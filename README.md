@@ -1,156 +1,164 @@
 # z-cache
 
-一个兼容Redis协议的内存缓存服务器，使用Java + Netty实现。
+> Redis 协议兼容的内存缓存服务器
 
-## 功能特性
-
-- ✅ 兼容Redis协议 (RESP)
-- ✅ 基础命令：PING, ECHO, QUIT, SELECT
-- ✅ 字符串操作：SET, GET, DEL, EXISTS
-- ✅ 过期时间：EXPIRE, TTL, PERSIST
-- ✅ 扩展设置：SETEX, PSETEX
-- ✅ 连接管理
-
-## 技术栈
-
-- Java 8+
-- Netty 4.1.x (网络框架)
-- Maven (构建工具)
-- SLF4J + Logback (日志)
-
-## 项目结构
-
-```
-z-cache/
-├── pom.xml                      # 根POM
-├── z-cache-core/                # 核心模块
-│   ├── pom.xml
-│   └── src/
-│       └── main/java/com/zifang/z/cache/core/
-│           ├── protocol/        # RESP协议实现
-│           │   ├── RespType.java
-│           │   ├── RespDecoder.java
-│           │   ├── RespEncoder.java
-│           │   ├── RespArray.java
-│           │   ├── RespBulkString.java
-│           │   ├── RespError.java
-│           │   ├── RespInteger.java
-│           │   └── RespSimpleString.java
-│           ├── server/        # 网络服务
-│           │   ├── RedisServer.java
-│           │   ├── RedisServerHandler.java
-│           │   └── ZCacheServerMain.java
-│           ├── storage/       # 存储引擎
-│           │   └── MemoryStore.java
-│           └── command/       # 命令处理
-│               └── CommandHandler.java
-└── doc/
-    └── 架构设计.md            # 完整架构设计文档
-```
-
-## 编译运行
-
-### 1. 编译项目
-
-```bash
-mvn clean package -DskipTests
-```
-
-### 2. 运行服务器
-
-```bash
-java -jar z-cache-core/target/z-cache-core-1.0-SNAPSHOT.jar
-```
-
-或使用默认端口 6379：
-
-```bash
-cd z-cache-core/target
-java -cp "z-cache-core-1.0-SNAPSHOT.jar:lib/*" com.zifang.z.cache.core.server.ZCacheServerMain
-```
-
-### 3. 使用 redis-cli 连接
-
-```bash
-# 连接服务器
-redis-cli -p 6379
-
-# 测试命令
-127.0.0.1:6379> PING
-PONG
-
-127.0.0.1:6379> SET name z-cache
-OK
-
-127.0.0.1:6379> GET name
-"z-cache"
-
-127.0.0.1:6379> DEL name
-(integer) 1
-
-127.0.0.1:6379> EXISTS name
-(integer) 0
-
-127.0.0.1:6379> SETEX temp 60 "hello"
-OK
-
-127.0.0.1:6379> TTL temp
-(integer) 59
-```
-
-## 支持的命令
-
-### 连接命令
-
-| 命令             | 描述    |
-|----------------|-------|
-| PING [message] | 测试连接  |
-| ECHO message   | 回显消息  |
-| QUIT           | 关闭连接  |
-| SELECT db      | 选择数据库 |
-
-### 字符串命令
-
-| 命令                                     | 描述      |
-|----------------------------------------|---------|
-| SET key value [EX seconds] [PX ms] [NX | XX]     | 设置键值 |
-| GET key                                | 获取键值    |
-| DEL key [key ...]                      | 删除键     |
-| EXISTS key [key ...]                   | 检查键是否存在 |
-
-### 过期命令
-
-| 命令                      | 描述            |
-|-------------------------|---------------|
-| EXPIRE key seconds      | 设置过期时间(秒)     |
-| TTL key                 | 获取剩余生存时间      |
-| PERSIST key             | 移除过期时间        |
-| SETEX key seconds value | 设置带过期时间的值     |
-| PSETEX key ms value     | 设置带过期时间的值(毫秒) |
-
-### 服务器命令
-
-| 命令      | 描述      |
-|---------|---------|
-| DBSIZE  | 返回键数量   |
-| FLUSHDB | 清空当前数据库 |
-
-## 开发计划
-
-- [x] MVP版本 - 基础Redis协议支持
-- [ ] v0.2 - 数据类型扩展 (List, Hash)
-- [ ] v0.3 - 持久化 (RDB, AOF)
-- [ ] v0.4 - 主从复制
-- [ ] v0.5 - 集群支持
-
-## 许可证
-
-MIT License
-
-## 贡献
-
-欢迎提交 Issue 和 Pull Request!
+Java + Netty 实现的兼容 RESP 协议的内存缓存服务, 支持 SET/GET/DEL/EXPIRE 等常用命令
 
 ---
 
-**z-cache** - 轻量级、高性能的内存缓存服务器
+## 📋 基本信息
+
+| 字段 | 值 |
+|------|-----|
+| **项目** | z-cache |
+| **分类** | 基础设施 · 缓存 |
+| **父项目** | z-opc (com.zifang:z-opc:1.0.0-SNAPSHOT) |
+| **默认端口** | `6379` |
+| **文档维护** | z-opc-foundation |
+| **最近更新** | 2026-09-06 |
+
+---
+
+## 🎯 核心功能
+
+Java + Netty 实现的兼容 RESP 协议的内存缓存服务, 支持 SET/GET/DEL/EXPIRE 等常用命令
+
+详细功能特性详见各子模块 README 或源码注释。
+
+---
+
+## 🏗️ 项目结构
+
+```
+z-cache/
+├── pom.xml                      # 根 POM (引用 z-opc 父项目)
+├── README.md                    # 本文档
+├── MODULE_NOTE.md               # 来源说明 (从 z-opc 拆分)
+```
+
+子模块列表:
+
+| 模块 | 职责 |
+|------|------|
+| `z-cache-common/` | 公共抽象层 |
+| `z-cache-core/` | 核心协议实现 + 服务端核心 |
+| `z-cache-client/` | 客户端 SDK |
+| `z-cache-server/` | 可启动服务端 |
+
+---
+
+## 🔧 技术栈
+
+- Java 8+
+- Netty 4.1
+- Maven
+- SLF4J + Logback
+
+---
+
+## 🚀 快速开始
+
+### 前置条件
+
+- JDK 8+ (推荐 JDK 17)
+- Maven 3.6+
+- 端口 `6379` 未被占用
+
+### 编译
+
+```bash
+# 在 z-opc 父项目下编译 (推荐)
+cd /Users/zifang/workplace/idea_workplace/z-opc
+mvn clean install -pl :z-opc -am -DskipTests
+
+# 单独编译本模块 (需 ../pom.xml 父项目可用)
+cd /Users/zifang/workplace/ceo_workplace/z-opc-foundation/z-cache
+mvn clean compile
+```
+
+### 运行
+
+```bash
+# 启动主服务 (根据项目类型选择)
+mvn -pl <启动模块> spring-boot:run
+# 或
+java -jar <启动模块>/target/*.jar
+```
+
+---
+
+## 📦 模块说明
+
+z-cache 由以下子模块组成:
+
+| `z-cache-common/` | 公共抽象层 |
+| `z-cache-core/` | 核心协议实现 + 服务端核心 |
+| `z-cache-client/` | 客户端 SDK |
+| `z-cache-server/` | 可启动服务端 |
+
+各模块职责详见各子目录下的 `pom.xml` 和源码。
+
+---
+
+## 🧪 测试
+
+```bash
+mvn test
+```
+
+测试覆盖:
+- 单元测试: 各核心服务类
+- 集成测试: 端到端调用链路
+- 性能测试: 详见 `/src/test` 下的 `*PerformanceTest.java`
+
+---
+
+## 🔌 API 接口
+
+API 接口定义在各子模块的 `controller` 包下。
+
+启动后访问 `http://localhost:6379/swagger-ui.html` 或 `/doc.html` (knife4j) 查看完整 API 文档。
+
+---
+
+## 🐳 部署
+
+### Docker
+
+```bash
+# 构建镜像
+docker build -t z-cache:latest .
+
+# 运行容器
+docker run -d -p 6379:6379 --name z-cache z-cache:latest
+```
+
+### 配置
+
+主要配置文件:
+- `application.yml` - Spring Boot 配置
+- `logback.xml` - 日志配置
+- 环境变量: `JAVA_OPTS`, `SPRING_PROFILES_ACTIVE`
+
+---
+
+## 📚 相关文档
+
+- [MODULE_NOTE.md](./MODULE_NOTE.md) - 从 z-opc 拆分说明
+- [z-opc 父项目](https://github.com/yuku123/z-opc) - 完整源码
+
+---
+
+## 📝 版本历史
+
+| 版本 | 日期 | 变更 |
+|------|------|------|
+| 1.0.0 | 2026-09-06 | 从 z-opc monorepo 拆分独立仓, 文档补齐 |
+
+---
+
+## 📄 License
+
+Internal use only. 版权属于 z-biz。
+
+_Maintained by z-opc-foundation organization._
