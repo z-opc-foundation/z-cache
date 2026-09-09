@@ -27,7 +27,7 @@ public class ZCachePool implements AutoCloseable {
     private final AtomicBoolean closed = new AtomicBoolean(false);
 
     public ZCachePool(ZCacheClientConfig config) {
-        this(config, 8, 30000);
+        this(config, config == null ? 8 : config.getPoolMaxSize(), 30000);
     }
 
     public ZCachePool(ZCacheClientConfig config, int maxSize) {
@@ -35,6 +35,15 @@ public class ZCachePool implements AutoCloseable {
     }
 
     public ZCachePool(ZCacheClientConfig config, int maxSize, long maxWaitMillis) {
+        if (config == null) {
+            throw new NullPointerException("config cannot be null");
+        }
+        if (maxSize <= 0) {
+            throw new IllegalArgumentException("maxSize must be positive");
+        }
+        if (maxWaitMillis < 0) {
+            throw new IllegalArgumentException("maxWaitMillis cannot be negative");
+        }
         this.config = config;
         this.maxSize = maxSize;
         this.maxWaitMillis = maxWaitMillis;
@@ -46,11 +55,18 @@ public class ZCachePool implements AutoCloseable {
 
         PooledClient client = availableClients.poll();
         if (client != null) {
+            // Wrap the borrowed underlying client in a fresh PooledClient
+            // so each borrow owns an independent `returned` flag. Returning
+            // the same PooledClient instance here would mean a second close()
+            // becomes a no-op (returned=true), leaking the activeCount
+            // increment and breaking pool capacity accounting.
+            activeCount.incrementAndGet();
             logger.debug("Reusing pooled client, active={}", activeCount.get());
-            return client;
+            return new PooledClient(client.getClient(), this);
         }
 
-        if (activeCount.incrementAndGet() <= maxSize) {
+        int after = activeCount.incrementAndGet();
+        if (after <= maxSize) {
             try {
                 ZCacheClient newClient = new ZCacheClient(config);
                 newClient.connect();
@@ -61,14 +77,17 @@ public class ZCachePool implements AutoCloseable {
                 throw new ZCacheClientException("Failed to create new client for pool", e);
             }
         } else {
+            // Active count exceeded max size; restore and wait for an available client.
             activeCount.decrementAndGet();
+            logger.debug("Pool over capacity, waiting for an available client");
         }
 
         try {
             client = availableClients.poll(maxWaitMillis, TimeUnit.MILLISECONDS);
             if (client != null) {
+                activeCount.incrementAndGet();
                 logger.debug("Got client from pool after waiting");
-                return client;
+                return new PooledClient(client.getClient(), this);
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -79,15 +98,21 @@ public class ZCachePool implements AutoCloseable {
     }
 
     void returnClient(PooledClient client) {
+        if (client == null) {
+            // Return null is a no-op (idempotent close path)
+            return;
+        }
+        // Client is no longer "in use" by the caller; decrement first regardless
+        // of whether the pool is closed or whether the available queue accepts it.
+        activeCount.decrementAndGet();
+
         if (closed.get()) {
             client.getClient().close();
-            activeCount.decrementAndGet();
             return;
         }
 
         if (!availableClients.offer(client)) {
             client.getClient().close();
-            activeCount.decrementAndGet();
             logger.debug("Closed excess client, active={}", activeCount.get());
         } else {
             logger.debug("Returned client to pool, active={}", activeCount.get());

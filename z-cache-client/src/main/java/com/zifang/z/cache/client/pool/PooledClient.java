@@ -27,6 +27,12 @@ public class PooledClient implements AutoCloseable {
     private volatile boolean inUse = true;
 
     public PooledClient(ZCacheClient client, ZCachePool pool) {
+        if (client == null) {
+            throw new NullPointerException("client cannot be null");
+        }
+        if (pool == null) {
+            throw new NullPointerException("pool cannot be null");
+        }
         this.client = client;
         this.pool = pool;
         this.inUse = true;

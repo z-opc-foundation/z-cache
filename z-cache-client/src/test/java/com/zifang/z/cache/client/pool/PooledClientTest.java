@@ -105,8 +105,10 @@ class PooledClientTest {
             assertNotNull(pooledClient2);
             assertNotSame(pooledClient1, pooledClient2);
         } finally {
-            if (pooledClient1 != null) pooledClient1.close();
-            if (pooledClient2 != null) pooledClient2.close();
+            if (pooledClient1 != null) { pooledClient1.close(); }
+
+            if (pooledClient2 != null) { pooledClient2.close(); }
+
         }
     }
 }

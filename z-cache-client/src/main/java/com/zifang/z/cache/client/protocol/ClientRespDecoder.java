@@ -155,8 +155,8 @@ public class ClientRespDecoder extends ReplayingDecoder<ClientRespDecoder.State>
     }
 
     private void decodeArray(ByteBuf in, List<Object> out) throws Exception {
-        if (remainingElements == 0 && arrayElements == null) {
-            // First time, read the array length
+        if (arrayElements == null) {
+            // First time entry for this array (or recovering after partial read)
             String line = readLine(in);
             if (line == null) {
                 return;
@@ -172,7 +172,7 @@ public class ClientRespDecoder extends ReplayingDecoder<ClientRespDecoder.State>
             if (length == -1) {
                 // Null array
                 out.add(RespArray.nullArray());
-                resetDecoder();
+                checkpoint(State.DECODE_TYPE);
                 return;
             }
 
@@ -183,29 +183,80 @@ public class ClientRespDecoder extends ReplayingDecoder<ClientRespDecoder.State>
             if (length == 0) {
                 // Empty array
                 out.add(RespArray.empty());
-                resetDecoder();
+                checkpoint(State.DECODE_TYPE);
                 return;
             }
 
             remainingElements = length;
             arrayElements = new ArrayList<>(length);
+            checkpoint(State.DECODE_ARRAY);
         }
 
-        // Decode elements
+        // Decode each remaining element by reading its type byte and dispatching
+        // directly. We deliberately do not recurse into decodeType() here, because
+        // an inner call would invoke resetDecoder() on completion and clobber the
+        // outer array's state (NPE observed on testDecodeArray).
         while (remainingElements > 0) {
-            // Save checkpoint before attempting to decode an element
             int readerIndexBefore = in.readerIndex();
 
-            // Try to decode the next element
-            checkpoint(State.DECODE_TYPE);
-            decodeType(in, arrayElements);
+            byte typeByte = in.readByte();
+            RespType elemType = RespType.fromPrefix((char) typeByte);
+            if (elemType == null) {
+                throw new IllegalArgumentException("Unknown RESP type: " + (char) typeByte);
+            }
 
-            // Check if decodeType actually decoded something
-            if (arrayElements.size() == 0 ||
-                    (arrayElements.size() > 0 && in.readerIndex() == readerIndexBefore)) {
-                // Nothing was decoded, we need more data
-                in.readerIndex(readerIndexBefore);
-                return;
+            switch (elemType) {
+                case SIMPLE_STRING: {
+                    String valueLine = readLine(in);
+                    if (valueLine == null) {
+                        in.readerIndex(readerIndexBefore);
+                        return;
+                    }
+                    arrayElements.add(RespSimpleString.of(valueLine));
+                    break;
+                }
+                case ERROR: {
+                    String errLine = readLine(in);
+                    if (errLine == null) {
+                        in.readerIndex(readerIndexBefore);
+                        return;
+                    }
+                    arrayElements.add(RespError.of(errLine));
+                    break;
+                }
+                case INTEGER: {
+                    String intLine = readLine(in);
+                    if (intLine == null) {
+                        in.readerIndex(readerIndexBefore);
+                        return;
+                    }
+                    try {
+                        arrayElements.add(RespInteger.of(Long.parseLong(intLine)));
+                    } catch (NumberFormatException e) {
+                        throw new IllegalArgumentException("Invalid integer in array: " + intLine);
+                    }
+                    break;
+                }
+                case BULK_STRING: {
+                    Object decoded = decodeBulkIntoList(in, arrayElements, readerIndexBefore);
+                    if (decoded == null) {
+                        return;
+                    }
+                    break;
+                }
+                case ARRAY: {
+                    // Nested array support: recursively build a child RespArray.
+                    // Use a fresh sub-decoder-style loop so it does not corrupt
+                    // the outer decoder state.
+                    Object nested = decodeNestedArray(in, readerIndexBefore);
+                    if (nested == null) {
+                        return;
+                    }
+                    arrayElements.add(nested);
+                    break;
+                }
+                default:
+                    throw new IllegalStateException("Unexpected type in array: " + elemType);
             }
 
             remainingElements--;
@@ -213,7 +264,119 @@ public class ClientRespDecoder extends ReplayingDecoder<ClientRespDecoder.State>
 
         // All elements decoded
         out.add(RespArray.of(arrayElements));
-        resetDecoder();
+        arrayElements = null;
+        remainingElements = 0;
+        checkpoint(State.DECODE_TYPE);
+    }
+
+    /**
+     * Helper for decodeArray: decode a single bulk-string element, append to the
+     * given list. Returns Boolean.TRUE on success, null when more data is needed
+     * (caller must abort the array decode loop and wait).
+     */
+    private Boolean decodeBulkIntoList(ByteBuf in, List<Object> sink, int readerIndexBefore) throws Exception {
+        String lenLine = readLine(in);
+        if (lenLine == null) {
+            in.readerIndex(readerIndexBefore);
+            return null;
+        }
+        int length;
+        try {
+            length = Integer.parseInt(lenLine);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("Invalid bulk string length: " + lenLine);
+        }
+        if (length == -1) {
+            sink.add(RespBulkString.nullBulkString());
+            return Boolean.TRUE;
+        }
+        if (length < 0 || length > MAX_BULK_STRING_LENGTH) {
+            throw new IllegalArgumentException("Invalid bulk string length: " + length);
+        }
+        if (in.readableBytes() < length + 2) {
+            in.readerIndex(readerIndexBefore);
+            return null;
+        }
+        byte[] data = new byte[length];
+        in.readBytes(data);
+        byte cr = in.readByte();
+        byte lf = in.readByte();
+        if (cr != '\r' || lf != '\n') {
+            throw new IllegalArgumentException("Expected CRLF after bulk string data");
+        }
+        sink.add(RespBulkString.of(data));
+        return Boolean.TRUE;
+    }
+
+    /**
+     * Helper for decodeArray: decode a nested RESP array starting at the current
+     * reader index. The caller has already consumed the leading '*' byte for the
+     * nested array. Returns null when more data is needed.
+     */
+    private RespArray decodeNestedArray(ByteBuf in, int readerIndexBefore) throws Exception {
+        String lenLine = readLine(in);
+        if (lenLine == null) {
+            in.readerIndex(readerIndexBefore);
+            return null;
+        }
+        int length;
+        try {
+            length = Integer.parseInt(lenLine);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("Invalid nested array length: " + lenLine);
+        }
+        if (length == -1) {
+            return RespArray.nullArray();
+        }
+        if (length < 0 || length > MAX_ARRAY_ELEMENTS) {
+            throw new IllegalArgumentException("Invalid nested array length: " + length);
+        }
+        if (length == 0) {
+            return RespArray.empty();
+        }
+        List<Object> nested = new ArrayList<>(length);
+        int nestedBefore = in.readerIndex();
+        for (int i = 0; i < length; i++) {
+            int before = in.readerIndex();
+            byte typeByte = in.readByte();
+            RespType elemType = RespType.fromPrefix((char) typeByte);
+            if (elemType == null) {
+                throw new IllegalArgumentException("Unknown RESP type: " + (char) typeByte);
+            }
+            switch (elemType) {
+                case SIMPLE_STRING: {
+                    String line = readLine(in);
+                    if (line == null) {
+                        in.readerIndex(nestedBefore);
+                        return null;
+                    }
+                    nested.add(RespSimpleString.of(line));
+                    break;
+                }
+                case INTEGER: {
+                    String line = readLine(in);
+                    if (line == null) {
+                        in.readerIndex(nestedBefore);
+                        return null;
+                    }
+                    nested.add(RespInteger.of(Long.parseLong(line)));
+                    break;
+                }
+                case BULK_STRING: {
+                    Object result = decodeBulkIntoList(in, nested, before);
+                    if (result == null) {
+                        in.readerIndex(nestedBefore);
+                        return null;
+                    }
+                    break;
+                }
+                default:
+                    in.readerIndex(before);
+                    throw new UnsupportedOperationException(
+                            "Nested array element type not yet supported: " + elemType);
+            }
+        }
+        return RespArray.of(nested);
     }
 
     private String readLine(ByteBuf in) {

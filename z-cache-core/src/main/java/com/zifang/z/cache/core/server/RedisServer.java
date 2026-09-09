@@ -20,7 +20,9 @@ public class RedisServer {
     // Default port - same as Redis
     public static final int DEFAULT_PORT = 6379;
     private static final Logger logger = LogManager.getLogger(RedisServer.class);
+    private final String host;
     private final int port;
+    private final String password;
     private final MemoryStore store;
 
     // Netty components
@@ -32,12 +34,38 @@ public class RedisServer {
     private volatile boolean started = false;
 
     public RedisServer() {
-        this(DEFAULT_PORT);
+        this("0.0.0.0", DEFAULT_PORT, 0);
     }
 
     public RedisServer(int port) {
+        this("0.0.0.0", port, 0);
+    }
+
+    /**
+     * 创建可配置监听地址和容量上限的服务器。
+     *
+     * @param host       监听地址
+     * @param port       监听端口
+     * @param maxEntries 最大键数量，0表示不限制
+     */
+    public RedisServer(String host, int port, int maxEntries) {
+        this(host, port, maxEntries, null);
+    }
+
+    /**
+     * 创建可配置监听地址、容量和密码的服务器。
+     */
+    public RedisServer(String host, int port, int maxEntries, String password) {
+        if (host == null || host.trim().isEmpty()) {
+            throw new IllegalArgumentException("host cannot be blank");
+        }
+        if (port < 1 || port > 65535) {
+            throw new IllegalArgumentException("port must be between 1 and 65535");
+        }
+        this.host = host;
         this.port = port;
-        this.store = new MemoryStore();
+        this.password = password == null || password.isEmpty() ? null : password;
+        this.store = new MemoryStore(maxEntries);
     }
 
     /**
@@ -72,13 +100,13 @@ public class RedisServer {
                             p.addLast("encoder", new RespEncoder());
 
                             // Add command handler
-                            CommandHandler commandHandler = new CommandHandler(store);
+                            CommandHandler commandHandler = new CommandHandler(store, password);
                             p.addLast("handler", new RedisServerHandler(commandHandler));
                         }
                     });
 
             // Bind and start to accept incoming connections
-            ChannelFuture f = b.bind(port).sync();
+            ChannelFuture f = b.bind(host, port).sync();
             serverChannel = f.channel();
             started = true;
 

@@ -20,6 +20,18 @@
             <version>${project.version}</version>
         </dependency>
 
+        <!-- Z-Serialize: zero-copy, schema-first binary codec -->
+        <dependency>
+            <groupId>io.github.yuku123</groupId>
+            <artifactId>z-util-serialize-core</artifactId>
+            <version>1.0.9</version>
+        </dependency>
+        <dependency>
+            <groupId>io.github.yuku123</groupId>
+            <artifactId>z-util-serialize-schema</artifactId>
+            <version>1.0.9</version>
+        </dependency>
+
         <dependency>
             <groupId>io.netty</groupId>
             <artifactId>netty-buffer</artifactId>
@@ -46,6 +58,12 @@
             <groupId>junit</groupId>
             <artifactId>junit</artifactId>
             <version>4.13.2</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>5.10.0</version>
             <scope>test</scope>
         </dependency>
         <dependency>

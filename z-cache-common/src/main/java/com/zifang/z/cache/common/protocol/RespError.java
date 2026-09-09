@@ -68,8 +68,14 @@ public final class RespError {
 
     @Override
     public boolean equals(Object o) {
-        if (this == o) return true;
-        if (o == null || getClass() != o.getClass()) return false;
+        if (this == o) {
+            return true;
+        }
+
+        if (o == null || getClass() != o.getClass()) {
+            return false;
+        }
+
         RespError respError = (RespError) o;
         return Objects.equals(message, respError.message);
     }

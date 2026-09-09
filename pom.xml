@@ -19,6 +19,7 @@
         <module>z-cache-core</module>
         <module>z-cache-client</module>
         <module>z-cache-server</module>
+        <module>z-cache-spring-boot-starter</module>
     </modules>
 
     <properties>

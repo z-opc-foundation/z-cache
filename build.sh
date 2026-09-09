@@ -1,123 +1,139 @@
 #!/bin/bash
-set -e  # 脚本遇到错误立即退出，避免后续无效操作
+set -euo pipefail
 
-# ====================== 配置项（请根据你的项目修改）======================
-PROJECT_NAME="z-cache"       # 项目名称（用于镜像/容器命名）
-DOCKERFILE_PATH="./Dockerfile"      # Dockerfile 路径
-IMAGE_NAME="${PROJECT_NAME}:latest" # 镜像名称+标签
-CONTAINER_NAME="${PROJECT_NAME}"    # 容器名称
-HOST_PORT=8082                      # 宿主机映射端口
-CONTAINER_PORT=8080                 # 容器内端口（对应SpringBoot服务端口）
-HEALTH_CHECK_URL="http://127.0.0.1:${HOST_PORT}/actuator/health" # 健康检查接口（需开启SpringBoot Actuator）
-HEALTH_CHECK_TIMEOUT=30             # 健康检查超时时间（秒）
-# =========================================================================
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+PROJECT_NAME="${PROJECT_NAME:-z-cache}"
+DOCKERFILE_PATH="${SCRIPT_DIR}/Dockerfile"
+IMAGE_NAME="${IMAGE_NAME:-${PROJECT_NAME}:latest}"
+CONTAINER_NAME="${CONTAINER_NAME:-${PROJECT_NAME}}"
+HOST_PORT="${HOST_PORT:-6379}"
+CONTAINER_PORT=6379
+HEALTH_CHECK_TIMEOUT="${HEALTH_CHECK_TIMEOUT:-60}"
+OLD_CONTAINER_NAME=""
 
-# 函数：打印带时间戳的日志
 log() {
     echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1"
 }
 
-# 函数：检查Docker是否运行
 check_docker_status() {
-    log "检查Docker服务状态..."
-    if ! docker info >/dev/null 2>&1; then
-        log "错误：Docker服务未运行，请先启动Docker！"
+    docker info >/dev/null 2>&1 || {
+        log "错误：Docker 服务未运行，请先启动 Docker。"
         exit 1
-    fi
-    log "Docker服务运行正常"
+    }
 }
 
-# 函数：打包
 package() {
-  sh package.sh
+    mvn -f "${SCRIPT_DIR}/pom.xml" -pl z-cache-server -am clean package -DskipTests
 }
 
-
-# 函数：构建Docker镜像
 build_image() {
-    log "开始构建Docker镜像: ${IMAGE_NAME}"
-    docker build -f "${DOCKERFILE_PATH}" -t "${IMAGE_NAME}" .
-    log "镜像构建完成: $(docker images -q ${IMAGE_NAME})"
+    log "开始构建 Docker 镜像：${IMAGE_NAME}"
+    local build_args=( -f "${DOCKERFILE_PATH}" -t "${IMAGE_NAME}" "${SCRIPT_DIR}/.." )
+    local host_m2="${HOST_M2:-${HOME}/.m2}"
+    if [[ -d "${host_m2}" ]]; then
+        build_args=(
+            --build-context "maven-m2=${host_m2}"
+            "${build_args[@]}"
+        )
+        log "使用主机 Maven 仓库上下文：${host_m2}"
+    else
+        log "警告：未找到主机 Maven 仓库 ${host_m2}，构建时将重新下载依赖。"
+    fi
+    docker buildx build "${build_args[@]}"
 }
 
-# 函数：检查旧容器是否存在
-check_old_container() {
-    OLD_CONTAINER_ID=$(docker ps -aq --filter "name=${CONTAINER_NAME}")
-    if [ -n "${OLD_CONTAINER_ID}" ]; then
-        log "检测到旧容器存在（ID: ${OLD_CONTAINER_ID}），准备平滑替换"
-        # 给旧容器加临时后缀，避免名称冲突
-        docker rename "${CONTAINER_NAME}" "${CONTAINER_NAME}-old"
+stop_old_container() {
+    if docker ps -aq --filter "name=^/${CONTAINER_NAME}$" | grep -q .; then
         OLD_CONTAINER_NAME="${CONTAINER_NAME}-old"
-    else
-        log "未检测到旧容器，将直接启动新容器"
-        OLD_CONTAINER_NAME=""
+        docker rm -f "${OLD_CONTAINER_NAME}" >/dev/null 2>&1 || true
+        docker rename "${CONTAINER_NAME}" "${OLD_CONTAINER_NAME}"
+        docker stop "${OLD_CONTAINER_NAME}" >/dev/null 2>&1 || true
     fi
 }
 
-# 函数：启动新容器
-start_new_container() {
-    log "启动新容器: ${CONTAINER_NAME}"
-    # 启动新容器（端口映射、后台运行、自动重启）
-    docker run -d \
+cleanup_old_container() {
+    if [[ -n "${OLD_CONTAINER_NAME}" ]]; then
+        docker rm -f "${OLD_CONTAINER_NAME}" >/dev/null 2>&1 || true
+    fi
+}
+
+restore_old_container() {
+    if [[ -n "${OLD_CONTAINER_NAME}" ]] && docker ps -aq --filter "name=^/${OLD_CONTAINER_NAME}$" | grep -q .; then
+        docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+        docker rename "${OLD_CONTAINER_NAME}" "${CONTAINER_NAME}"
+        docker start "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+    fi
+}
+
+start_container() {
+    log "启动容器：${CONTAINER_NAME}"
+    if ! docker run -d \
         --name "${CONTAINER_NAME}" \
         -p "${HOST_PORT}:${CONTAINER_PORT}" \
-        --restart=always \
-        "${IMAGE_NAME}"
-
-    NEW_CONTAINER_ID=$(docker ps -aq --filter "name=${CONTAINER_NAME}")
-    log "新容器已启动（ID: ${NEW_CONTAINER_ID}）"
+        -e "ZCACHE_PORT=${CONTAINER_PORT}" \
+        -e "ZCACHE_MAX_ENTRIES=${ZCACHE_MAX_ENTRIES:-0}" \
+        -e "ZCACHE_PASSWORD=${ZCACHE_PASSWORD:-}" \
+        -e "ZCACHE_PASSWORD_FILE=${ZCACHE_PASSWORD_FILE:-}" \
+        --restart=unless-stopped \
+        "${IMAGE_NAME}" >/dev/null; then
+        restore_old_container
+        return 1
+    fi
 }
 
-# 函数：健康检查（验证新容器服务是否可用）
 health_check() {
-    log "开始健康检查，超时时间：${HEALTH_CHECK_TIMEOUT}秒"
-    local timeout=0
-    while [ ${timeout} -lt ${HEALTH_CHECK_TIMEOUT} ]; do
-        # 尝试访问健康检查接口
-        if curl -s -f "${HEALTH_CHECK_URL}" >/dev/null 2>&1; then
-            log "健康检查通过！新容器服务可用"
+    log "等待服务健康检查通过（${HEALTH_CHECK_TIMEOUT}秒）"
+    for ((i = 0; i < HEALTH_CHECK_TIMEOUT; i++)); do
+        status=$(docker inspect --format='{{.State.Health.Status}}' "${CONTAINER_NAME}" 2>/dev/null || true)
+        if [[ "${status}" == "healthy" ]]; then
+            log "健康检查通过。"
             return 0
         fi
-        timeout=$((timeout + 1))
+        if [[ "${status}" == "unhealthy" ]]; then
+            docker logs "${CONTAINER_NAME}" || true
+            restore_old_container
+            return 1
+        fi
         sleep 1
     done
-    # 健康检查失败，回滚操作
-    log "错误：新容器健康检查超时，服务不可用！"
-    log "开始回滚：停止并删除新容器，恢复旧容器"
-    docker stop "${CONTAINER_NAME}" >/dev/null 2>&1
-    docker rm "${CONTAINER_NAME}" >/dev/null 2>&1
-    if [ -n "${OLD_CONTAINER_NAME}" ]; then
-        docker rename "${OLD_CONTAINER_NAME}" "${CONTAINER_NAME}"
-        docker start "${CONTAINER_NAME}" >/dev/null 2>&1
-        log "回滚完成，旧容器已恢复运行"
-    fi
-    exit 1
+    docker logs "${CONTAINER_NAME}" || true
+    restore_old_container
+    log "错误：健康检查超时，已清理新容器并恢复旧容器（如存在）。"
+    return 1
 }
 
-# 函数：清理旧容器
-clean_old_container() {
-    if [ -n "${OLD_CONTAINER_NAME}" ]; then
-        log "停止并删除旧容器: ${OLD_CONTAINER_NAME}"
-        docker stop "${OLD_CONTAINER_NAME}" >/dev/null 2>&1
-        docker rm "${OLD_CONTAINER_NAME}" >/dev/null 2>&1
-        log "旧容器已清理完成"
-    fi
+usage() {
+    echo "用法：$0 [build|deploy|logs|stop]"
 }
 
-# 主执行流程
 main() {
-    log "===================== 开始部署 SpringBoot 服务 ====================="
-    check_docker_status
-    package
-    build_image
-    check_old_container
-    start_new_container
-    health_check
-    clean_old_container
-    log "===================== 部署完成！服务已平滑更新 ====================="
-    log "当前运行容器信息："
-    docker ps --filter "name=${CONTAINER_NAME}" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+    local action="${1:-deploy}"
+    case "${action}" in
+        build)
+            check_docker_status
+            package
+            build_image
+            ;;
+        deploy)
+            check_docker_status
+            package
+            build_image
+            stop_old_container
+            start_container
+            health_check
+            cleanup_old_container
+            ;;
+        logs)
+            docker logs -f "${CONTAINER_NAME}"
+            ;;
+        stop)
+            docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+            ;;
+        *)
+            usage
+            exit 2
+            ;;
+    esac
 }
 
-# 执行主流程
-main
+main "$@"

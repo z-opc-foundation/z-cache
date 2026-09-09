@@ -15,3 +15,10 @@
 *.flattened-pom.xml
 .flattened-pom.xml
 *.lst
+
+# macOS
+.DS_Store
+*/.DS_Store
+
+# Maven repository snapshot staged for Docker build (large file with secrets)
+/.build-context/

@@ -74,11 +74,22 @@ public final class RespBulkString {
 
     @Override
     public boolean equals(Object o) {
-        if (this == o) return true;
-        if (o == null || getClass() != o.getClass()) return false;
+        if (this == o) {
+            return true;
+        }
+
+        if (o == null || getClass() != o.getClass()) {
+            return false;
+        }
+
         RespBulkString that = (RespBulkString) o;
-        if (isNull != that.isNull) return false;
-        if (isNull) return true; // Both null
+        if (isNull != that.isNull) {
+            return false;
+        }
+
+        if (isNull) {
+            return true; // Both null
+        }
         return Arrays.equals(data, that.data);
     }
 

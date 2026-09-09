@@ -116,11 +116,23 @@ public final class RespArray {
 
     @Override
     public boolean equals(Object o) {
-        if (this == o) return true;
-        if (o == null || getClass() != o.getClass()) return false;
+        if (this == o) {
+            return true;
+        }
+
+        if (o == null || getClass() != o.getClass()) {
+            return false;
+        }
+
         RespArray respArray = (RespArray) o;
-        if (isNull != respArray.isNull) return false;
-        if (isNull) return true;
+        if (isNull != respArray.isNull) {
+            return false;
+        }
+
+        if (isNull) {
+            return true;
+        }
+
         return elements.equals(respArray.elements);
     }
 

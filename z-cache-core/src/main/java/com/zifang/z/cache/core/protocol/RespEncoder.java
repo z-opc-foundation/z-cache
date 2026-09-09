@@ -11,19 +11,30 @@ import java.nio.charset.StandardCharsets;
 import java.util.List;
 
 /**
- * RESP protocol encoder
- * Encodes Java objects into RESP protocol bytes
+ * RESP协议编码器
+ * 将Java对象编码为RESP协议字节流
+ *
+ * @author zifang
+ * @since 1.0.0
  */
 public class RespEncoder extends MessageToByteEncoder<Object> {
     private static final Logger logger = LogManager.getLogger(RespEncoder.class);
 
-    // CRLF separator
+    // CRLF分隔符
     private static final byte[] CRLF = new byte[]{'\r', '\n'};
-    // Null bulk string representation
+    // 空bulk字符串表示
     private static final byte[] NULL_BULK_STRING = new byte[]{'$', '-', '1', '\r', '\n'};
-    // Null array representation
+    // 空数组表示
     private static final byte[] NULL_ARRAY = new byte[]{'*', '-', '1', '\r', '\n'};
 
+    /**
+     * 编码消息为RESP协议字节
+     *
+     * @param ctx ChannelHandlerContext
+     * @param msg 待编码对象
+     * @param out 输出ByteBuf
+     * @throws Exception 编码异常
+     */
     @Override
     protected void encode(ChannelHandlerContext ctx, Object msg, ByteBuf out) throws Exception {
         if (msg instanceof RespSimpleString) {
@@ -57,24 +68,48 @@ public class RespEncoder extends MessageToByteEncoder<Object> {
         }
     }
 
+    /**
+     * 编码Simple String类型
+     *
+     * @param msg Simple String消息
+     * @param out 输出ByteBuf
+     */
     private void encodeSimpleString(RespSimpleString msg, ByteBuf out) {
         out.writeByte(RespType.SIMPLE_STRING.getPrefix());
         out.writeBytes(msg.getValue().getBytes(StandardCharsets.UTF_8));
         out.writeBytes(CRLF);
     }
 
+    /**
+     * 编码Error类型
+     *
+     * @param msg Error消息
+     * @param out 输出ByteBuf
+     */
     private void encodeError(RespError msg, ByteBuf out) {
         out.writeByte(RespType.ERROR.getPrefix());
         out.writeBytes(msg.getMessage().getBytes(StandardCharsets.UTF_8));
         out.writeBytes(CRLF);
     }
 
+    /**
+     * 编码Integer类型
+     *
+     * @param msg Integer消息
+     * @param out 输出ByteBuf
+     */
     private void encodeInteger(RespInteger msg, ByteBuf out) {
         out.writeByte(RespType.INTEGER.getPrefix());
         out.writeBytes(Long.toString(msg.getValue()).getBytes(StandardCharsets.UTF_8));
         out.writeBytes(CRLF);
     }
 
+    /**
+     * 编码Bulk String类型
+     *
+     * @param msg Bulk String消息
+     * @param out 输出ByteBuf
+     */
     private void encodeBulkString(RespBulkString msg, ByteBuf out) {
         if (msg.isNull()) {
             out.writeBytes(NULL_BULK_STRING);
@@ -89,6 +124,13 @@ public class RespEncoder extends MessageToByteEncoder<Object> {
         out.writeBytes(CRLF);
     }
 
+    /**
+     * 编码Array类型
+     *
+     * @param msg Array消息
+     * @param out 输出ByteBuf
+     * @throws Exception 编码异常
+     */
     private void encodeArray(RespArray msg, ByteBuf out) throws Exception {
         if (msg.isNull()) {
             out.writeBytes(NULL_ARRAY);
