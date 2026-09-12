@@ -6,22 +6,14 @@
     <parent>
         <groupId>io.github.yuku123</groupId>
         <artifactId>z-cache</artifactId>
-        <version>1.0.1</version>
+        <version>1.0.2</version>
     </parent>
 
     <groupId>io.github.yuku123</groupId>
-    <version>1.0.1</version>
+    <version>1.0.2</version>
     <artifactId>z-cache-server</artifactId>
     <name>z-cache-server</name>
     <description>可直接运行的 z-cache Redis 兼容服务器发行包</description>
-
-    <dependencies>
-        <dependency>
-            <groupId>io.github.yuku123</groupId>
-            <artifactId>z-cache-core</artifactId>
-            <version>${project.version}</version>
-        </dependency>
-    </dependencies>
 
     <url>https://github.com/yuku123/z-cache</url>
     <licenses>
@@ -51,6 +43,13 @@
         <tag>HEAD</tag>
     </scm>
 
+    <dependencies>
+        <dependency>
+            <groupId>io.github.yuku123</groupId>
+            <artifactId>z-cache-core</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+    </dependencies>
 
     <build>
         <plugins>

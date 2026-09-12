@@ -15,7 +15,7 @@
          显式覆盖 parent 的 com.zifang，保留 parent 仅用于继承 monorepo 本地构建链 -->
     <groupId>io.github.yuku123</groupId>
     <artifactId>z-cache</artifactId>
-    <version>1.0.1</version>
+    <version>1.0.2</version>
     <packaging>pom</packaging>
     <modules>
         <module>z-cache-common</module>

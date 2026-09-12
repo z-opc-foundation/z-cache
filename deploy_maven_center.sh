@@ -139,9 +139,9 @@ cmd_publish() {
     check_deps
 
     log "═══════════════════════════════════════════════════════════════"
-    log " 即将把 z-util 上传到 Maven Central"
+    log " 即将把 z-cache 上传到 Maven Central"
     log "  groupId : io.github.yuku123"
-    log "  version : $(grep '<revision>' pom.xml | sed 's/.*<revision>\(.*\)<\/revision>.*/\1/')"
+    log "  version : $(grep '<version>1.0.2</version>' pom.xml | head -1 | sed 's/.*<version>\(.*\)<\/version>.*/\1/')"
     log "  GPG KEY : ${GPG_KEY_ID:-?}"
     log "═══════════════════════════════════════════════════════════════"
 
@@ -150,23 +150,22 @@ cmd_publish() {
 
     mvn -B deploy \
         -Pcentral \
-        -pl '!z-util-all' \
         -DskipTests \
         -Dgpg.passphrase="$CENTRAL_GPG_PASSPHRASE" \
-        2>&1 | tee /tmp/z-util-deploy.log | tail -100
+        2>&1 | tee /tmp/z-cache-deploy.log | tail -100
 
-    if grep -q "BUILD SUCCESS" /tmp/z-util-deploy.log; then
+    if grep -q "BUILD SUCCESS" /tmp/z-cache-deploy.log; then
         log ""
         log "✅ BUILD SUCCESS"
-        if grep -q "Uploaded bundle successfully" /tmp/z-util-deploy.log; then
+        if grep -q "Uploaded bundle successfully" /tmp/z-cache-deploy.log; then
             log "✅ Bundle uploaded"
             log "Central Portal 控制台：https://central.sonatype.com/publishing/deployments"
             log "验证（30 秒后）：https://search.maven.org/search?q=g:io.github.yuku123"
         else
-            warn "BUILD SUCCESS 但 upload 未确认。请看 /tmp/z-util-deploy.log 最后 30 行"
+            warn "BUILD SUCCESS 但 upload 未确认。请看 /tmp/z-cache-deploy.log 最后 30 行"
         fi
     else
-        die "BUILD FAILURE，请看 /tmp/z-util-deploy.log"
+        die "BUILD FAILURE，请看 /tmp/z-cache-deploy.log"
     fi
 }
 

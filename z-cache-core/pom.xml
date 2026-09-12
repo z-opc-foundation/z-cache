@@ -7,12 +7,40 @@
     <parent>
         <groupId>io.github.yuku123</groupId>
         <artifactId>z-cache</artifactId>
-        <version>1.0.1</version>
+        <version>1.0.2</version>
     </parent>
 
     <groupId>io.github.yuku123</groupId>
-    <version>1.0.1</version>
+    <version>1.0.2</version>
     <artifactId>z-cache-core</artifactId>
+
+    <url>https://github.com/yuku123/z-cache</url>
+    <licenses>
+        <license>
+            <name>MIT License</name>
+            <url>https://opensource.org/licenses/MIT</url>
+            <distribution>repo</distribution>
+        </license>
+    </licenses>
+    <developers>
+        <developer>
+            <id>yuku123</id>
+            <name>yuku123</name>
+            <email>1340947819@qq.com</email>
+            <organization>z-team</organization>
+            <organizationUrl>https://github.com/yuku123</organizationUrl>
+            <timezone>+08:00</timezone>
+            <roles>
+                <role>owner</role>
+            </roles>
+        </developer>
+    </developers>
+    <scm>
+        <connection>scm:git:https://github.com/yuku123/z-cache.git</connection>
+        <developerConnection>scm:git:ssh://git@github.com/yuku123/z-cache.git</developerConnection>
+        <url>https://github.com/yuku123/z-cache</url>
+        <tag>HEAD</tag>
+    </scm>
 
     <dependencies>
         <!-- Common module -->
@@ -80,33 +108,5 @@
             <scope>test</scope>
         </dependency>
     </dependencies>
-
-    <url>https://github.com/yuku123/z-cache</url>
-    <licenses>
-        <license>
-            <name>MIT License</name>
-            <url>https://opensource.org/licenses/MIT</url>
-            <distribution>repo</distribution>
-        </license>
-    </licenses>
-    <developers>
-        <developer>
-            <id>yuku123</id>
-            <name>yuku123</name>
-            <email>1340947819@qq.com</email>
-            <organization>z-team</organization>
-            <organizationUrl>https://github.com/yuku123</organizationUrl>
-            <timezone>+08:00</timezone>
-            <roles>
-                <role>owner</role>
-            </roles>
-        </developer>
-    </developers>
-    <scm>
-        <connection>scm:git:https://github.com/yuku123/z-cache.git</connection>
-        <developerConnection>scm:git:ssh://git@github.com/yuku123/z-cache.git</developerConnection>
-        <url>https://github.com/yuku123/z-cache</url>
-        <tag>HEAD</tag>
-    </scm>
 
 </project>
