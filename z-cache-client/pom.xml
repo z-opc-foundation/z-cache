@@ -5,11 +5,12 @@
     <modelVersion>4.0.0</modelVersion>
 
     <parent>
-        <groupId>com.zifang</groupId>
+        <groupId>io.github.yuku123</groupId>
         <artifactId>z-cache</artifactId>
-        <version>1.0.0-SNAPSHOT</version>
+        <version>1.0.1</version>
     </parent>
 
+    <groupId>io.github.yuku123</groupId>
     <artifactId>z-cache-client</artifactId>
     <packaging>jar</packaging>
 
@@ -25,14 +26,14 @@
     <dependencies>
         <!-- Common module -->
         <dependency>
-            <groupId>com.zifang</groupId>
+            <groupId>io.github.yuku123</groupId>
             <artifactId>z-cache-common</artifactId>
             <version>${project.version}</version>
         </dependency>
 
         <!-- Core module: integration tests only; production clients only depend on protocol/common -->
         <dependency>
-            <groupId>com.zifang</groupId>
+            <groupId>io.github.yuku123</groupId>
             <artifactId>z-cache-core</artifactId>
             <version>${project.version}</version>
             <scope>test</scope>

@@ -22,3 +22,6 @@
 
 # Maven repository snapshot staged for Docker build (large file with secrets)
 /.build-context/
+# Maven Central 发布凭证
+.env
+.gnupg/

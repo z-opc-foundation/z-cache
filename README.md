@@ -167,7 +167,7 @@ pool.close();
 
 ```xml
 <dependency>
-    <groupId>com.zifang</groupId>
+    <groupId>io.github.yuku123</groupId>
     <artifactId>z-cache-spring-boot-starter</artifactId>
     <version>1.0.0-SNAPSHOT</version>
 </dependency>
@@ -357,7 +357,7 @@ docker compose down -v
 
 | 路径                                      | 说明                                                                 |
 | ----------------------------------------- | -------------------------------------------------------------------- |
-| `pom.xml`                                | Maven 聚合工程（`com.zifang:z-cache` 5 模块）                       |
+| `pom.xml`                                | Maven 聚合工程（`io.github.yuku123:z-cache` 5 模块）                     |
 | `Dockerfile`                             | 多阶段构建 / Eclipse Temurin 8 / 非 root 用户 / `HEALTHCHECK`      |
 | `docker-compose.yml`                     | 容器编排 / `additional_contexts: maven-m2` / 资源限制              |
 | `build.sh`                                | `build` / `deploy` / `logs` / `stop` + 失败回滚                     |

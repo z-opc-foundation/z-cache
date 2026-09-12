@@ -5,18 +5,19 @@
     <modelVersion>4.0.0</modelVersion>
 
     <parent>
-        <groupId>com.zifang</groupId>
+        <groupId>io.github.yuku123</groupId>
         <artifactId>z-cache</artifactId>
-        <version>1.0.0-SNAPSHOT</version>
+        <version>1.0.1</version>
     </parent>
 
+    <groupId>io.github.yuku123</groupId>
     <artifactId>z-cache-spring-boot-starter</artifactId>
     <name>z-cache-spring-boot-starter</name>
     <description>z-cache Spring Boot 自动配置与模板组件</description>
 
     <dependencies>
         <dependency>
-            <groupId>com.zifang</groupId>
+            <groupId>io.github.yuku123</groupId>
             <artifactId>z-cache-client</artifactId>
             <version>${project.version}</version>
         </dependency>
