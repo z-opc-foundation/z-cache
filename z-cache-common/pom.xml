@@ -28,6 +28,7 @@
         <dependency>
             <groupId>io.netty</groupId>
             <artifactId>netty-buffer</artifactId>
+            <version>4.1.100.Final</version>
         </dependency>
 
         <!-- Test -->
@@ -38,5 +39,34 @@
             <scope>test</scope>
         </dependency>
     </dependencies>
+
+    <url>https://github.com/yuku123/z-cache</url>
+    <licenses>
+        <license>
+            <name>MIT License</name>
+            <url>https://opensource.org/licenses/MIT</url>
+            <distribution>repo</distribution>
+        </license>
+    </licenses>
+    <developers>
+        <developer>
+            <id>yuku123</id>
+            <name>yuku123</name>
+            <email>1340947819@qq.com</email>
+            <organization>z-team</organization>
+            <organizationUrl>https://github.com/yuku123</organizationUrl>
+            <timezone>+08:00</timezone>
+            <roles>
+                <role>owner</role>
+            </roles>
+        </developer>
+    </developers>
+    <scm>
+        <connection>scm:git:https://github.com/yuku123/z-cache.git</connection>
+        <developerConnection>scm:git:ssh://git@github.com/yuku123/z-cache.git</developerConnection>
+        <url>https://github.com/yuku123/z-cache</url>
+        <tag>HEAD</tag>
+    </scm>
+
 
 </project>
