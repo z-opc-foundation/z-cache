@@ -13,6 +13,8 @@
     <groupId>io.github.yuku123</groupId>
     <version>1.0.2</version>
     <artifactId>z-cache-core</artifactId>
+    <name>z-cache-core</name>
+    <description>Storage engine + Command handler + Netty server + embedded API</description>
 
     <url>https://github.com/yuku123/z-cache</url>
     <licenses>

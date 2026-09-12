@@ -119,6 +119,21 @@
                         </configuration>
                     </plugin>
 
+                    <!-- sources.jar：Maven Central 强制要求 -->
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-source-plugin</artifactId>
+                        <version>3.3.0</version>
+                        <executions>
+                            <execution>
+                                <id>attach-sources</id>
+                                <goals>
+                                    <goal>jar-no-fork</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+
                     <!-- Maven Central 强制要求 javadoc.jar；用 doclint=none 规避 Java 8+ 的 HTML5 校验 -->
                     <plugin>
                         <groupId>org.apache.maven.plugins</groupId>
