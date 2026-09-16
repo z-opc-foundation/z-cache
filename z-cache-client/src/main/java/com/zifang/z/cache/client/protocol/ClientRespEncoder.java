@@ -1,0 +1,108 @@
+package com.zifang.z.cache.client.protocol;
+
+import com.zifang.z.cache.common.protocol.*;
+import io.netty.buffer.ByteBuf;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.handler.codec.MessageToByteEncoder;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
+import java.nio.charset.StandardCharsets;
+import java.util.List;
+
+/**
+ * RESP protocol encoder for client
+ * Encodes requests into RESP protocol bytes to send to server
+ */
+public class ClientRespEncoder extends MessageToByteEncoder<Object> {
+    private static final Logger logger = LogManager.getLogger(ClientRespEncoder.class);
+
+    // CRLF separator
+    private static final byte[] CRLF = new byte[]{'\r', '\n'};
+    // Null bulk string representation
+    private static final byte[] NULL_BULK_STRING = new byte[]{'$', '-', '1', '\r', '\n'};
+    // Null array representation
+    private static final byte[] NULL_ARRAY = new byte[]{'*', '-', '1', '\r', '\n'};
+
+    @Override
+    protected void encode(ChannelHandlerContext ctx, Object msg, ByteBuf out) throws Exception {
+        if (msg instanceof RespSimpleString) {
+            encodeSimpleString((RespSimpleString) msg, out);
+        } else if (msg instanceof RespError) {
+            encodeError((RespError) msg, out);
+        } else if (msg instanceof RespInteger) {
+            encodeInteger((RespInteger) msg, out);
+        } else if (msg instanceof RespBulkString) {
+            encodeBulkString((RespBulkString) msg, out);
+        } else if (msg instanceof RespArray) {
+            encodeArray((RespArray) msg, out);
+        } else if (msg instanceof String) {
+            // Treat plain String as Simple String
+            encodeSimpleString(RespSimpleString.of((String) msg), out);
+        } else if (msg instanceof Long || msg instanceof Integer) {
+            // Treat numeric types as Integer
+            encodeInteger(RespInteger.of(((Number) msg).longValue()), out);
+        } else if (msg instanceof byte[]) {
+            // Treat byte[] as Bulk String
+            encodeBulkString(RespBulkString.of((byte[]) msg), out);
+        } else if (msg instanceof List) {
+            // Treat List as Array (convert elements)
+            List<?> list = (List<?>) msg;
+            encodeArray(RespArray.of(list), out);
+        } else if (msg == null) {
+            // Null as null bulk string
+            out.writeBytes(NULL_BULK_STRING);
+        } else {
+            throw new IllegalArgumentException("Cannot encode type: " + msg.getClass().getName());
+        }
+    }
+
+    private void encodeSimpleString(RespSimpleString msg, ByteBuf out) {
+        out.writeByte(RespType.SIMPLE_STRING.getPrefix());
+        out.writeBytes(msg.getValue().getBytes(StandardCharsets.UTF_8));
+        out.writeBytes(CRLF);
+    }
+
+    private void encodeError(RespError msg, ByteBuf out) {
+        out.writeByte(RespType.ERROR.getPrefix());
+        out.writeBytes(msg.getMessage().getBytes(StandardCharsets.UTF_8));
+        out.writeBytes(CRLF);
+    }
+
+    private void encodeInteger(RespInteger msg, ByteBuf out) {
+        out.writeByte(RespType.INTEGER.getPrefix());
+        out.writeBytes(Long.toString(msg.getValue()).getBytes(StandardCharsets.UTF_8));
+        out.writeBytes(CRLF);
+    }
+
+    private void encodeBulkString(RespBulkString msg, ByteBuf out) {
+        if (msg.isNull()) {
+            out.writeBytes(NULL_BULK_STRING);
+            return;
+        }
+
+        byte[] data = msg.getData();
+        out.writeByte(RespType.BULK_STRING.getPrefix());
+        out.writeBytes(Integer.toString(data.length).getBytes(StandardCharsets.UTF_8));
+        out.writeBytes(CRLF);
+        out.writeBytes(data);
+        out.writeBytes(CRLF);
+    }
+
+    private void encodeArray(RespArray msg, ByteBuf out) throws Exception {
+        if (msg.isNull()) {
+            out.writeBytes(NULL_ARRAY);
+            return;
+        }
+
+        List<Object> elements = msg.getElements();
+        out.writeByte(RespType.ARRAY.getPrefix());
+        out.writeBytes(Integer.toString(elements.size()).getBytes(StandardCharsets.UTF_8));
+        out.writeBytes(CRLF);
+
+        // Encode each element
+        for (Object element : elements) {
+            encode(null, element, out);
+        }
+    }
+}
