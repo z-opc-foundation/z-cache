@@ -1,7 +1,7 @@
 package com.zifang.z.cache.core.command;
 
 import com.zifang.z.cache.common.protocol.*;
-import com.zifang.z.cache.core.storage.MemoryStore;
+import com.zifang.z.cache.core.storage.*;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -22,6 +22,12 @@ class CommandHandlerJunit5Test {
 
     @BeforeEach
     void setUp() {
+        // 重置静态共享 Store 避免测试间数据泄漏
+        CommandHandler.setHashStore(new HashStore());
+        CommandHandler.setListStore(new ListStore());
+        CommandHandler.setSetStore(new SetStore());
+        CommandHandler.setSortedSetStore(new SortedSetStore());
+
         store = new MemoryStore();
         handler = new CommandHandler(store);
     }
@@ -76,7 +82,8 @@ class CommandHandlerJunit5Test {
 
     @Test
     void testSelectNonZero() {
-        assertTrue(handler.handle(cmd("SELECT", "1")) instanceof RespError);
+        // 新实现支持 0-15 共 16 个数据库
+        assertTrue(handler.handle(cmd("SELECT", "1")) instanceof RespSimpleString);
     }
 
     @Test
