@@ -2,14 +2,20 @@ package com.zifang.z.cache.core.server;
 
 import com.zifang.z.cache.common.protocol.RespError;
 import com.zifang.z.cache.core.command.CommandHandler;
+import com.zifang.z.cache.core.pubsub.PubSubManager;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 /**
- * Netty handler for Redis protocol
- * Processes RESP requests and sends responses
+ * Netty handler for Redis protocol.
+ * <p>
+ * 处理 RESP 请求，支持 PubSub 订阅模式和事务模式。
+ * </p>
+ *
+ * @author zifang
+ * @since 1.0.0
  */
 public class RedisServerHandler extends SimpleChannelInboundHandler<Object> {
 
@@ -17,8 +23,12 @@ public class RedisServerHandler extends SimpleChannelInboundHandler<Object> {
 
     private final CommandHandler commandHandler;
 
-    public RedisServerHandler(CommandHandler commandHandler) {
+    public RedisServerHandler(CommandHandler commandHandler, PubSubManager pubSubManager) {
         this.commandHandler = commandHandler;
+        this.commandHandler.setChannelContext(null); // 会在 channelActive 中设置
+        if (pubSubManager != null) {
+            this.commandHandler.setPubSubManager(pubSubManager);
+        }
     }
 
     @Override
@@ -27,24 +37,32 @@ public class RedisServerHandler extends SimpleChannelInboundHandler<Object> {
             logger.debug("Received: {}", msg);
         }
 
-        // Handle the request through command handler
+        // 确保 CommandHandler 持有当前 ctx
+        commandHandler.setChannelContext(ctx);
+
         Object response = commandHandler.handle(msg);
 
-        // Send response back to client
         if (response != null) {
-            ctx.writeAndFlush(response);
+            if (response instanceof Object[]) {
+                // PubSub 模式下可能返回 Object[] 需要包装为 RespArray
+                ctx.writeAndFlush(response);
+            } else {
+                ctx.writeAndFlush(response);
+            }
         }
     }
 
     @Override
     public void channelActive(ChannelHandlerContext ctx) throws Exception {
         logger.info("Client connected: {}", ctx.channel().remoteAddress());
+        commandHandler.setChannelContext(ctx);
         super.channelActive(ctx);
     }
 
     @Override
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
         logger.info("Client disconnected: {}", ctx.channel().remoteAddress());
+        commandHandler.onDisconnect();
         super.channelInactive(ctx);
     }
 
@@ -52,7 +70,6 @@ public class RedisServerHandler extends SimpleChannelInboundHandler<Object> {
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
         logger.error("Error handling request from {}", ctx.channel().remoteAddress(), cause);
 
-        // Send error response to client
         String errorMessage = cause.getMessage();
         if (errorMessage == null || errorMessage.isEmpty()) {
             errorMessage = "internal error";
@@ -60,7 +77,6 @@ public class RedisServerHandler extends SimpleChannelInboundHandler<Object> {
 
         ctx.writeAndFlush(RespError.of("ERR", errorMessage));
 
-        // Don't close the connection for recoverable errors
         if (cause instanceof java.io.IOException) {
             ctx.close();
         }

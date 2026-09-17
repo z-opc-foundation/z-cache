@@ -428,8 +428,570 @@ public class ZCacheClient implements AutoCloseable {
         return toString(response);
     }
 
+    // ==================== Hash 命令 ====================
+
     /**
-     * 清空当前数据库
+     * 设置 hash 字段值，返回新增字段数量。
+     */
+    public Long hset(String key, String field, String value) {
+        return toLong(sendCommand("HSET", key, field, value));
+    }
+
+    /**
+     * 获取 hash 字段值。
+     */
+    public String hget(String key, String field) {
+        return toString(sendCommand("HGET", key, field));
+    }
+
+    /**
+     * 删除 hash 一个或多个字段，返回删除数量。
+     */
+    public Long hdel(String key, String... fields) {
+        Object[] args = new Object[fields.length + 2];
+        args[0] = "HDEL"; args[1] = key;
+        System.arraycopy(fields, 0, args, 2, fields.length);
+        return toLong(sendCommand("HDEL", (Object[]) args));
+    }
+
+    /**
+     * 检查 hash 字段是否存在。
+     */
+    public Long hexists(String key, String field) {
+        return toLong(sendCommand("HEXISTS", key, field));
+    }
+
+    /**
+     * 获取 hash 所有字段和值，返回 [field1, value1, field2, value2, ...] 列表。
+     */
+    public List<String> hgetall(String key) {
+        Object response = sendCommand("HGETALL", key);
+        if (!(response instanceof com.zifang.z.cache.common.protocol.RespArray)) return new ArrayList<>();
+        List<String> result = new ArrayList<>();
+        for (Object item : ((com.zifang.z.cache.common.protocol.RespArray) response).getElements()) {
+            result.add(toString(item));
+        }
+        return result;
+    }
+
+    /**
+     * 获取 hash 所有字段名。
+     */
+    public List<String> hkeys(String key) {
+        Object response = sendCommand("HKEYS", key);
+        if (!(response instanceof com.zifang.z.cache.common.protocol.RespArray)) return new ArrayList<>();
+        List<String> result = new ArrayList<>();
+        for (Object item : ((com.zifang.z.cache.common.protocol.RespArray) response).getElements()) {
+            result.add(toString(item));
+        }
+        return result;
+    }
+
+    /**
+     * 获取 hash 所有值。
+     */
+    public List<String> hvals(String key) {
+        Object response = sendCommand("HVALS", key);
+        if (!(response instanceof com.zifang.z.cache.common.protocol.RespArray)) return new ArrayList<>();
+        List<String> result = new ArrayList<>();
+        for (Object item : ((com.zifang.z.cache.common.protocol.RespArray) response).getElements()) {
+            result.add(toString(item));
+        }
+        return result;
+    }
+
+    /**
+     * 批量获取 hash 多个字段值。
+     */
+    public List<String> hmget(String key, String... fields) {
+        Object[] args = new Object[fields.length + 2];
+        args[0] = "HMGET"; args[1] = key;
+        System.arraycopy(fields, 0, args, 2, fields.length);
+        Object response = sendCommand("HMGET", (Object[]) args);
+        if (!(response instanceof com.zifang.z.cache.common.protocol.RespArray)) return new ArrayList<>();
+        List<String> result = new ArrayList<>();
+        for (Object item : ((com.zifang.z.cache.common.protocol.RespArray) response).getElements()) {
+            result.add(toString(item));
+        }
+        return result;
+    }
+
+    /**
+     * 批量设置 hash 多个字段值。
+     */
+    public String hmset(String key, String... fieldValues) {
+        Object[] args = new Object[fieldValues.length + 2];
+        args[0] = "HMSET"; args[1] = key;
+        System.arraycopy(fieldValues, 0, args, 2, fieldValues.length);
+        return toString(sendCommand("HMSET", (Object[]) args));
+    }
+
+    /**
+     * hash 字段值加整数。
+     */
+    public Long hincrby(String key, String field, long increment) {
+        return toLong(sendCommand("HINCRBY", key, field, increment));
+    }
+
+    /**
+     * 获取 hash 字段数量。
+     */
+    public Long hlen(String key) {
+        return toLong(sendCommand("HLEN", key));
+    }
+
+    /**
+     * 仅当 hash 字段不存在时设置值。
+     */
+    public Long hsetnx(String key, String field, String value) {
+        return toLong(sendCommand("HSETNX", key, field, value));
+    }
+
+    // ==================== List 命令 ====================
+
+    /**
+     * 从头部插入一个或多个元素。
+     */
+    public Long lpush(String key, String... values) {
+        Object[] args = new Object[values.length + 2];
+        args[0] = "LPUSH"; args[1] = key;
+        System.arraycopy(values, 0, args, 2, values.length);
+        return toLong(sendCommand("LPUSH", (Object[]) args));
+    }
+
+    /**
+     * 从尾部插入一个或多个元素。
+     */
+    public Long rpush(String key, String... values) {
+        Object[] args = new Object[values.length + 2];
+        args[0] = "RPUSH"; args[1] = key;
+        System.arraycopy(values, 0, args, 2, values.length);
+        return toLong(sendCommand("RPUSH", (Object[]) args));
+    }
+
+    /**
+     * 从头部弹出元素。
+     */
+    public String lpop(String key) {
+        return toString(sendCommand("LPOP", key));
+    }
+
+    /**
+     * 从尾部弹出元素。
+     */
+    public String rpop(String key) {
+        return toString(sendCommand("RPOP", key));
+    }
+
+    /**
+     * 获取列表指定范围的元素。
+     */
+    public List<String> lrange(String key, long start, long stop) {
+        Object response = sendCommand("LRANGE", key, start, stop);
+        if (!(response instanceof com.zifang.z.cache.common.protocol.RespArray)) return new ArrayList<>();
+        List<String> result = new ArrayList<>();
+        for (Object item : ((com.zifang.z.cache.common.protocol.RespArray) response).getElements()) {
+            result.add(toString(item));
+        }
+        return result;
+    }
+
+    /**
+     * 通过索引获取列表元素。
+     */
+    public String lindex(String key, long index) {
+        return toString(sendCommand("LINDEX", key, index));
+    }
+
+    /**
+     * 获取列表长度。
+     */
+    public Long llen(String key) {
+        return toLong(sendCommand("LLEN", key));
+    }
+
+    /**
+     * 设置列表指定索引的值。
+     */
+    public String lset(String key, long index, String value) {
+        return toString(sendCommand("LSET", key, index, value));
+    }
+
+    /**
+     * 在列表元素前/后插入新元素。
+     */
+    public Long linsert(String key, String pivot, String value, boolean before) {
+        return toLong(sendCommand("LINSERT", key, before ? "BEFORE" : "AFTER", pivot, value));
+    }
+
+    /**
+     * 移除列表中 count 个值为 value 的元素。
+     */
+    public Long lrem(String key, long count, String value) {
+        return toLong(sendCommand("LREM", key, count, value));
+    }
+
+    /**
+     * 裁剪列表，只保留指定区间内的元素。
+     */
+    public String ltrim(String key, long start, long stop) {
+        return toString(sendCommand("LTRIM", key, start, stop));
+    }
+
+    /**
+     * 将 source 列表尾部弹出的元素放入 destination 列表头部。
+     */
+    public String rpoplpush(String source, String destination) {
+        return toString(sendCommand("RPOPLPUSH", source, destination));
+    }
+
+    // ==================== Set 命令 ====================
+
+    /**
+     * 向集合添加一个或多个成员，返回新增数量。
+     */
+    public Long sadd(String key, String... members) {
+        Object[] args = new Object[members.length + 2];
+        args[0] = "SADD"; args[1] = key;
+        System.arraycopy(members, 0, args, 2, members.length);
+        return toLong(sendCommand("SADD", (Object[]) args));
+    }
+
+    /**
+     * 移除集合一个或多个成员，返回移除数量。
+     */
+    public Long srem(String key, String... members) {
+        Object[] args = new Object[members.length + 2];
+        args[0] = "SREM"; args[1] = key;
+        System.arraycopy(members, 0, args, 2, members.length);
+        return toLong(sendCommand("SREM", (Object[]) args));
+    }
+
+    /**
+     * 获取集合所有成员。
+     */
+    public List<String> smembers(String key) {
+        Object response = sendCommand("SMEMBERS", key);
+        if (!(response instanceof com.zifang.z.cache.common.protocol.RespArray)) return new ArrayList<>();
+        List<String> result = new ArrayList<>();
+        for (Object item : ((com.zifang.z.cache.common.protocol.RespArray) response).getElements()) {
+            result.add(toString(item));
+        }
+        return result;
+    }
+
+    /**
+     * 判断成员是否在集合中。
+     */
+    public Long sismember(String key, String member) {
+        return toLong(sendCommand("SISMEMBER", key, member));
+    }
+
+    /**
+     * 获取集合成员数量。
+     */
+    public Long scard(String key) {
+        return toLong(sendCommand("SCARD", key));
+    }
+
+    /**
+     * 随机获取集合中的成员。
+     */
+    public String srandmember(String key) {
+        return toString(sendCommand("SRANDMEMBER", key));
+    }
+
+    /**
+     * 返回多个集合的交集。
+     */
+    public List<String> sinter(String... keys) {
+        Object[] args = new Object[keys.length + 1];
+        args[0] = "SINTER";
+        System.arraycopy(keys, 0, args, 1, keys.length);
+        Object response = sendCommand("SINTER", (Object[]) args);
+        if (!(response instanceof com.zifang.z.cache.common.protocol.RespArray)) return new ArrayList<>();
+        List<String> result = new ArrayList<>();
+        for (Object item : ((com.zifang.z.cache.common.protocol.RespArray) response).getElements()) {
+            result.add(toString(item));
+        }
+        return result;
+    }
+
+    /**
+     * 返回多个集合的并集。
+     */
+    public List<String> sunion(String... keys) {
+        Object[] args = new Object[keys.length + 1];
+        args[0] = "SUNION";
+        System.arraycopy(keys, 0, args, 1, keys.length);
+        Object response = sendCommand("SUNION", (Object[]) args);
+        if (!(response instanceof com.zifang.z.cache.common.protocol.RespArray)) return new ArrayList<>();
+        List<String> result = new ArrayList<>();
+        for (Object item : ((com.zifang.z.cache.common.protocol.RespArray) response).getElements()) {
+            result.add(toString(item));
+        }
+        return result;
+    }
+
+    /**
+     * 返回第一个集合与其他集合的差集。
+     */
+    public List<String> sdiff(String... keys) {
+        Object[] args = new Object[keys.length + 1];
+        args[0] = "SDIFF";
+        System.arraycopy(keys, 0, args, 1, keys.length);
+        Object response = sendCommand("SDIFF", (Object[]) args);
+        if (!(response instanceof com.zifang.z.cache.common.protocol.RespArray)) return new ArrayList<>();
+        List<String> result = new ArrayList<>();
+        for (Object item : ((com.zifang.z.cache.common.protocol.RespArray) response).getElements()) {
+            result.add(toString(item));
+        }
+        return result;
+    }
+
+    /**
+     * 将成员从 source 移动到 destination。
+     */
+    public Long smove(String source, String destination, String member) {
+        return toLong(sendCommand("SMOVE", source, destination, member));
+    }
+
+    // ==================== Sorted Set 命令 ====================
+
+    /**
+     * 向有序集合添加一个或多个成员，返回新增数量。
+     */
+    public Long zadd(String key, double score, String member) {
+        return toLong(sendCommand("ZADD", key, score, member));
+    }
+
+    /**
+     * 移除有序集合一个或多个成员，返回移除数量。
+     */
+    public Long zrem(String key, String... members) {
+        Object[] args = new Object[members.length + 2];
+        args[0] = "ZREM"; args[1] = key;
+        System.arraycopy(members, 0, args, 2, members.length);
+        return toLong(sendCommand("ZREM", (Object[]) args));
+    }
+
+    /**
+     * 获取有序集合成员的分数。
+     */
+    public String zscore(String key, String member) {
+        return toString(sendCommand("ZSCORE", key, member));
+    }
+
+    /**
+     * 获取有序集合成员的排名（从 0 开始，分数低排前面）。
+     */
+    public Long zrank(String key, String member) {
+        return toLong(sendCommand("ZRANK", key, member));
+    }
+
+    /**
+     * 获取有序集合成员的逆排名。
+     */
+    public Long zrevrank(String key, String member) {
+        return toLong(sendCommand("ZREVRANK", key, member));
+    }
+
+    /**
+     * 获取有序集合成员数量。
+     */
+    public Long zcard(String key) {
+        return toLong(sendCommand("ZCARD", key));
+    }
+
+    /**
+     * 统计有序集合中分数在 min 和 max 之间的成员数量。
+     */
+    public Long zcount(String key, double min, double max) {
+        return toLong(sendCommand("ZCOUNT", key, min, max));
+    }
+
+    /**
+     * 获取有序集合中指定排名范围的成员。
+     */
+    public List<String> zrange(String key, long start, long stop) {
+        Object response = sendCommand("ZRANGE", key, start, stop);
+        if (!(response instanceof com.zifang.z.cache.common.protocol.RespArray)) return new ArrayList<>();
+        List<String> result = new ArrayList<>();
+        for (Object item : ((com.zifang.z.cache.common.protocol.RespArray) response).getElements()) {
+            result.add(toString(item));
+        }
+        return result;
+    }
+
+    /**
+     * 获取有序集合中指定排名范围的成员（逆序）。
+     */
+    public List<String> zrevrange(String key, long start, long stop) {
+        Object response = sendCommand("ZREVRANGE", key, start, stop);
+        if (!(response instanceof com.zifang.z.cache.common.protocol.RespArray)) return new ArrayList<>();
+        List<String> result = new ArrayList<>();
+        for (Object item : ((com.zifang.z.cache.common.protocol.RespArray) response).getElements()) {
+            result.add(toString(item));
+        }
+        return result;
+    }
+
+    /**
+     * 有序集合成员分数增加指定值。
+     */
+    public String zincrby(String key, double increment, String member) {
+        return toString(sendCommand("ZINCRBY", key, increment, member));
+    }
+
+    // ==================== 新增命令 ====================
+
+    /**
+     * 随机返回 hash 中的一个字段名。
+     */
+    public String hrandfield(String key) {
+        return toString(sendCommand("HRANDFIELD", key));
+    }
+
+    /**
+     * 随机返回 hash 中的 count 个字段名。
+     */
+    public List<String> hrandfield(String key, int count) {
+        Object response = sendCommand("HRANDFIELD", key, count);
+        if (!(response instanceof com.zifang.z.cache.common.protocol.RespArray)) return new ArrayList<>();
+        List<String> result = new ArrayList<>();
+        for (Object item : ((com.zifang.z.cache.common.protocol.RespArray) response).getElements()) {
+            result.add(toString(item));
+        }
+        return result;
+    }
+
+    /**
+     * 随机返回集合中的一个成员并移除。
+     */
+    public String spop(String key) {
+        return toString(sendCommand("SPOP", key));
+    }
+
+    /**
+     * 随机返回集合中的 count 个成员并移除。
+     */
+    public List<String> spop(String key, int count) {
+        Object response = sendCommand("SPOP", key, count);
+        if (!(response instanceof com.zifang.z.cache.common.protocol.RespArray)) return new ArrayList<>();
+        List<String> result = new ArrayList<>();
+        for (Object item : ((com.zifang.z.cache.common.protocol.RespArray) response).getElements()) {
+            result.add(toString(item));
+        }
+        return result;
+    }
+
+    /**
+     * 阻塞弹出列表头部元素。
+     */
+    public List<String> blpop(String key, int timeout) {
+        Object response = sendCommand("BLPOP", key, timeout);
+        if (!(response instanceof com.zifang.z.cache.common.protocol.RespArray)) return new ArrayList<>();
+        List<String> result = new ArrayList<>();
+        for (Object item : ((com.zifang.z.cache.common.protocol.RespArray) response).getElements()) {
+            result.add(toString(item));
+        }
+        return result;
+    }
+
+    /**
+     * 阻塞弹出列表尾部元素。
+     */
+    public List<String> brpop(String key, int timeout) {
+        Object response = sendCommand("BRPOP", key, timeout);
+        if (!(response instanceof com.zifang.z.cache.common.protocol.RespArray)) return new ArrayList<>();
+        List<String> result = new ArrayList<>();
+        for (Object item : ((com.zifang.z.cache.common.protocol.RespArray) response).getElements()) {
+            result.add(toString(item));
+        }
+        return result;
+    }
+
+    // ==================== 事务命令 ====================
+
+    /**
+     * 开启事务。
+     */
+    public String multi() {
+        return toString(sendCommand("MULTI"));
+    }
+
+    /**
+     * 执行事务。
+     */
+    public Object exec() {
+        return sendCommand("EXEC");
+    }
+
+    /**
+     * 取消事务。
+     */
+    public String discard() {
+        return toString(sendCommand("DISCARD"));
+    }
+
+    /**
+     * 监控指定的键。
+     */
+    public String watch(String... keys) {
+        Object[] args = new Object[keys.length + 1];
+        args[0] = "WATCH";
+        System.arraycopy(keys, 0, args, 1, keys.length);
+        return toString(sendCommand("WATCH", (Object[]) args));
+    }
+
+    /**
+     * 取消所有 WATCH。
+     */
+    public String unwatch() {
+        return toString(sendCommand("UNWATCH"));
+    }
+
+    // ==================== Pub/Sub 命令 ====================
+
+    /**
+     * 订阅指定频道。
+     */
+    public void subscribe(String... channels) {
+        Object[] args = new Object[channels.length + 1];
+        args[0] = "SUBSCRIBE";
+        System.arraycopy(channels, 0, args, 1, channels.length);
+        sendCommand("SUBSCRIBE", (Object[]) args);
+    }
+
+    /**
+     * 发布消息到指定频道。
+     */
+    public Long publish(String channel, String message) {
+        return toLong(sendCommand("PUBLISH", channel, message));
+    }
+
+    // ==================== Pipeline ====================
+
+    /**
+     * 创建 Pipeline 批量命令处理器。
+     * <p>
+     * 使用方式：
+     * <pre>
+     * ZCachePipeline p = client.pipeline();
+     * p.set("k1", "v1").get("k1").del("k2");
+     * List&lt;Object&gt; results = p.syncAndReturnAll();
+     * </pre>
+     *
+     * @return 新的 Pipeline 实例
+     */
+    public ZCachePipeline pipeline() {
+        return new ZCachePipeline(this);
+    }
+
+    // ==================== 管理命令 ====================
+
+    /**
+     * 清空当前数据库。
      *
      * @return OK 表示成功
      */

@@ -1,17 +1,24 @@
 package com.zifang.z.cache.core.command;
 
 import com.zifang.z.cache.common.protocol.*;
-import com.zifang.z.cache.core.storage.MemoryStore;
+import com.zifang.z.cache.core.logging.SlowLog;
+import com.zifang.z.cache.core.persistence.AofPersistence;
+import com.zifang.z.cache.core.pubsub.PubSubManager;
+import com.zifang.z.cache.core.storage.*;
+import io.netty.channel.ChannelHandlerContext;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.*;
+import java.util.concurrent.ThreadLocalRandom;
 
 /**
- * Redis命令处理器
- * 处理RESP数组格式的请求并执行对应的命令
+ * Redis 命令处理器 — 支持完整 Redis 命令集的内存缓存服务器。
+ * <p>
+ * 每个 Netty 连接拥有独立的 CommandHandler 实例，per-connection 状态
+ * （currentDb、transactionContext、channelContext）是线程安全的。
+ * 共享组件（PubSubManager、SlowLog、子存储）通过静态字段在所有连接间共享。
  *
  * @author zifang
  * @since 1.0.0
@@ -23,573 +30,1164 @@ public class CommandHandler {
     private final String password;
     private volatile boolean authenticated;
 
-    /**
-     * 构造函数
-     *
-     * @param store 内存存储实例
-     */
+    // per-connection 状态
+    private int currentDb = 0;
+    private final TransactionManager transactionManager;
+    private final TransactionManager.TransactionContext transactionContext;
+    private ChannelHandlerContext channelContext;
+
+    // 共享组件
+    private static PubSubManager pubSubManager;
+    private static SlowLog slowLog;
+    private static AofPersistence aofPersistence;
+    private static HashStore hashStore;
+    private static ListStore listStore;
+    private static SetStore setStore;
+    private static SortedSetStore sortedSetStore;
+
+    // ======================== 构造 ========================
+
     public CommandHandler(MemoryStore store) {
         this(store, null);
     }
 
-    /**
-     * 创建带可选密码认证的命令处理器。密码为空时关闭认证。
-     */
     public CommandHandler(MemoryStore store, String password) {
         this.store = store;
         this.password = password;
         this.authenticated = password == null;
+        this.transactionManager = new TransactionManager();
+        this.transactionContext = new TransactionManager.TransactionContext();
+        synchronized (CommandHandler.class) {
+            if (hashStore == null) hashStore = new HashStore();
+            if (listStore == null) listStore = new ListStore();
+            if (setStore == null) setStore = new SetStore();
+            if (sortedSetStore == null) sortedSetStore = new SortedSetStore();
+        }
     }
 
-    /**
-     * 处理RESP请求（必须是数组格式的命令）
-     *
-     * @param request RESP请求对象
-     * @return 执行结果，错误时返回RespError
-     */
-    public Object handle(Object request) {
-        if (request == null) {
-            return RespError.of("ERR", "empty request");
-        }
+    // ---- 共享组件 setter ----
+    public static void setPubSubManager(PubSubManager m) { pubSubManager = m; }
+    public static void setSlowLog(SlowLog l) { slowLog = l; }
+    public static void setAofPersistence(AofPersistence a) { aofPersistence = a; }
+    public static void setHashStore(HashStore hs) { hashStore = hs; }
+    public static void setListStore(ListStore ls) { listStore = ls; }
+    public static void setSetStore(SetStore ss) { setStore = ss; }
+    public static void setSortedSetStore(SortedSetStore zss) { sortedSetStore = zss; }
+    public void setChannelContext(ChannelHandlerContext ctx) { this.channelContext = ctx; }
 
+    /**
+     * 客户端断开连接时的清理逻辑。
+     * 清理该连接的 PubSub 订阅、事务上下文。
+     */
+    public void onDisconnect() {
+        if (pubSubManager != null && channelContext != null) {
+            pubSubManager.removeClient(channelContext);
+        }
+        if (transactionManager != null) {
+            transactionManager.cleanup(transactionContext);
+        }
+    }
+
+    // ======================== 核心分发 ========================
+
+    public Object handle(Object request) {
+        if (request == null) return RespError.of("ERR", "empty request");
         if (!(request instanceof RespArray)) {
             logger.warn("Request is not an array: {}", request.getClass().getName());
             return RespError.of("ERR", "Protocol error: expected array");
         }
-
         RespArray array = (RespArray) request;
         String[] args = array.toStringArray();
-
-        if (args.length == 0) {
-            return RespError.of("ERR", "empty command");
-        }
-
+        if (args.length == 0) return RespError.of("ERR", "empty command");
         String cmd = args[0].toUpperCase();
         logger.debug("Processing command: {} with {} args", cmd, args.length);
 
-        if ("AUTH".equals(cmd)) {
-            return handleAuth(args);
+        long startTime = System.nanoTime();
+
+        // Pub/Sub 模式检查
+        if (pubSubManager != null && channelContext != null
+                && pubSubManager.isSubscribed(channelContext)) {
+            switch (cmd) {
+                case "SUBSCRIBE":    return handleSubscribe(args);
+                case "UNSUBSCRIBE":  return handleUnsubscribe(args);
+                case "PSUBSCRIBE":   return handlePsubscribe(args);
+                case "PUNSUBSCRIBE": return handlePunsubscribe(args);
+                case "PING":         return RespSimpleString.of("PONG");
+                case "QUIT":         return RespSimpleString.of("OK");
+                default:
+                    return RespError.of("ERR",
+                            "Can't execute this command in subscribe mode");
+            }
         }
-        if (!authenticated) {
-            return RespError.of("NOAUTH", "Authentication required.");
+
+        if ("AUTH".equals(cmd)) return handleAuth(args);
+        if (!authenticated) return RespError.of("NOAUTH", "Authentication required.");
+
+        if (!executingTransaction && transactionContext.isInTransaction()
+                && !"MULTI".equals(cmd) && !"EXEC".equals(cmd) && !"DISCARD".equals(cmd)) {
+            transactionManager.addCommand(transactionContext, args);
+            return RespSimpleString.of("QUEUED");
         }
 
         try {
+            Object result;
             switch (cmd) {
-                // Connection commands
-                case "PING":
-                    return handlePing(args);
-                case "ECHO":
-                    return handleEcho(args);
-                case "QUIT":
-                    return RespSimpleString.of("OK");
-                case "SELECT":
-                    return handleSelect(args);
-
-                // String commands
-                case "SET":
-                    return handleSet(args);
-                case "GET":
-                    return handleGet(args);
-                case "DEL":
-                    return handleDel(args);
-                case "EXISTS":
-                    return handleExists(args);
-                case "EXPIRE":
-                    return handleExpire(args);
-                case "TTL":
-                    return handleTtl(args);
-                case "PTTL":
-                    return handlePttl(args);
-                case "PERSIST":
-                    return handlePersist(args);
-                case "SETEX":
-                    return handleSetex(args);
-                case "PSETEX":
-                    return handlePsetex(args);
-                case "SETNX":
-                    return handleSetnx(args);
-                case "GETSET":
-                    return handleGetset(args);
-                case "MGET":
-                    return handleMget(args);
-                case "MSET":
-                    return handleMset(args);
-                case "APPEND":
-                    return handleAppend(args);
-                case "STRLEN":
-                    return handleStrlen(args);
-                case "INCR":
-                    return handleIncrement(args, 1);
-                case "DECR":
-                    return handleIncrement(args, -1);
-                case "INCRBY":
-                    return handleIncrementBy(args, 1);
-                case "DECRBY":
-                    return handleIncrementBy(args, -1);
-                case "PEXPIRE":
-                    return handlePexpire(args);
-                case "KEYS":
-                    return handleKeys(args);
-                case "DBSIZE":
-                    return RespInteger.of(store.dbsize());
-                case "FLUSHDB":
-                    store.flush();
-                    return RespSimpleString.of("OK");
-                case "FLUSHALL":
-                    store.flush();
-                    return RespSimpleString.of("OK");
-                case "INFO":
-                    return handleInfo(args);
-                case "TYPE":
-                    return handleType(args);
-
-                // Unknown command
+                case "PING":     result = handlePing(args);       break;
+                case "ECHO":     result = handleEcho(args);       break;
+                case "QUIT":     result = RespSimpleString.of("OK"); break;
+                case "SELECT":   result = handleSelect(args);     break;
+                case "DBSIZE":   result = handleDbsize();         break;
+                case "SET":      result = handleSet(args);        break;
+                case "GET":      result = handleGet(args);        break;
+                case "DEL":      result = handleDel(args);        break;
+                case "EXISTS":   result = handleExists(args);     break;
+                case "EXPIRE":   result = handleExpire(args);     break;
+                case "PEXPIRE":  result = handlePexpire(args);    break;
+                case "TTL":      result = handleTtl(args);        break;
+                case "PTTL":     result = handlePttl(args);       break;
+                case "PERSIST":  result = handlePersist(args);    break;
+                case "SETEX":    result = handleSetex(args);      break;
+                case "PSETEX":   result = handlePsetex(args);     break;
+                case "SETNX":    result = handleSetnx(args);      break;
+                case "GETSET":   result = handleGetset(args);     break;
+                case "MGET":     result = handleMget(args);       break;
+                case "MSET":     result = handleMset(args);       break;
+                case "APPEND":   result = handleAppend(args);     break;
+                case "STRLEN":   result = handleStrlen(args);     break;
+                case "INCR":     result = handleIncr(args, 1);    break;
+                case "DECR":     result = handleIncr(args, -1);   break;
+                case "INCRBY":   result = handleIncrby(args, 1);  break;
+                case "DECRBY":   result = handleIncrby(args, -1); break;
+                case "KEYS":     result = handleKeys(args);       break;
+                case "TYPE":     result = handleType(args);       break;
+                case "RENAME":   result = handleRename(args, false); break;
+                case "RENAMENX": result = handleRename(args, true);  break;
+                case "RANDOMKEY":result = handleRandomkey();      break;
+                case "HSET":     result = handleHset(args);       break;
+                case "HGET":     result = handleHget(args);       break;
+                case "HDEL":     result = handleHdel(args);       break;
+                case "HEXISTS":  result = handleHexists(args);    break;
+                case "HGETALL":  result = handleHgetall(args);    break;
+                case "HKEYS":    result = handleHkeys(args);      break;
+                case "HVALS":    result = handleHvals(args);      break;
+                case "HMGET":    result = handleHmget(args);      break;
+                case "HMSET":    result = handleHmset(args);      break;
+                case "HINCRBY":  result = handleHincrby(args);    break;
+                case "HLEN":     result = handleHlen(args);       break;
+                case "HSETNX":   result = handleHsetnx(args);     break;
+                case "HSCAN":    result = handleHscan(args);      break;
+                case "LPUSH":    result = handleLpush(args);      break;
+                case "RPUSH":    result = handleRpush(args);      break;
+                case "LPOP":     result = handleLpop(args);       break;
+                case "RPOP":     result = handleRpop(args);       break;
+                case "LRANGE":   result = handleLrange(args);     break;
+                case "LINDEX":   result = handleLindex(args);     break;
+                case "LLEN":     result = handleLlen(args);       break;
+                case "LSET":     result = handleLset(args);       break;
+                case "LINSERT":  result = handleLinsert(args);    break;
+                case "LREM":     result = handleLrem(args);       break;
+                case "LTRIM":    result = handleLtrim(args);      break;
+                case "RPOPLPUSH":result = handleRpoplpush(args);  break;
+                case "BLPOP":    result = handleBpop(args, "LEFT");    break;
+                case "BRPOP":    result = handleBpop(args, "RIGHT");   break;
+                case "BRPOPLPUSH": result = handleRpoplpush(args); break;
+                case "HRANDFIELD": result = handleHrandfield(args); break;
+                case "SSCAN":    result = handleSscan(args);      break;
+                case "ZSCAN":    result = handleZscan(args);      break;
+                case "SADD":     result = handleSadd(args);       break;
+                case "SREM":     result = handleSrem(args);       break;
+                case "SMEMBERS": result = handleSmembers(args);   break;
+                case "SISMEMBER":result = handleSismember(args);  break;
+                case "SCARD":    result = handleScard(args);      break;
+                case "SRANDMEMBER": result = handleSrandmember(args); break;
+                case "SINTER":   result = handleSinter(args);     break;
+                case "SUNION":   result = handleSunion(args);     break;
+                case "SDIFF":    result = handleSdiff(args);      break;
+                case "SMOVE":    result = handleSmove(args);      break;
+                case "ZADD":     result = handleZadd(args);       break;
+                case "ZREM":     result = handleZrem(args);       break;
+                case "ZSCORE":   result = handleZscore(args);     break;
+                case "ZRANK":    result = handleZrank(args);      break;
+                case "ZREVRANK": result = handleZrevrank(args);   break;
+                case "ZCARD":    result = handleZcard(args);      break;
+                case "ZCOUNT":   result = handleZcount(args);     break;
+                case "ZRANGE":   result = handleZrange(args, false);  break;
+                case "ZREVRANGE":result = handleZrange(args, true);   break;
+                case "ZRANGEBYSCORE":    result = handleZrangebyscore(args, false); break;
+                case "ZREVRANGEBYSCORE": result = handleZrangebyscore(args, true);  break;
+                case "ZINCRBY":  result = handleZincrby(args);    break;
+                case "HINCRBYFLOAT": result = handleHincrbyfloat(args); break;
+                case "LMOVE":    result = handleLmove(args);       break;
+                case "SPOP":     result = handleSpop(args);        break;
+                case "SINTERSTORE": result = handleSinterstore(args); break;
+                case "SUNIONSTORE": result = handleSunionstore(args); break;
+                case "SDIFFSTORE":  result = handleSdiffstore(args);  break;
+                case "ZLEXCOUNT":   result = handleZlexcount(args);   break;
+                case "ZRANGEBYLEX": result = handleZrangebylex(args, false); break;
+                case "ZREVRANGEBYLEX": result = handleZrangebylex(args, true); break;
+                case "ZREMRANGEBYLEX": result = handleZremrangebylex(args); break;
+                case "ZREMRANGEBYRANK": result = handleZremrangebyrank(args); break;
+                case "ZREMRANGEBYSCORE": result = handleZremrangebyscore(args); break;
+                case "ZRANDMEMBER": result = handleZrandmember(args); break;
+                case "SCAN":     result = handleScan(args);        break;
+                case "MULTI":    result = handleMulti();    break;
+                case "EXEC":     result = handleExec();     break;
+                case "DISCARD":  result = handleDiscard();  break;
+                case "WATCH":    result = handleWatch(args); break;
+                case "UNWATCH":  result = handleUnwatch();  break;
+                case "SUBSCRIBE":    result = handleSubscribe(args);    break;
+                case "UNSUBSCRIBE":  result = handleUnsubscribe(args);  break;
+                case "PSUBSCRIBE":   result = handlePsubscribe(args);   break;
+                case "PUNSUBSCRIBE": result = handlePunsubscribe(args); break;
+                case "PUBLISH":      result = handlePublish(args);      break;
+                case "PUBSUB":       result = handlePubsub(args);       break;
+                case "BGSAVE":  result = RespSimpleString.of("OK"); break;
+                case "SAVE":    result = RespSimpleString.of("OK"); break;
+                case "LASTSAVE":result = RespInteger.of((int)(System.currentTimeMillis()/1000)); break;
+                case "SLOWLOG": result = handleSlowlog(args); break;
+                case "FLUSHDB":  result = handleFlushdb();  break;
+                case "FLUSHALL": result = handleFlushall(); break;
+                case "INFO":     result = handleInfo(args);    break;
                 default:
                     logger.warn("Unknown command: {}", cmd);
-                    return RespError.unknownCommand(cmd);
+                    result = RespError.unknownCommand(cmd);
             }
+            if (slowLog != null) {
+                long duration = System.nanoTime() - startTime;
+                slowLog.log(duration, args);
+            }
+            // AOF 追加写命令
+            appendAof(args);
+            return result;
         } catch (Exception e) {
             logger.error("Error executing command: {} - {}", cmd, e.getMessage(), e);
             return RespError.of("ERR", "internal error: " + e.getMessage());
         }
     }
 
+    // ==================== 连接命令 ====================
+
     private Object handleAuth(String[] args) {
-        if (password == null) {
-            return RespError.of("ERR", "AUTH called without any password configured");
-        }
-        if (args.length != 2) {
-            return RespError.wrongNumberOfArguments("AUTH");
-        }
-        if (password.equals(args[1])) {
-            authenticated = true;
-            return RespSimpleString.of("OK");
-        }
+        if (password == null) return RespError.of("ERR", "AUTH called without any password configured");
+        if (args.length != 2) return RespError.wrongNumberOfArguments("AUTH");
+        if (password.equals(args[1])) { authenticated = true; return RespSimpleString.of("OK"); }
         return RespError.of("WRONGPASS", "invalid username-password pair or user is disabled.");
     }
 
-    /**
-     * 处理PING命令
-     *
-     * @param args 命令参数
-     * @return PONG响应或带消息的响应
-     */
     private Object handlePing(String[] args) {
-        if (args.length == 1) {
-            return RespSimpleString.of("PONG");
-        } else if (args.length == 2) {
-            return RespBulkString.of(args[1]);
-        } else {
-            return RespError.wrongNumberOfArguments("PING");
-        }
+        if (args.length == 1) return RespSimpleString.of("PONG");
+        if (args.length == 2) return RespBulkString.of(args[1]);
+        return RespError.wrongNumberOfArguments("PING");
     }
 
-    /**
-     * 处理ECHO命令
-     *
-     * @param args 命令参数
-     * @return 回显消息
-     */
     private Object handleEcho(String[] args) {
-        if (args.length != 2) {
-            return RespError.wrongNumberOfArguments("ECHO");
-        }
+        if (args.length != 2) return RespError.wrongNumberOfArguments("ECHO");
         return RespBulkString.of(args[1]);
     }
 
-    /**
-     * 处理SELECT命令
-     *
-     * @param args 命令参数
-     * @return OK响应
-     */
     private Object handleSelect(String[] args) {
-        if (args.length != 2) {
-            return RespError.wrongNumberOfArguments("SELECT");
-        }
-        // Currently only support database 0
+        if (args.length != 2) return RespError.wrongNumberOfArguments("SELECT");
         try {
             int db = Integer.parseInt(args[1]);
-            if (db != 0) {
-                return RespError.of("ERR", "DB index is out of range");
-            }
+            if (db < 0 || db > 15) return RespError.of("ERR", "DB index is out of range");
+            this.currentDb = db;
+            return RespSimpleString.of("OK");
         } catch (NumberFormatException e) {
             return RespError.of("ERR", "invalid DB index");
         }
-        return RespSimpleString.of("OK");
     }
 
-    // ==================== String Commands ====================
+    // ==================== String 命令 ====================
 
-    /**
-     * 处理SET命令
-     *
-     * @param args 命令参数
-     * @return OK响应或nil
-     */
     private Object handleSet(String[] args) {
-        if (args.length < 3) {
-            return RespError.wrongNumberOfArguments("SET");
-        }
-
-        String key = args[1];
-        String value = args[2];
-
-        // Parse options
-        Integer expireSeconds = null;
-        Long expireMillis = null;
-        boolean nx = false; // Only set if not exists
-        boolean xx = false; // Only set if exists
-
+        if (args.length < 3) return RespError.wrongNumberOfArguments("SET");
+        String key = args[1], value = args[2];
+        Integer expireSeconds = null; Long expireMillis = null;
+        boolean nx = false, xx = false;
         for (int i = 3; i < args.length; i++) {
             String opt = args[i].toUpperCase();
             switch (opt) {
-                case "EX":
-                    if (i + 1 >= args.length) {
-                        return RespError.syntaxError();
-                    }
-                    try {
-                        expireSeconds = Integer.parseInt(args[++i]);
-                    } catch (NumberFormatException e) {
-                        return RespError.of("ERR", "value is not an integer or out of range");
-                    }
-                    break;
-                case "PX":
-                    if (i + 1 >= args.length) {
-                        return RespError.syntaxError();
-                    }
-                    try {
-                        expireMillis = Long.parseLong(args[++i]);
-                    } catch (NumberFormatException e) {
-                        return RespError.of("ERR", "value is not an integer or out of range");
-                    }
-                    break;
-                case "NX":
-                    nx = true;
-                    break;
-                case "XX":
-                    xx = true;
-                    break;
-                default:
-                    return RespError.syntaxError();
+                case "EX": if (i+1>=args.length) return RespError.syntaxError();
+                    try { expireSeconds = Integer.parseInt(args[++i]); } catch (NumberFormatException e) { return RespError.of("ERR","value is not an integer or out of range"); } break;
+                case "PX": if (i+1>=args.length) return RespError.syntaxError();
+                    try { expireMillis = Long.parseLong(args[++i]); } catch (NumberFormatException e) { return RespError.of("ERR","value is not an integer or out of range"); } break;
+                case "NX": nx = true; break;
+                case "XX": xx = true; break;
+                default: return RespError.syntaxError();
             }
         }
-
-        // Check NX/XX conditions
-        boolean exists = store.exists(key);
-        if (nx && exists) {
-            return RespBulkString.nullBulkString(); // Don't set, return nil
-        }
-        if (xx && !exists) {
-            return RespBulkString.nullBulkString(); // Don't set, return nil
-        }
-
-        // Store the value
-        if (expireMillis != null) {
-            store.psetex(key, expireMillis, value.getBytes(StandardCharsets.UTF_8));
-        } else if (expireSeconds != null) {
-            store.setex(key, expireSeconds, value.getBytes(StandardCharsets.UTF_8));
-        } else {
-            store.set(key, value.getBytes(StandardCharsets.UTF_8));
-        }
-
+        boolean exists = store.existsDb(currentDb, key);
+        if (nx && exists) return RespBulkString.nullBulkString();
+        if (xx && !exists) return RespBulkString.nullBulkString();
+        byte[] val = value.getBytes(StandardCharsets.UTF_8);
+        if (expireMillis != null) store.psetexDb(currentDb, key, expireMillis, val);
+        else if (expireSeconds != null) store.setexDb(currentDb, key, expireSeconds, val);
+        else store.setDb(currentDb, key, val);
         return RespSimpleString.of("OK");
     }
 
-    /**
-     * 处理GET命令
-     *
-     * @param args 命令参数
-     * @return 值或nil
-     */
     private Object handleGet(String[] args) {
-        if (args.length != 2) {
-            return RespError.wrongNumberOfArguments("GET");
-        }
-        String key = args[1];
-        byte[] value = store.get(key);
-        if (value == null) {
-            return RespBulkString.nullBulkString();
-        }
-        return RespBulkString.of(value);
+        if (args.length != 2) return RespError.wrongNumberOfArguments("GET");
+        byte[] v = store.getDb(currentDb, args[1]);
+        return v == null ? RespBulkString.nullBulkString() : RespBulkString.of(v);
     }
 
-    /**
-     * 处理DEL命令
-     *
-     * @param args 命令参数
-     * @return 删除的键数量
-     */
     private Object handleDel(String[] args) {
-        if (args.length < 2) {
-            return RespError.wrongNumberOfArguments("DEL");
-        }
-        String[] keys = new String[args.length - 1];
-        System.arraycopy(args, 1, keys, 0, keys.length);
-        long deleted = store.del(keys);
-        return RespInteger.of(deleted);
-    }
-
-    /**
-     * 处理EXISTS命令
-     *
-     * @param args 命令参数
-     * @return 存在的键数量
-     */
-    private Object handleExists(String[] args) {
-        if (args.length < 2) {
-            return RespError.wrongNumberOfArguments("EXISTS");
-        }
+        if (args.length < 2) return RespError.wrongNumberOfArguments("DEL");
         long count = 0;
         for (int i = 1; i < args.length; i++) {
-            if (store.exists(args[i])) {
-                count++;
-            }
+            String k = args[i];
+            if (store.delDb(currentDb, k)) { count++; continue; }
+            if (store.getHashStore(currentDb).del(k)) { count++; continue; }
+            if (store.getListStore(currentDb).del(k)) { count++; continue; }
+            if (store.getSetStore(currentDb).del(k)) { count++; continue; }
+            if (store.getSortedSetStore(currentDb).del(k)) count++;
         }
         return RespInteger.of(count);
     }
 
-    /**
-     * 处理EXPIRE命令
-     *
-     * @param args 命令参数
-     * @return 1表示设置成功，0表示键不存在
-     */
+    private Object handleExists(String[] args) {
+        if (args.length < 2) return RespError.wrongNumberOfArguments("EXISTS");
+        long c = 0;
+        for (int i = 1; i < args.length; i++) if (keyExists(args[i])) c++;
+        return RespInteger.of(c);
+    }
+
     private Object handleExpire(String[] args) {
-        if (args.length != 3) {
-            return RespError.wrongNumberOfArguments("EXPIRE");
-        }
-        String key = args[1];
-        int seconds;
-        try {
-            seconds = Integer.parseInt(args[2]);
-        } catch (NumberFormatException e) {
-            return RespError.of("ERR", "value is not an integer or out of range");
-        }
-        boolean result = store.expire(key, seconds);
-        return RespInteger.of(result ? 1 : 0);
+        if (args.length != 3) return RespError.wrongNumberOfArguments("EXPIRE");
+        try { return RespInteger.of(store.expireDb(currentDb, args[1], Integer.parseInt(args[2])) ? 1 : 0); }
+        catch (NumberFormatException e) { return RespError.of("ERR","value is not an integer or out of range"); }
     }
 
-    /**
-     * 处理TTL命令
-     *
-     * @param args 命令参数
-     * @return 剩余过期时间（秒）
-     */
+    private Object handlePexpire(String[] args) {
+        if (args.length != 3) return RespError.wrongNumberOfArguments("PEXPIRE");
+        try { return RespInteger.of(store.pexpireDb(currentDb, args[1], Long.parseLong(args[2])) ? 1 : 0); }
+        catch (NumberFormatException e) { return RespError.of("ERR","value is not an integer or out of range"); }
+    }
+
     private Object handleTtl(String[] args) {
-        if (args.length != 2) {
-            return RespError.wrongNumberOfArguments("TTL");
-        }
-        String key = args[1];
-        long ttl = store.ttl(key);
-        return RespInteger.of(ttl);
+        if (args.length != 2) return RespError.wrongNumberOfArguments("TTL");
+        return RespInteger.of(store.ttlDb(currentDb, args[1]));
     }
 
-    /**
-     * 处理PERSIST命令
-     *
-     * @param args 命令参数
-     * @return 1表示移除成功，0表示键不存在或无过期时间
-     */
+    private Object handlePttl(String[] args) {
+        if (args.length != 2) return RespError.wrongNumberOfArguments("PTTL");
+        return RespInteger.of(store.pttlDb(currentDb, args[1]));
+    }
+
     private Object handlePersist(String[] args) {
-        if (args.length != 2) {
-            return RespError.wrongNumberOfArguments("PERSIST");
-        }
-        String key = args[1];
-        boolean result = store.persist(key);
-        return RespInteger.of(result ? 1 : 0);
+        if (args.length != 2) return RespError.wrongNumberOfArguments("PERSIST");
+        return RespInteger.of(store.persistDb(currentDb, args[1]) ? 1 : 0);
     }
 
-    /**
-     * 处理SETEX命令
-     *
-     * @param args 命令参数
-     * @return OK响应
-     */
     private Object handleSetex(String[] args) {
-        if (args.length != 4) {
-            return RespError.wrongNumberOfArguments("SETEX");
-        }
-        String key = args[1];
-        int seconds;
-        try {
-            seconds = Integer.parseInt(args[2]);
-        } catch (NumberFormatException e) {
-            return RespError.of("ERR", "value is not an integer or out of range");
-        }
-        byte[] value = args[3].getBytes(StandardCharsets.UTF_8);
-        store.setex(key, seconds, value);
-        return RespSimpleString.of("OK");
+        if (args.length != 4) return RespError.wrongNumberOfArguments("SETEX");
+        try { store.setexDb(currentDb, args[1], Integer.parseInt(args[2]), args[3].getBytes(StandardCharsets.UTF_8)); return RespSimpleString.of("OK"); }
+        catch (NumberFormatException e) { return RespError.of("ERR","value is not an integer or out of range"); }
     }
 
-    /**
-     * 处理PSETEX命令
-     *
-     * @param args 命令参数
-     * @return OK响应
-     */
     private Object handlePsetex(String[] args) {
-        if (args.length != 4) {
-            return RespError.wrongNumberOfArguments("PSETEX");
-        }
-        String key = args[1];
-        long milliseconds;
-        try {
-            milliseconds = Long.parseLong(args[2]);
-        } catch (NumberFormatException e) {
-            return RespError.of("ERR", "value is not an integer or out of range");
-        }
-        byte[] value = args[3].getBytes(StandardCharsets.UTF_8);
-        store.psetex(key, milliseconds, value);
-        return RespSimpleString.of("OK");
+        if (args.length != 4) return RespError.wrongNumberOfArguments("PSETEX");
+        try { store.psetexDb(currentDb, args[1], Long.parseLong(args[2]), args[3].getBytes(StandardCharsets.UTF_8)); return RespSimpleString.of("OK"); }
+        catch (NumberFormatException e) { return RespError.of("ERR","value is not an integer or out of range"); }
     }
 
     private Object handleSetnx(String[] args) {
-        if (args.length != 3) {
-            return RespError.wrongNumberOfArguments("SETNX");
-        }
-        return RespInteger.of(store.setIfAbsent(args[1], args[2].getBytes(StandardCharsets.UTF_8)) ? 1 : 0);
+        if (args.length != 3) return RespError.wrongNumberOfArguments("SETNX");
+        return RespInteger.of(store.setIfAbsentDb(currentDb, args[1], args[2].getBytes(StandardCharsets.UTF_8)) ? 1 : 0);
     }
 
     private Object handleGetset(String[] args) {
-        if (args.length != 3) {
-            return RespError.wrongNumberOfArguments("GETSET");
-        }
-        byte[] oldValue = store.getAndSet(args[1], args[2].getBytes(StandardCharsets.UTF_8));
-        return oldValue == null ? RespBulkString.nullBulkString() : RespBulkString.of(oldValue);
+        if (args.length != 3) return RespError.wrongNumberOfArguments("GETSET");
+        byte[] old = store.getAndSetDb(currentDb, args[1], args[2].getBytes(StandardCharsets.UTF_8));
+        return old == null ? RespBulkString.nullBulkString() : RespBulkString.of(old);
     }
 
     private Object handleMget(String[] args) {
-        if (args.length < 2) {
-            return RespError.wrongNumberOfArguments("MGET");
-        }
-        List<byte[]> values = store.mget(java.util.Arrays.copyOfRange(args, 1, args.length));
-        Object[] response = new Object[values.size()];
-        for (int i = 0; i < values.size(); i++) {
-            response[i] = values.get(i) == null ? RespBulkString.nullBulkString() : RespBulkString.of(values.get(i));
-        }
-        return RespArray.of(response);
+        if (args.length < 2) return RespError.wrongNumberOfArguments("MGET");
+        List<byte[]> vals = store.mgetDb(currentDb, Arrays.copyOfRange(args, 1, args.length));
+        Object[] r = new Object[vals.size()];
+        for (int i = 0; i < vals.size(); i++) r[i] = vals.get(i)==null ? RespBulkString.nullBulkString() : RespBulkString.of(vals.get(i));
+        return RespArray.of(r);
     }
 
     private Object handleMset(String[] args) {
-        if (args.length < 3 || args.length % 2 == 0) {
-            return RespError.wrongNumberOfArguments("MSET");
-        }
-        for (int i = 1; i < args.length; i += 2) {
-            store.set(args[i], args[i + 1].getBytes(StandardCharsets.UTF_8));
-        }
+        if (args.length < 3 || args.length%2==0) return RespError.wrongNumberOfArguments("MSET");
+        for (int i = 1; i < args.length; i += 2) store.setDb(currentDb, args[i], args[i+1].getBytes(StandardCharsets.UTF_8));
         return RespSimpleString.of("OK");
     }
 
     private Object handleAppend(String[] args) {
-        if (args.length != 3) {
-            return RespError.wrongNumberOfArguments("APPEND");
-        }
-        return RespInteger.of(store.append(args[1], args[2].getBytes(StandardCharsets.UTF_8)));
+        if (args.length != 3) return RespError.wrongNumberOfArguments("APPEND");
+        return RespInteger.of(store.appendDb(currentDb, args[1], args[2].getBytes(StandardCharsets.UTF_8)));
     }
 
     private Object handleStrlen(String[] args) {
-        if (args.length != 2) {
-            return RespError.wrongNumberOfArguments("STRLEN");
-        }
-        byte[] value = store.get(args[1]);
-        return RespInteger.of(value == null ? 0 : value.length);
+        if (args.length != 2) return RespError.wrongNumberOfArguments("STRLEN");
+        byte[] v = store.getDb(currentDb, args[1]);
+        return RespInteger.of(v==null ? 0 : v.length);
     }
 
-    private Object handleIncrement(String[] args, long delta) {
-        String command = delta > 0 ? "INCR" : "DECR";
-        if (args.length != 2) {
-            return RespError.wrongNumberOfArguments(command);
-        }
-        return incrementResult(args[1], delta);
+    private Object handleIncr(String[] args, long delta) {
+        if (args.length != 2) return RespError.wrongNumberOfArguments(delta>0?"INCR":"DECR");
+        try { return RespInteger.of(store.incrementDb(currentDb, args[1], delta)); }
+        catch (IllegalArgumentException e) { return RespError.of("ERR", e.getMessage()); }
     }
 
-    private Object handleIncrementBy(String[] args, long sign) {
-        String command = sign > 0 ? "INCRBY" : "DECRBY";
-        if (args.length != 3) {
-            return RespError.wrongNumberOfArguments(command);
-        }
-        try {
-            long delta = Long.parseLong(args[2]);
-            return incrementResult(args[1], sign > 0 ? delta : Math.negateExact(delta));
-        } catch (NumberFormatException e) {
-            return RespError.of("ERR", "value is not an integer or out of range");
-        } catch (ArithmeticException e) {
-            return RespError.of("ERR", "increment or decrement would overflow");
-        }
+    private Object handleIncrby(String[] args, long sign) {
+        if (args.length != 3) return RespError.wrongNumberOfArguments(sign>0?"INCRBY":"DECRBY");
+        try { long d = Long.parseLong(args[2]); return RespInteger.of(store.incrementDb(currentDb, args[1], sign>0?d:Math.negateExact(d))); }
+        catch (NumberFormatException e) { return RespError.of("ERR","value is not an integer or out of range"); }
+        catch (ArithmeticException e) { return RespError.of("ERR","increment or decrement would overflow"); }
     }
 
-    private Object incrementResult(String key, long delta) {
-        try {
-            return RespInteger.of(store.increment(key, delta));
-        } catch (IllegalArgumentException e) {
-            return RespError.of("ERR", e.getMessage());
-        }
-    }
-
-    private Object handlePexpire(String[] args) {
-        if (args.length != 3) {
-            return RespError.wrongNumberOfArguments("PEXPIRE");
-        }
-        try {
-            return RespInteger.of(store.pexpire(args[1], Long.parseLong(args[2])) ? 1 : 0);
-        } catch (NumberFormatException e) {
-            return RespError.of("ERR", "value is not an integer or out of range");
-        }
-    }
-
-    private Object handlePttl(String[] args) {
-        if (args.length != 2) {
-            return RespError.wrongNumberOfArguments("PTTL");
-        }
-        return RespInteger.of(store.pttl(args[1]));
-    }
-
-    private Object handleInfo(String[] args) {
-        if (args.length > 2) {
-            return RespError.wrongNumberOfArguments("INFO");
-        }
-        String info = "# Server\r\n" +
-                "z-cache_version:1.0.0\r\n" +
-                "redis_compatible:resp2\r\n\r\n" +
-                "# Stats\r\n" +
-                "keyspace_hits:" + store.getHits() + "\r\n" +
-                "keyspace_misses:" + store.getMisses() + "\r\n" +
-                "evicted_keys:" + store.getEvictions() + "\r\n" +
-                "max_entries:" + store.getMaxEntries() + "\r\n" +
-                "hit_rate:" + String.format(java.util.Locale.ROOT, "%.6f", hitRate()) + "\r\n" +
-                "db0_keys:" + store.dbsize() + "\r\n";
-        return RespBulkString.of(info);
-    }
-
-    private double hitRate() {
-        long hits = store.getHits();
-        long misses = store.getMisses();
-        return hits + misses == 0 ? 0.0 : (double) hits / (hits + misses);
+    private Object handleKeys(String[] args) {
+        if (args.length != 2) return RespError.wrongNumberOfArguments("KEYS");
+        String pattern = args[1];
+        Set<String> allKeys = new LinkedHashSet<>(store.keysDb(currentDb, pattern));
+        allKeys.addAll(store.getHashStore(currentDb).keys());
+        allKeys.addAll(store.getListStore(currentDb).keys());
+        allKeys.addAll(store.getSetStore(currentDb).keys());
+        allKeys.addAll(store.getSortedSetStore(currentDb).keys());
+        String regex = globToRegex(pattern);
+        List<RespBulkString> result = new ArrayList<>();
+        for (String k : allKeys) if (k.matches(regex)) result.add(RespBulkString.of(k));
+        return RespArray.of(result.stream().map(k->(Object)k).toArray());
     }
 
     private Object handleType(String[] args) {
-        if (args.length != 2) {
-            return RespError.wrongNumberOfArguments("TYPE");
-        }
-        return RespSimpleString.of(store.exists(args[1]) ? "string" : "none");
+        if (args.length != 2) return RespError.wrongNumberOfArguments("TYPE");
+        String k = args[1];
+        if (store.existsDb(currentDb, k)) return RespSimpleString.of("string");
+        if (store.getHashStore(currentDb).exists(k)) return RespSimpleString.of("hash");
+        if (store.getListStore(currentDb).exists(k)) return RespSimpleString.of("list");
+        if (store.getSetStore(currentDb).exists(k)) return RespSimpleString.of("set");
+        if (store.getSortedSetStore(currentDb).exists(k)) return RespSimpleString.of("zset");
+        return RespSimpleString.of("none");
     }
 
-    /**
-     * 处理KEYS命令
-     *
-     * @param args 命令参数
-     * @return 匹配的键列表
-     */
-    private Object handleKeys(String[] args) {
-        if (args.length != 2) {
-            return RespError.wrongNumberOfArguments("KEYS");
+    private Object handleDbsize() { return RespInteger.of(store.dbsizeDb(currentDb)); }
+
+    // ==================== Key 命令 ====================
+
+    private Object handleRename(String[] args, boolean nx) {
+        if (args.length != 3) return RespError.wrongNumberOfArguments(nx?"RENAMENX":"RENAME");
+        String src = args[1], dst = args[2];
+        if (src.equals(dst)) return RespError.of("ERR","source and destination objects are the same");
+        if (nx && keyExists(dst)) return RespInteger.of(0);
+        if (store.existsDb(currentDb, src)) {
+            byte[] val = store.getDb(currentDb, src); Long ttlMs = store.pttlDb(currentDb, src); store.delDb(currentDb, src);
+            store.setDb(currentDb, dst, val); if (ttlMs > 0) store.pexpireDb(currentDb, dst, ttlMs);
+            return nx ? RespInteger.of(1) : RespSimpleString.of("OK");
         }
-        List<RespBulkString> keys = new ArrayList<>();
-        for (String key : store.keys(args[1])) {
-            keys.add(RespBulkString.of(key));
+        if (store.getHashStore(currentDb).exists(src)) { Map<String,byte[]> m = store.getHashStore(currentDb).hgetall(src); store.getHashStore(currentDb).del(src); store.getHashStore(currentDb).hmset(dst, m); return nx?RespInteger.of(1):RespSimpleString.of("OK"); }
+        if (store.getListStore(currentDb).exists(src)) { List<byte[]> l = store.getListStore(currentDb).lrange(src,0,-1); store.getListStore(currentDb).del(src); store.getListStore(currentDb).rpush(dst, l.toArray(new byte[0][])); return nx?RespInteger.of(1):RespSimpleString.of("OK"); }
+        if (store.getSetStore(currentDb).exists(src)) { List<byte[]> s = store.getSetStore(currentDb).smembers(src); store.getSetStore(currentDb).del(src); store.getSetStore(currentDb).sadd(dst, s.toArray(new byte[0][])); return nx?RespInteger.of(1):RespSimpleString.of("OK"); }
+        if (store.getSortedSetStore(currentDb).exists(src)) {
+            List<byte[]> r = store.getSortedSetStore(currentDb).zrange(src, 0, -1, true);
+            store.getSortedSetStore(currentDb).del(src);
+            for (int i = 0; i < r.size(); i += 2) {
+                double score = Double.parseDouble(new String(r.get(i+1), StandardCharsets.UTF_8));
+                store.getSortedSetStore(currentDb).zadd(dst, score, r.get(i));
+            }
+            return nx ? RespInteger.of(1) : RespSimpleString.of("OK");
         }
-        return RespArray.of(keys.stream().map(k -> (Object) k).toArray());
+        return RespError.noSuchKey();
     }
+
+    private Object handleRandomkey() {
+        List<String> all = new ArrayList<>(store.keysDb(currentDb, "*"));
+        all.addAll(store.getHashStore(currentDb).keys()); all.addAll(store.getListStore(currentDb).keys());
+        all.addAll(store.getSetStore(currentDb).keys()); all.addAll(store.getSortedSetStore(currentDb).keys());
+        if (all.isEmpty()) return RespBulkString.nullBulkString();
+        return RespBulkString.of(all.get(ThreadLocalRandom.current().nextInt(all.size())));
+    }
+
+    // ==================== Hash 命令 ====================
+
+    private Object handleHset(String[] args) {
+        if (args.length < 4 || (args.length-2)%2!=0) return RespError.wrongNumberOfArguments("HSET");
+        long added = 0;
+        for (int i = 2; i < args.length; i += 2) added += store.getHashStore(currentDb).hset(args[1], args[i], args[i+1].getBytes(StandardCharsets.UTF_8));
+        return RespInteger.of(added);
+    }
+
+    private Object handleHget(String[] args) {
+        if (args.length != 3) return RespError.wrongNumberOfArguments("HGET");
+        byte[] v = store.getHashStore(currentDb).hget(args[1], args[2]);
+        return v == null ? RespBulkString.nullBulkString() : RespBulkString.of(v);
+    }
+
+    private Object handleHdel(String[] args) {
+        if (args.length < 3) return RespError.wrongNumberOfArguments("HDEL");
+        return RespInteger.of(store.getHashStore(currentDb).hdel(args[1], Arrays.copyOfRange(args, 2, args.length)));
+    }
+
+    private Object handleHexists(String[] args) {
+        if (args.length != 3) return RespError.wrongNumberOfArguments("HEXISTS");
+        return RespInteger.of(store.getHashStore(currentDb).hexists(args[1], args[2]) ? 1 : 0);
+    }
+
+    private Object handleHgetall(String[] args) {
+        if (args.length != 2) return RespError.wrongNumberOfArguments("HGETALL");
+        Map<String,byte[]> m = store.getHashStore(currentDb).hgetall(args[1]);
+        List<Object> r = new ArrayList<>(m.size()*2);
+        for (Map.Entry<String,byte[]> e : m.entrySet()) { r.add(RespBulkString.of(e.getKey())); r.add(e.getValue()==null?RespBulkString.nullBulkString():RespBulkString.of(e.getValue())); }
+        return RespArray.of(r);
+    }
+
+    private Object handleHkeys(String[] args) {
+        if (args.length != 2) return RespError.wrongNumberOfArguments("HKEYS");
+        List<String> k = store.getHashStore(currentDb).hkeys(args[1]); Object[] r = new Object[k.size()];
+        for (int i = 0; i < k.size(); i++) r[i] = RespBulkString.of(k.get(i));
+        return RespArray.of(r);
+    }
+
+    private Object handleHvals(String[] args) {
+        if (args.length != 2) return RespError.wrongNumberOfArguments("HVALS");
+        List<byte[]> v = store.getHashStore(currentDb).hvals(args[1]); Object[] r = new Object[v.size()];
+        for (int i = 0; i < v.size(); i++) r[i] = v.get(i)==null?RespBulkString.nullBulkString():RespBulkString.of(v.get(i));
+        return RespArray.of(r);
+    }
+
+    private Object handleHmget(String[] args) {
+        if (args.length < 3) return RespError.wrongNumberOfArguments("HMGET");
+        List<byte[]> v = store.getHashStore(currentDb).hmget(args[1], Arrays.copyOfRange(args,2,args.length));
+        Object[] r = new Object[v.size()];
+        for (int i = 0; i < v.size(); i++) r[i] = v.get(i)==null?RespBulkString.nullBulkString():RespBulkString.of(v.get(i));
+        return RespArray.of(r);
+    }
+
+    private Object handleHmset(String[] args) {
+        if (args.length < 4 || (args.length-2)%2!=0) return RespError.wrongNumberOfArguments("HMSET");
+        Map<String,byte[]> f = new LinkedHashMap<>();
+        for (int i = 2; i < args.length; i += 2) f.put(args[i], args[i+1].getBytes(StandardCharsets.UTF_8));
+        store.getHashStore(currentDb).hmset(args[1], f);
+        return RespSimpleString.of("OK");
+    }
+
+    private Object handleHincrby(String[] args) {
+        if (args.length != 4) return RespError.wrongNumberOfArguments("HINCRBY");
+        try { return RespInteger.of(store.getHashStore(currentDb).hincrby(args[1], args[2], Long.parseLong(args[3]))); }
+        catch (NumberFormatException e) { return RespError.of("ERR","value is not an integer or out of range"); }
+        catch (IllegalArgumentException e) { return RespError.of("ERR", e.getMessage()); }
+    }
+
+    private Object handleHlen(String[] args) {
+        if (args.length != 2) return RespError.wrongNumberOfArguments("HLEN");
+        return RespInteger.of(store.getHashStore(currentDb).hlen(args[1]));
+    }
+
+    private Object handleHsetnx(String[] args) {
+        if (args.length != 4) return RespError.wrongNumberOfArguments("HSETNX");
+        return RespInteger.of(store.getHashStore(currentDb).hsetnx(args[1], args[2], args[3].getBytes(StandardCharsets.UTF_8)) ? 1 : 0);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Object handleHscan(String[] args) {
+        if (args.length < 3) return RespError.wrongNumberOfArguments("HSCAN");
+        String pattern = null;
+        for (int i = 3; i < args.length; i++) if ("MATCH".equalsIgnoreCase(args[i]) && i+1<args.length) pattern = args[++i];
+        Object[] sr = store.getHashStore(currentDb).hscan(args[1], args[2], pattern);
+        Map<String,byte[]> m = (Map<String,byte[]>)sr[1];
+        List<Object> fv = new ArrayList<>();
+        for (Map.Entry<String,byte[]> e : m.entrySet()) { fv.add(RespBulkString.of(e.getKey())); fv.add(e.getValue()==null?RespBulkString.nullBulkString():RespBulkString.of(e.getValue())); }
+        return RespArray.of(new Object[]{ RespBulkString.of((String)sr[0]), RespArray.of(fv) });
+    }
+
+    // ==================== List 命令 ====================
+
+    private Object handleLpush(String[] args) {
+        if (args.length < 3) return RespError.wrongNumberOfArguments("LPUSH");
+        byte[][] v = new byte[args.length-2][]; for (int i=2;i<args.length;i++) v[i-2]=args[i].getBytes(StandardCharsets.UTF_8);
+        return RespInteger.of(store.getListStore(currentDb).lpush(args[1], v));
+    }
+
+    private Object handleRpush(String[] args) {
+        if (args.length < 3) return RespError.wrongNumberOfArguments("RPUSH");
+        byte[][] v = new byte[args.length-2][]; for (int i=2;i<args.length;i++) v[i-2]=args[i].getBytes(StandardCharsets.UTF_8);
+        return RespInteger.of(store.getListStore(currentDb).rpush(args[1], v));
+    }
+
+    private Object handleLpop(String[] args) {
+        if (args.length != 2) return RespError.wrongNumberOfArguments("LPOP");
+        byte[] v = store.getListStore(currentDb).lpop(args[1]); return v==null?RespBulkString.nullBulkString():RespBulkString.of(v);
+    }
+
+    private Object handleRpop(String[] args) {
+        if (args.length != 2) return RespError.wrongNumberOfArguments("RPOP");
+        byte[] v = store.getListStore(currentDb).rpop(args[1]); return v==null?RespBulkString.nullBulkString():RespBulkString.of(v);
+    }
+
+    private Object handleLrange(String[] args) {
+        if (args.length != 4) return RespError.wrongNumberOfArguments("LRANGE");
+        try {
+            List<byte[]> l = store.getListStore(currentDb).lrange(args[1], Integer.parseInt(args[2]), Integer.parseInt(args[3]));
+            Object[] r = new Object[l.size()]; for (int i=0;i<l.size();i++) r[i]=l.get(i)==null?RespBulkString.nullBulkString():RespBulkString.of(l.get(i));
+            return RespArray.of(r);
+        } catch (NumberFormatException e) { return RespError.of("ERR","value is not an integer or out of range"); }
+    }
+
+    private Object handleLindex(String[] args) {
+        if (args.length != 3) return RespError.wrongNumberOfArguments("LINDEX");
+        try { byte[] v = store.getListStore(currentDb).lindex(args[1], Integer.parseInt(args[2])); return v==null?RespBulkString.nullBulkString():RespBulkString.of(v); }
+        catch (NumberFormatException e) { return RespError.of("ERR","value is not an integer or out of range"); }
+    }
+
+    private Object handleLlen(String[] args) {
+        if (args.length != 2) return RespError.wrongNumberOfArguments("LLEN");
+        return RespInteger.of(store.getListStore(currentDb).llen(args[1]));
+    }
+
+    private Object handleLset(String[] args) {
+        if (args.length != 4) return RespError.wrongNumberOfArguments("LSET");
+        try { store.getListStore(currentDb).lset(args[1], Integer.parseInt(args[2]), args[3].getBytes(StandardCharsets.UTF_8)); return RespSimpleString.of("OK"); }
+        catch (NumberFormatException e) { return RespError.of("ERR","value is not an integer or out of range"); }
+        catch (IndexOutOfBoundsException e) { return RespError.of("ERR","index out of range"); }
+    }
+
+    private Object handleLinsert(String[] args) {
+        if (args.length != 5) return RespError.wrongNumberOfArguments("LINSERT");
+        boolean before = "BEFORE".equalsIgnoreCase(args[2]);
+        if (!before && !"AFTER".equalsIgnoreCase(args[2])) return RespError.of("ERR","syntax error, use BEFORE or AFTER");
+        return RespInteger.of(store.getListStore(currentDb).linsert(args[1], args[3].getBytes(StandardCharsets.UTF_8), args[4].getBytes(StandardCharsets.UTF_8), before));
+    }
+
+    private Object handleLrem(String[] args) {
+        if (args.length != 4) return RespError.wrongNumberOfArguments("LREM");
+        try { return RespInteger.of(store.getListStore(currentDb).lrem(args[1], Integer.parseInt(args[2]), args[3].getBytes(StandardCharsets.UTF_8))); }
+        catch (NumberFormatException e) { return RespError.of("ERR","value is not an integer or out of range"); }
+    }
+
+    private Object handleLtrim(String[] args) {
+        if (args.length != 4) return RespError.wrongNumberOfArguments("LTRIM");
+        try { store.getListStore(currentDb).ltrim(args[1], Integer.parseInt(args[2]), Integer.parseInt(args[3])); return RespSimpleString.of("OK"); }
+        catch (NumberFormatException e) { return RespError.of("ERR","value is not an integer or out of range"); }
+    }
+
+    private Object handleRpoplpush(String[] args) {
+        if (args.length != 3) return RespError.wrongNumberOfArguments("RPOPLPUSH");
+        byte[] v = store.getListStore(currentDb).rpoplpush(args[1], args[2]);
+        return v==null?RespBulkString.nullBulkString():RespBulkString.of(v);
+    }
+
+    // ==================== Set 命令 ====================
+
+    private Object handleSadd(String[] args) {
+        if (args.length < 3) return RespError.wrongNumberOfArguments("SADD");
+        byte[][] m = new byte[args.length-2][]; for (int i=2;i<args.length;i++) m[i-2]=args[i].getBytes(StandardCharsets.UTF_8);
+        return RespInteger.of(store.getSetStore(currentDb).sadd(args[1], m));
+    }
+
+    private Object handleSrem(String[] args) {
+        if (args.length < 3) return RespError.wrongNumberOfArguments("SREM");
+        byte[][] m = new byte[args.length-2][]; for (int i=2;i<args.length;i++) m[i-2]=args[i].getBytes(StandardCharsets.UTF_8);
+        return RespInteger.of(store.getSetStore(currentDb).srem(args[1], m));
+    }
+
+    private Object handleSmembers(String[] args) {
+        if (args.length != 2) return RespError.wrongNumberOfArguments("SMEMBERS");
+        List<byte[]> m = store.getSetStore(currentDb).smembers(args[1]); Object[] r = new Object[m.size()];
+        for (int i=0;i<m.size();i++) r[i]=RespBulkString.of(m.get(i));
+        return RespArray.of(r);
+    }
+
+    private Object handleSismember(String[] args) {
+        if (args.length != 3) return RespError.wrongNumberOfArguments("SISMEMBER");
+        return RespInteger.of(store.getSetStore(currentDb).sismember(args[1], args[2].getBytes(StandardCharsets.UTF_8)) ? 1 : 0);
+    }
+
+    private Object handleScard(String[] args) {
+        if (args.length != 2) return RespError.wrongNumberOfArguments("SCARD");
+        return RespInteger.of(store.getSetStore(currentDb).scard(args[1]));
+    }
+
+    private Object handleSrandmember(String[] args) {
+        if (args.length<2||args.length>3) return RespError.wrongNumberOfArguments("SRANDMEMBER");
+        int count = args.length==3 ? Integer.parseInt(args[2]) : 1;
+        List<byte[]> m = store.getSetStore(currentDb).srandmember(args[1], count);
+        if (args.length==2) { if (m.isEmpty()) return RespBulkString.nullBulkString(); return RespBulkString.of(m.get(0)); }
+        Object[] r = new Object[m.size()]; for (int i=0;i<m.size();i++) r[i]=RespBulkString.of(m.get(i));
+        return RespArray.of(r);
+    }
+
+    private Object handleSinter(String[] args) {
+        if (args.length < 2) return RespError.wrongNumberOfArguments("SINTER");
+        List<byte[]> m = store.getSetStore(currentDb).sinter(Arrays.copyOfRange(args,1,args.length));
+        Object[] r = new Object[m.size()]; for (int i=0;i<m.size();i++) r[i]=RespBulkString.of(m.get(i));
+        return RespArray.of(r);
+    }
+
+    private Object handleSunion(String[] args) {
+        if (args.length < 2) return RespError.wrongNumberOfArguments("SUNION");
+        List<byte[]> m = store.getSetStore(currentDb).sunion(Arrays.copyOfRange(args,1,args.length));
+        Object[] r = new Object[m.size()]; for (int i=0;i<m.size();i++) r[i]=RespBulkString.of(m.get(i));
+        return RespArray.of(r);
+    }
+
+    private Object handleSdiff(String[] args) {
+        if (args.length < 2) return RespError.wrongNumberOfArguments("SDIFF");
+        List<byte[]> m = store.getSetStore(currentDb).sdiff(Arrays.copyOfRange(args,1,args.length));
+        Object[] r = new Object[m.size()]; for (int i=0;i<m.size();i++) r[i]=RespBulkString.of(m.get(i));
+        return RespArray.of(r);
+    }
+
+    private Object handleSmove(String[] args) {
+        if (args.length != 4) return RespError.wrongNumberOfArguments("SMOVE");
+        return RespInteger.of(store.getSetStore(currentDb).smove(args[1], args[2], args[3].getBytes(StandardCharsets.UTF_8)) ? 1 : 0);
+    }
+
+    // ==================== Sorted Set 命令 ====================
+
+    private Object handleZadd(String[] args) {
+        if (args.length < 4 || (args.length-2)%2!=0) return RespError.wrongNumberOfArguments("ZADD");
+        long added = 0;
+        for (int i = 2; i < args.length; i += 2) {
+            try { added += store.getSortedSetStore(currentDb).zadd(args[1], Double.parseDouble(args[i]), args[i+1].getBytes(StandardCharsets.UTF_8)); }
+            catch (NumberFormatException e) { return RespError.of("ERR","value is not a valid float"); }
+        }
+        return RespInteger.of(added);
+    }
+
+    private Object handleZrem(String[] args) {
+        if (args.length < 3) return RespError.wrongNumberOfArguments("ZREM");
+        byte[][] m = new byte[args.length-2][]; for (int i=2;i<args.length;i++) m[i-2]=args[i].getBytes(StandardCharsets.UTF_8);
+        return RespInteger.of(store.getSortedSetStore(currentDb).zrem(args[1], m));
+    }
+
+    private Object handleZscore(String[] args) {
+        if (args.length != 3) return RespError.wrongNumberOfArguments("ZSCORE");
+        Double s = store.getSortedSetStore(currentDb).zscore(args[1], args[2].getBytes(StandardCharsets.UTF_8));
+        return s==null ? RespBulkString.nullBulkString() : RespBulkString.of(formatDouble(s));
+    }
+
+    private Object handleZrank(String[] args) {
+        if (args.length != 3) return RespError.wrongNumberOfArguments("ZRANK");
+        return RespInteger.of(store.getSortedSetStore(currentDb).zrank(args[1], args[2].getBytes(StandardCharsets.UTF_8)));
+    }
+
+    private Object handleZrevrank(String[] args) {
+        if (args.length != 3) return RespError.wrongNumberOfArguments("ZREVRANK");
+        return RespInteger.of(store.getSortedSetStore(currentDb).zrevrank(args[1], args[2].getBytes(StandardCharsets.UTF_8)));
+    }
+
+    private Object handleZcard(String[] args) {
+        if (args.length != 2) return RespError.wrongNumberOfArguments("ZCARD");
+        return RespInteger.of(store.getSortedSetStore(currentDb).zcard(args[1]));
+    }
+
+    private Object handleZcount(String[] args) {
+        if (args.length != 4) return RespError.wrongNumberOfArguments("ZCOUNT");
+        try { return RespInteger.of(store.getSortedSetStore(currentDb).zcount(args[1], parseScore(args[2]), parseScore(args[3]))); }
+        catch (NumberFormatException e) { return RespError.of("ERR","value is not a valid float"); }
+    }
+
+    private Object handleZrange(String[] args, boolean reverse) {
+        if (args.length < 4) return RespError.wrongNumberOfArguments(reverse?"ZREVRANGE":"ZRANGE");
+        try {
+            boolean ws = args.length==5 && "WITHSCORES".equalsIgnoreCase(args[4]);
+            List<byte[]> r = reverse ? store.getSortedSetStore(currentDb).zrevrange(args[1], Long.parseLong(args[2]), Long.parseLong(args[3]), ws)
+                    : store.getSortedSetStore(currentDb).zrange(args[1], Long.parseLong(args[2]), Long.parseLong(args[3]), ws);
+            return toRespArray(r);
+        } catch (NumberFormatException e) { return RespError.of("ERR","value is not an integer or out of range"); }
+    }
+
+    private Object handleZrangebyscore(String[] args, boolean reverse) {
+        if (args.length < 4) return RespError.wrongNumberOfArguments(reverse?"ZREVRANGEBYSCORE":"ZRANGEBYSCORE");
+        try {
+            double min = parseScore(args[2]), max = parseScore(args[3]);
+            boolean ws=false; int offset=0, count=-1;
+            for (int i=4;i<args.length;i++) { if ("WITHSCORES".equalsIgnoreCase(args[i])) ws=true; else if ("LIMIT".equalsIgnoreCase(args[i])&&i+2<args.length) { offset=Integer.parseInt(args[++i]); count=Integer.parseInt(args[++i]); } }
+            List<byte[]> r = reverse ? store.getSortedSetStore(currentDb).zrevrangebyscore(args[1], max, min, ws, offset, count)
+                    : store.getSortedSetStore(currentDb).zrangebyscore(args[1], min, max, ws, offset, count);
+            return toRespArray(r);
+        } catch (NumberFormatException e) { return RespError.of("ERR","value is not a valid float"); }
+    }
+
+    private Object handleZincrby(String[] args) {
+        if (args.length != 4) return RespError.wrongNumberOfArguments("ZINCRBY");
+        try {
+            double ns = store.getSortedSetStore(currentDb).zincrby(args[1], Double.parseDouble(args[2]), args[3].getBytes(StandardCharsets.UTF_8));
+            return RespBulkString.of(formatDouble(ns));
+        } catch (NumberFormatException e) { return RespError.of("ERR","value is not a valid float"); }
+    }
+
+    // ==================== 事务命令 ====================
+
+    private Object handleMulti() { try { transactionManager.multi(transactionContext); return RespSimpleString.of("OK"); } catch (IllegalStateException e) { return RespError.of("ERR",e.getMessage()); } }
+    private volatile boolean executingTransaction = false;
+
+    private Object handleExec() {
+        try {
+            // 设置执行标志，让 handle() 跳过入队逻辑
+            executingTransaction = true;
+            try {
+                Object r = transactionManager.exec(transactionContext, a -> {
+                    String[] s = new String[a.length];
+                    for (int i = 0; i < a.length; i++) s[i] = a[i] == null ? null : a[i].toString();
+                    return handle(RespArray.of(Arrays.stream(s).map(x -> (Object) RespBulkString.of(x)).toArray()));
+                });
+                return r == null ? RespError.of("ERR", "EXECABORT Transaction discarded because of previous errors.") : r;
+            } finally {
+                executingTransaction = false;
+            }
+        } catch (IllegalStateException e) {
+            return RespError.of("ERR", e.getMessage());
+        }
+    }
+    private Object handleDiscard() { try { transactionManager.discard(transactionContext); return RespSimpleString.of("OK"); } catch (IllegalStateException e) { return RespError.of("ERR",e.getMessage()); } }
+    private Object handleWatch(String[] args) {
+        if (args.length < 2) return RespError.wrongNumberOfArguments("WATCH");
+        try { transactionManager.watch(transactionContext, Arrays.copyOfRange(args,1,args.length), store::getKeyVersion); return RespSimpleString.of("OK"); } catch (IllegalStateException e) { return RespError.of("ERR",e.getMessage()); }
+    }
+    private Object handleUnwatch() { transactionManager.unwatch(transactionContext); return RespSimpleString.of("OK"); }
+
+    // ==================== Pub/Sub 命令 ====================
+
+    private Object handleSubscribe(String[] args) {
+        if (args.length<2) return RespError.wrongNumberOfArguments("SUBSCRIBE");
+        if (pubSubManager==null) return RespError.of("ERR","Pub/Sub not configured");
+        String[] ch = Arrays.copyOfRange(args,1,args.length); pubSubManager.subscribe(channelContext, ch);
+        Object[] r = new Object[ch.length]; for (int i=0;i<ch.length;i++) r[i]=RespArray.of(RespBulkString.of("subscribe"),RespBulkString.of(ch[i]),RespInteger.of(i+1));
+        return ch.length==1 ? r[0] : RespArray.of(r);
+    }
+    private Object handleUnsubscribe(String[] args) {
+        if (pubSubManager==null) return RespSimpleString.of("OK");
+        String[] ch = args.length<2 ? new String[0] : Arrays.copyOfRange(args,1,args.length); pubSubManager.unsubscribe(channelContext, ch);
+        if (ch.length==0) return RespArray.empty();
+        Object[] r = new Object[ch.length]; for (int i=0;i<ch.length;i++) r[i]=RespArray.of(RespBulkString.of("unsubscribe"),RespBulkString.of(ch[i]),RespInteger.of(0));
+        return ch.length==1 ? r[0] : RespArray.of(r);
+    }
+    private Object handlePsubscribe(String[] args) {
+        if (args.length<2) return RespError.wrongNumberOfArguments("PSUBSCRIBE");
+        if (pubSubManager==null) return RespError.of("ERR","Pub/Sub not configured");
+        String[] p = Arrays.copyOfRange(args,1,args.length); pubSubManager.psubscribe(channelContext, p);
+        Object[] r = new Object[p.length]; for (int i=0;i<p.length;i++) r[i]=RespArray.of(RespBulkString.of("psubscribe"),RespBulkString.of(p[i]),RespInteger.of(i+1));
+        return p.length==1 ? r[0] : RespArray.of(r);
+    }
+    private Object handlePunsubscribe(String[] args) {
+        if (pubSubManager==null) return RespSimpleString.of("OK");
+        String[] p = args.length<2 ? new String[0] : Arrays.copyOfRange(args,1,args.length); pubSubManager.punsubscribe(channelContext, p);
+        if (p.length==0) return RespArray.empty();
+        Object[] r = new Object[p.length]; for (int i=0;i<p.length;i++) r[i]=RespArray.of(RespBulkString.of("punsubscribe"),RespBulkString.of(p[i]),RespInteger.of(0));
+        return p.length==1 ? r[0] : RespArray.of(r);
+    }
+    private Object handlePublish(String[] args) {
+        if (args.length!=3) return RespError.wrongNumberOfArguments("PUBLISH");
+        return RespInteger.of(pubSubManager==null ? 0 : pubSubManager.publish(args[1], args[2]));
+    }
+    private Object handlePubsub(String[] args) {
+        if (args.length<2) return RespError.wrongNumberOfArguments("PUBSUB");
+        if (pubSubManager==null) return RespError.of("ERR","Pub/Sub not configured");
+        switch (args[1].toUpperCase()) {
+            case "CHANNELS": { String p=args.length>2?args[2]:null; Set<String> c=pubSubManager.getChannels(p); Object[] r=new Object[c.size()]; int i=0; for (String s:c) r[i++]=RespBulkString.of(s); return RespArray.of(r); }
+            case "NUMSUB": { String[] ch=args.length>2?Arrays.copyOfRange(args,2,args.length):new String[0]; Map<String,Integer> n=pubSubManager.getNumSub(ch); List<Object> r=new ArrayList<>(); for (Map.Entry<String,Integer> e:n.entrySet()) { r.add(RespBulkString.of(e.getKey())); r.add(RespInteger.of(e.getValue())); } return RespArray.of(r); }
+            case "NUMPAT": return RespInteger.of(pubSubManager.getNumPat());
+            default: return RespError.syntaxError();
+        }
+    }
+
+    // ==================== 管理命令 ====================
+
+    private Object handleSlowlog(String[] args) {
+        if (args.length<2) return RespError.wrongNumberOfArguments("SLOWLOG");
+        if (slowLog==null) return RespError.of("ERR","SlowLog not configured");
+        switch (args[1].toUpperCase()) {
+            case "GET": { int c=args.length>2?Integer.parseInt(args[2]):10; List<SlowLog.SlowLogEntry> e=slowLog.get(c); Object[] r=new Object[e.size()]; for(int i=0;i<e.size();i++) { SlowLog.SlowLogEntry en=e.get(i); r[i]=RespArray.of(RespInteger.of(en.getId()),RespInteger.of(en.getTimestampNanos()/1000),RespInteger.of(en.getDurationNanos()/1000),toRespArray(en.getArgs())); } return RespArray.of(r); }
+            case "LEN": return RespInteger.of(slowLog.len());
+            case "RESET": slowLog.reset(); return RespSimpleString.of("OK");
+            default: return RespError.syntaxError();
+        }
+    }
+
+    private Object handleFlushdb() { store.flushDb(currentDb); return RespSimpleString.of("OK"); }
+    private Object handleFlushall() { store.flushAll(); return RespSimpleString.of("OK"); }
+
+    private Object handleInfo(String[] args) {
+        String sec = args.length > 1 ? args[1].toUpperCase() : null;
+        StringBuilder sb = new StringBuilder();
+        if (sec == null || "SERVER".equals(sec)) {
+            sb.append("# Server\r\n");
+            sb.append("z-cache_version:1.0.2\r\n");
+            sb.append("redis_compatible:resp2\r\n");
+            sb.append("os:").append(System.getProperty("os.name")).append(" ").append(System.getProperty("os.version")).append("\r\n");
+            sb.append("java_version:").append(System.getProperty("java.version")).append("\r\n");
+            sb.append("uptime_in_seconds:").append((System.currentTimeMillis() - store.getStartTime()) / 1000).append("\r\n");
+            sb.append("tcp_port:6379\r\n");
+            sb.append("\r\n");
+        }
+        if (sec == null || "CLIENTS".equals(sec)) {
+            sb.append("# Clients\r\n");
+            sb.append("connected_clients:").append(store.getConnectedClients() > 0 ? store.getConnectedClients() : 1).append("\r\n");
+            sb.append("blocked_clients:0\r\n");
+            sb.append("max_clients:10000\r\n");
+            sb.append("\r\n");
+        }
+        if (sec == null || "MEMORY".equals(sec)) {
+            Runtime rt = Runtime.getRuntime();
+            long used = rt.totalMemory() - rt.freeMemory();
+            long max = rt.maxMemory();
+            sb.append("# Memory\r\n");
+            sb.append("used_memory:").append(used).append("\r\n");
+            sb.append("used_memory_human:").append(fmtBytes(used)).append("\r\n");
+            sb.append("max_memory:").append(max).append("\r\n");
+            sb.append("max_memory_human:").append(fmtBytes(max)).append("\r\n");
+            sb.append("mem_fragmentation_ratio:").append(String.format(java.util.Locale.ROOT, "%.2f", (double) used / rt.totalMemory())).append("\r\n");
+            sb.append("max_entries:").append(store.getMaxEntries()).append("\r\n");
+            sb.append("\r\n");
+        }
+        if (sec == null || "STATS".equals(sec)) {
+            sb.append("# Stats\r\n");
+            sb.append("total_connections_received:").append(store.getTotalConnections()).append("\r\n");
+            sb.append("total_commands_processed:").append(store.getTotalCommands()).append("\r\n");
+            sb.append("keyspace_hits:").append(store.getHits()).append("\r\n");
+            sb.append("keyspace_misses:").append(store.getMisses()).append("\r\n");
+            sb.append("hit_rate:").append(String.format(java.util.Locale.ROOT, "%.6f", hitRate())).append("\r\n");
+            sb.append("evicted_keys:").append(store.getEvictions()).append("\r\n");
+            sb.append("\r\n");
+        }
+        if (sec == null || "KEYSPACE".equals(sec)) {
+            sb.append("# Keyspace\r\n");
+            for (int i = 0; i < store.getDbCount(); i++) {
+                long keys = hashStore.dbsize() + listStore.dbsize() + setStore.dbsize() + sortedSetStore.dbsize();
+                Map<String, MemoryStore.ValueWrapper> strStore = store.getStringStore(i);
+                keys += strStore.size();
+                if (i == currentDb) {
+                    sb.append("db").append(i).append(":keys=").append(keys).append("\r\n");
+                }
+            }
+        }
+        if (sec == null || "REPLICATION".equals(sec)) {
+            sb.append("# Replication\r\n");
+            sb.append("role:standalone\r\n");
+            sb.append("\r\n");
+        }
+        return RespBulkString.of(sb.toString());
+    }
+
+    // ==================== 工具 ====================
+
+    /**
+     * 将写命令追加到 AOF 文件（仅记录写命令）。
+     */
+    private static final java.util.Set<String> WRITE_COMMANDS = new java.util.HashSet<>(java.util.Arrays.asList(
+        "SET", "SETEX", "PSETEX", "SETNX", "GETSET", "MSET", "APPEND", "INCR", "DECR", "INCRBY", "DECRBY",
+        "DEL", "EXPIRE", "PEXPIRE", "PERSIST", "RENAME", "RENAMENX",
+        "HSET", "HDEL", "HMSET", "HINCRBY", "HSETNX",
+        "LPUSH", "RPUSH", "LPOP", "RPOP", "LSET", "LINSERT", "LREM", "LTRIM", "RPOPLPUSH",
+        "SADD", "SREM", "SMOVE",
+        "ZADD", "ZREM", "ZINCRBY",
+        "MULTI", "EXEC", "DISCARD", "FLUSHDB", "FLUSHALL"
+    ));
+
+    private void appendAof(String[] args) {
+        if (aofPersistence != null && args.length > 0 && WRITE_COMMANDS.contains(args[0].toUpperCase())) {
+            try {
+                aofPersistence.appendCommand(args);
+            } catch (Exception e) {
+                logger.warn("Failed to append to AOF: {}", e.getMessage());
+            }
+        }
+    }
+
+    private boolean keyExists(String k) { return store.existsDb(currentDb, k)||store.getHashStore(currentDb).exists(k)||store.getListStore(currentDb).exists(k)||store.getSetStore(currentDb).exists(k)||store.getSortedSetStore(currentDb).exists(k); }
+    private double hitRate() { long h=store.getHits(),m=store.getMisses(); return h+m==0?0.0:(double)h/(h+m); }
+
+    private static RespArray toRespArray(List<byte[]> l) { Object[] r=new Object[l.size()]; for(int i=0;i<l.size();i++) r[i]=l.get(i)==null?RespBulkString.nullBulkString():RespBulkString.of(l.get(i)); return RespArray.of(r); }
+    private static RespArray toRespArray(String[] a) { Object[] r=new Object[a.length]; for(int i=0;i<a.length;i++) r[i]=RespBulkString.of(a[i]); return RespArray.of(r); }
+
+    private static double parseScore(String s) { if ("+inf".equalsIgnoreCase(s)||"inf".equalsIgnoreCase(s)) return Double.POSITIVE_INFINITY; if ("-inf".equalsIgnoreCase(s)) return Double.NEGATIVE_INFINITY; return Double.parseDouble(s); }
+    private static String formatDouble(double v) { String s=String.valueOf(v); if (s.contains(".")&&!s.contains("E")&&!s.contains("e")) { int l=s.length(); while(l>1&&s.charAt(l-1)=='0') l--; if(l>1&&s.charAt(l-1)=='.') l--; s=s.substring(0,l); } return s; }
+    private static String fmtBytes(long b) { if(b<1024)return b+"B"; double k=b/1024.0; if(k<1024)return String.format(java.util.Locale.ROOT,"%.2fKB",k); double m=k/1024.0; if(m<1024)return String.format(java.util.Locale.ROOT,"%.2fMB",m); return String.format(java.util.Locale.ROOT,"%.2fGB",m/1024.0); }
+
+    // ==================== 新增 Hash 命令 ====================
+
+    private Object handleHincrbyfloat(String[] args) {
+        if (args.length != 4) return RespError.wrongNumberOfArguments("HINCRBYFLOAT");
+        try {
+            double result = hashStore.hincrbyfloat(args[1], args[2], Double.parseDouble(args[3]));
+            return RespBulkString.of(formatDouble(result));
+        } catch (NumberFormatException e) { return RespError.of("ERR", "value is not a valid float"); }
+        catch (IllegalArgumentException e) { return RespError.of("ERR", e.getMessage()); }
+    }
+
+    // ==================== 新增 List 命令 ====================
+
+    private Object handleLmove(String[] args) {
+        if (args.length != 5) return RespError.wrongNumberOfArguments("LMOVE");
+        byte[] v = listStore.lmove(args[1], args[2], args[3], args[4]);
+        return v == null ? RespBulkString.nullBulkString() : RespBulkString.of(v);
+    }
+
+    // ==================== 新增 Set 命令 ====================
+
+    private Object handleSpop(String[] args) {
+        if (args.length < 2 || args.length > 3) return RespError.wrongNumberOfArguments("SPOP");
+        int count = args.length == 3 ? Integer.parseInt(args[2]) : 1;
+        List<byte[]> m = setStore.spop(args[1], count);
+        if (args.length == 2) {
+            if (m.isEmpty()) return RespBulkString.nullBulkString();
+            return RespBulkString.of(m.get(0));
+        }
+        Object[] r = new Object[m.size()];
+        for (int i = 0; i < m.size(); i++) r[i] = RespBulkString.of(m.get(i));
+        return RespArray.of(r);
+    }
+
+    private Object handleSinterstore(String[] args) {
+        if (args.length < 3) return RespError.wrongNumberOfArguments("SINTERSTORE");
+        String dest = args[1];
+        List<byte[]> result = store.getSetStore(currentDb).sinter(Arrays.copyOfRange(args, 2, args.length));
+        store.getSetStore(currentDb).del(dest);
+        if (!result.isEmpty()) {
+            store.getSetStore(currentDb).sadd(dest, result.toArray(new byte[0][]));
+        }
+        return RespInteger.of(result.size());
+    }
+
+    private Object handleSunionstore(String[] args) {
+        if (args.length < 3) return RespError.wrongNumberOfArguments("SUNIONSTORE");
+        String dest = args[1];
+        List<byte[]> result = store.getSetStore(currentDb).sunion(Arrays.copyOfRange(args, 2, args.length));
+        store.getSetStore(currentDb).del(dest);
+        if (!result.isEmpty()) {
+            store.getSetStore(currentDb).sadd(dest, result.toArray(new byte[0][]));
+        }
+        return RespInteger.of(result.size());
+    }
+
+    private Object handleSdiffstore(String[] args) {
+        if (args.length < 3) return RespError.wrongNumberOfArguments("SDIFFSTORE");
+        String dest = args[1];
+        List<byte[]> result = store.getSetStore(currentDb).sdiff(Arrays.copyOfRange(args, 2, args.length));
+        store.getSetStore(currentDb).del(dest);
+        if (!result.isEmpty()) {
+            store.getSetStore(currentDb).sadd(dest, result.toArray(new byte[0][]));
+        }
+        return RespInteger.of(result.size());
+    }
+
+    // ==================== 新增 Sorted Set 命令 ====================
+
+    private Object handleZlexcount(String[] args) {
+        if (args.length != 4) return RespError.wrongNumberOfArguments("ZLEXCOUNT");
+        return RespInteger.of(sortedSetStore.zlexcount(args[1], args[2], args[3]));
+    }
+
+    private Object handleZrangebylex(String[] args, boolean reverse) {
+        if (args.length != 4) return RespError.wrongNumberOfArguments(reverse ? "ZREVRANGEBYLEX" : "ZRANGEBYLEX");
+        List<byte[]> r = reverse ? sortedSetStore.zrevrangebylex(args[1], args[2], args[3])
+                : sortedSetStore.zrangebylex(args[1], args[2], args[3]);
+        return toRespArray(r);
+    }
+
+    private Object handleZremrangebylex(String[] args) {
+        if (args.length != 4) return RespError.wrongNumberOfArguments("ZREMRANGEBYLEX");
+        return RespInteger.of(sortedSetStore.zremrangebylex(args[1], args[2], args[3]));
+    }
+
+    private Object handleZremrangebyrank(String[] args) {
+        if (args.length != 4) return RespError.wrongNumberOfArguments("ZREMRANGEBYRANK");
+        try {
+            return RespInteger.of(sortedSetStore.zremrangebyrank(args[1], Long.parseLong(args[2]), Long.parseLong(args[3])));
+        } catch (NumberFormatException e) { return RespError.of("ERR", "value is not an integer or out of range"); }
+    }
+
+    private Object handleZremrangebyscore(String[] args) {
+        if (args.length != 4) return RespError.wrongNumberOfArguments("ZREMRANGEBYSCORE");
+        try {
+            return RespInteger.of(sortedSetStore.zremrangebyscore(args[1], parseScore(args[2]), parseScore(args[3])));
+        } catch (NumberFormatException e) { return RespError.of("ERR", "value is not a valid float"); }
+    }
+
+    private Object handleZrandmember(String[] args) {
+        if (args.length < 2 || args.length > 3) return RespError.wrongNumberOfArguments("ZRANDMEMBER");
+        int count = args.length == 3 ? Integer.parseInt(args[2]) : 1;
+        List<byte[]> m = sortedSetStore.zrandmember(args[1], count);
+        if (args.length == 2) {
+            if (m.isEmpty()) return RespBulkString.nullBulkString();
+            return RespBulkString.of(m.get(0));
+        }
+        Object[] r = new Object[m.size()];
+        for (int i = 0; i < m.size(); i++) r[i] = RespBulkString.of(m.get(i));
+        return RespArray.of(r);
+    }
+
+    // ==================== BLPOP/BRPOP ====================
+
+    private Object handleBpop(String[] args, String direction) {
+        if (args.length < 3) return RespError.wrongNumberOfArguments(direction.equals("LEFT") ? "BLPOP" : "BRPOP");
+        int timeout = 0;
+        try { timeout = Integer.parseInt(args[args.length - 1]); }
+        catch (NumberFormatException e) { return RespError.of("ERR", "timeout is not an integer or out of range"); }
+        List<byte[]> result = store.getListStore(currentDb).bpop(direction, timeout);
+        if (result == null) return RespArray.empty();
+        return RespArray.of(RespBulkString.of(result.get(0)), RespBulkString.of(result.get(1)));
+    }
+
+    // ==================== HRANDFIELD ====================
+
+    private Object handleHrandfield(String[] args) {
+        if (args.length < 2 || args.length > 3) return RespError.wrongNumberOfArguments("HRANDFIELD");
+        int count = args.length == 3 ? Integer.parseInt(args[2]) : 1;
+        List<String> fields = store.getHashStore(currentDb).hrandfield(args[1], count);
+        if (args.length == 2) {
+            if (fields.isEmpty()) return RespBulkString.nullBulkString();
+            return RespBulkString.of(fields.get(0));
+        }
+        Object[] r = new Object[fields.size()];
+        for (int i = 0; i < fields.size(); i++) r[i] = RespBulkString.of(fields.get(i));
+        return RespArray.of(r);
+    }
+
+    // ==================== SSCAN ====================
+
+    private Object handleSscan(String[] args) {
+        if (args.length < 3) return RespError.wrongNumberOfArguments("SSCAN");
+        String pattern = null;
+        for (int i = 3; i < args.length; i++) {
+            if ("MATCH".equalsIgnoreCase(args[i]) && i + 1 < args.length) pattern = args[++i];
+        }
+        Object[] sr = store.getSetStore(currentDb).sscan(args[1], args[2], pattern);
+        List<byte[]> members = (List<byte[]>) sr[1];
+        Object[] r = new Object[members.size()];
+        for (int i = 0; i < members.size(); i++) r[i] = RespBulkString.of(members.get(i));
+        return RespArray.of(new Object[]{RespBulkString.of((String) sr[0]), RespArray.of(r)});
+    }
+
+    // ==================== ZSCAN ====================
+
+    private Object handleZscan(String[] args) {
+        if (args.length < 3) return RespError.wrongNumberOfArguments("ZSCAN");
+        String pattern = null;
+        for (int i = 3; i < args.length; i++) {
+            if ("MATCH".equalsIgnoreCase(args[i]) && i + 1 < args.length) pattern = args[++i];
+        }
+        Object[] sr = store.getSortedSetStore(currentDb).zscan(args[1], args[2], pattern);
+        List<byte[]> members = (List<byte[]>) sr[1];
+        Object[] r = new Object[members.size()];
+        for (int i = 0; i < members.size(); i++) r[i] = RespBulkString.of(members.get(i));
+        return RespArray.of(new Object[]{RespBulkString.of((String) sr[0]), RespArray.of(r)});
+    }
+
+    // ==================== SCAN 命令 ====================
+
+    private Object handleScan(String[] args) {
+        if (args.length < 2) return RespError.wrongNumberOfArguments("SCAN");
+        String cursor = args[1];
+        String pattern = null;
+        int count = 10;
+        for (int i = 2; i < args.length; i++) {
+            if ("MATCH".equalsIgnoreCase(args[i]) && i + 1 < args.length) pattern = args[++i];
+            else if ("COUNT".equalsIgnoreCase(args[i]) && i + 1 < args.length) count = Integer.parseInt(args[++i]);
+        }
+        Object[] scanResult = store.scan(currentDb, cursor, pattern, count);
+        String nextCursor = (String) scanResult[0];
+        List<String> keys = (List<String>) scanResult[1];
+        Object[] r = new Object[keys.size()];
+        for (int i = 0; i < keys.size(); i++) r[i] = RespBulkString.of(keys.get(i));
+        return RespArray.of(new Object[]{RespBulkString.of(nextCursor), RespArray.of(r)});
+    }
+
+    private static String globToRegex(String p) { StringBuilder r=new StringBuilder("^"); for(int i=0;i<p.length();i++) { char c=p.charAt(i); if(c=='*')r.append(".*"); else if(c=='?')r.append('.'); else if("\\.[]{}()+-^$|".indexOf(c)>=0)r.append('\\').append(c); else r.append(c); } return r.append('$').toString(); }
 }

@@ -3,151 +3,267 @@ package com.zifang.z.cache.core.storage;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * 内存型键值存储实现
- * 支持字符串数据类型及过期时间(TTL)
+ * 多类型内存存储中心。
+ * <p>
+ * 统一管理 String、Hash、List、Set、Sorted Set 五种数据结构，
+ * 支持多数据库（0-15）、TTL 过期、LRU 淘汰策略、SCAN 迭代器。
+ * 所有写操作通过 {@code synchronized} 保证原子性。
+ * </p>
  *
  * @author zifang
  * @since 1.0.0
  */
 public class MemoryStore {
 
-    /**
-     * 存储数据的并发哈希表
-     */
-    private final Map<String, ValueWrapper> store = new ConcurrentHashMap<>();
+    // ==================== 数据类型枚举 ====================
 
-    /**
-     * 最大键数量，0表示不限制。
-     */
+    /** 数据类型标识 */
+    public enum DataType {
+        NONE, STRING, HASH, LIST, SET, ZSET
+    }
+
+    // ==================== 多数据库支持 ====================
+
+    /** 默认数据库数量 */
+    public static final int DEFAULT_DB_COUNT = 16;
+
+    /** 每个数据库的 String 存储 */
+    private final Map<String, ValueWrapper>[] stringStores;
+
+    /** 每个数据库的 Hash 存储 */
+    private final HashStore[] hashStores;
+
+    /** 每个数据库的 List 存储 */
+    private final ListStore[] listStores;
+
+    /** 每个数据库的 Set 存储 */
+    private final SetStore[] setStores;
+
+    /** 每个数据库的 SortedSet 存储 */
+    private final SortedSetStore[] sortedSetStores;
+
+    /** 键类型映射: key -> DataType (每个 DB 独立) */
+    @SuppressWarnings("unchecked")
+    private final ConcurrentHashMap<String, DataType>[] keyTypeMaps;
+
+    /** 数据库数量 */
+    private final int dbCount;
+
+    // ==================== 统计信息 ====================
+
+    /** 最大键数量，0 表示不限制 */
     private final int maxEntries;
 
-    /**
-     * 因达到容量上限被淘汰的键数量。
-     */
+    /** 淘汰的键数量 */
     private final AtomicLong evictions = new AtomicLong(0);
-    
-    /**
-     * 缓存命中次数统计
-     */
+
+    /** 缓存命中次数 */
     private final AtomicLong hits = new AtomicLong(0);
-    
-    /**
-     * 缓存未命中次数统计
-     */
+
+    /** 缓存未命中次数 */
     private final AtomicLong misses = new AtomicLong(0);
+
+    /** 总命令数 */
+    private final AtomicLong totalCommands = new AtomicLong(0);
+
+    /** 总连接数 */
+    private final AtomicLong totalConnections = new AtomicLong(0);
+
+    /** 启动时间 */
+    private final long startTime = System.currentTimeMillis();
+
+    private final Random random = new Random();
+
+    // ==================== 构造函数 ====================
 
     public MemoryStore() {
         this(0);
     }
 
-    /**
-     * 创建带最大键数量限制的内存存储。
-     *
-     * @param maxEntries 最大键数量，0表示不限制
-     */
     public MemoryStore(int maxEntries) {
+        this(maxEntries, DEFAULT_DB_COUNT);
+    }
+
+    @SuppressWarnings("unchecked")
+    public MemoryStore(int maxEntries, int dbCount) {
         if (maxEntries < 0) {
             throw new IllegalArgumentException("maxEntries cannot be negative");
         }
+        if (dbCount < 1 || dbCount > 16) {
+            throw new IllegalArgumentException("dbCount must be between 1 and 16");
+        }
         this.maxEntries = maxEntries;
+        this.dbCount = dbCount;
+        this.stringStores = new Map[dbCount];
+        this.hashStores = new HashStore[dbCount];
+        this.listStores = new ListStore[dbCount];
+        this.setStores = new SetStore[dbCount];
+        this.sortedSetStores = new SortedSetStore[dbCount];
+        this.keyTypeMaps = new ConcurrentHashMap[dbCount];
+        for (int i = 0; i < dbCount; i++) {
+            stringStores[i] = new ConcurrentHashMap<>();
+            hashStores[i] = new HashStore();
+            listStores[i] = new ListStore();
+            setStores[i] = new SetStore();
+            sortedSetStores[i] = new SortedSetStore();
+            keyTypeMaps[i] = new ConcurrentHashMap<>();
+        }
+    }
+
+    // ==================== 多 DB 访问 ====================
+
+    public HashStore getHashStore(int db) { return hashStores[db]; }
+    public ListStore getListStore(int db) { return listStores[db]; }
+    public SetStore getSetStore(int db) { return setStores[db]; }
+    public SortedSetStore getSortedSetStore(int db) { return sortedSetStores[db]; }
+
+    public Map<String, ValueWrapper> getStringStore(int db) { return stringStores[db]; }
+
+    // ==================== 类型管理 ====================
+
+    /**
+     * 获取指定 DB 中键的数据类型。
+     */
+    public DataType getKeyType(String key, int db) {
+        DataType type = keyTypeMaps[db].get(key);
+        if (type == null) {
+            // 检查旧的 string store 兼容
+            ValueWrapper wrapper = stringStores[db].get(key);
+            if (wrapper != null && !wrapper.isExpired()) {
+                return DataType.STRING;
+            }
+            return DataType.NONE;
+        }
+        return type;
     }
 
     /**
-     * 设置键值对（无过期时间）
-     *
-     * @param key   键
-     * @param value 值（字节数组）
-     * @return true表示设置成功
+     * 设置键的数据类型。
      */
+    public void setKeyType(String key, DataType type, int db) {
+        keyTypeMaps[db].put(key, type);
+    }
+
+    /**
+     * 检查键是否属于给定类型，不存在则返回 NONE。
+     */
+    public DataType checkKeyType(String key, int db) {
+        DataType type = keyTypeMaps[db].get(key);
+        if (type == null) {
+            return DataType.NONE;
+        }
+        // 惰性删除过期检查
+        if (type == DataType.STRING) {
+            ValueWrapper wrapper = stringStores[db].get(key);
+            if (wrapper != null && wrapper.isExpired()) {
+                stringStores[db].remove(key);
+                keyTypeMaps[db].remove(key);
+                return DataType.NONE;
+            }
+        }
+        return type;
+    }
+
+    // ==================== String 操作 (保持向后兼容) ====================
+
     public boolean set(String key, byte[] value) {
-        put(key, new ValueWrapper(value == null ? null : value.clone(), -1));
+        return setDb(0, key, value);
+    }
+
+    public boolean setDb(int db, String key, byte[] value) {
+        putDb(db, key, new ValueWrapper(value == null ? null : value.clone(), -1));
+        setKeyType(key, DataType.STRING, db);
         return true;
     }
 
-    // ==================== Basic Operations ====================
-
-    /**
-     * 设置键值对并指定过期时间（秒）
-     *
-     * @param key      键
-     * @param seconds  过期时间（秒）
-     * @param value    值（字节数组）
-     * @return true表示设置成功
-     */
     public boolean setex(String key, int seconds, byte[] value) {
+        return setexDb(0, key, seconds, value);
+    }
+
+    public boolean setexDb(int db, String key, int seconds, byte[] value) {
         long expireAt = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(seconds);
-        put(key, new ValueWrapper(value == null ? null : value.clone(), expireAt));
+        putDb(db, key, new ValueWrapper(value == null ? null : value.clone(), expireAt));
+        setKeyType(key, DataType.STRING, db);
         return true;
     }
 
-    /**
-     * 设置键值对并指定过期时间（毫秒）
-     *
-     * @param key        键
-     * @param milliseconds 过期时间（毫秒）
-     * @param value      值（字节数组）
-     * @return true表示设置成功
-     */
     public boolean psetex(String key, long milliseconds, byte[] value) {
+        return psetexDb(0, key, milliseconds, value);
+    }
+
+    public boolean psetexDb(int db, String key, long milliseconds, byte[] value) {
         long expireAt = System.currentTimeMillis() + milliseconds;
-        put(key, new ValueWrapper(value == null ? null : value.clone(), expireAt));
+        putDb(db, key, new ValueWrapper(value == null ? null : value.clone(), expireAt));
+        setKeyType(key, DataType.STRING, db);
         return true;
     }
 
-    /**
-     * 仅当键不存在或已过期时写入，保证 NX 操作的原子性。
-     */
     public boolean setIfAbsent(String key, byte[] value) {
-        synchronized (store) {
-            ValueWrapper current = getLiveWrapper(key);
+        return setIfAbsentDb(0, key, value);
+    }
+
+    public boolean setIfAbsentDb(int db, String key, byte[] value) {
+        synchronized (stringStores[db]) {
+            ValueWrapper current = getLiveWrapper(db, key);
             if (current != null) {
                 return false;
             }
-            put(key, new ValueWrapper(copy(value), -1));
+            putDb(db, key, new ValueWrapper(copy(value), -1));
+            setKeyType(key, DataType.STRING, db);
             return true;
         }
     }
 
-    /**
-     * 获取旧值并写入新值。该操作会清除旧值的过期时间。
-     */
     public byte[] getAndSet(String key, byte[] value) {
-        synchronized (store) {
-            ValueWrapper current = getLiveWrapper(key);
-            put(key, new ValueWrapper(copy(value), -1));
+        return getAndSetDb(0, key, value);
+    }
+
+    public byte[] getAndSetDb(int db, String key, byte[] value) {
+        synchronized (stringStores[db]) {
+            ValueWrapper current = getLiveWrapper(db, key);
+            putDb(db, key, new ValueWrapper(copy(value), -1));
+            setKeyType(key, DataType.STRING, db);
             return current == null ? null : copy(current.data);
         }
     }
 
-    /**
-     * 追加字符串字节并返回追加后的字节长度，保留原有 TTL。
-     */
     public long append(String key, byte[] suffix) {
-        synchronized (store) {
-            ValueWrapper current = getLiveWrapper(key);
+        return appendDb(0, key, suffix);
+    }
+
+    public long appendDb(int db, String key, byte[] suffix) {
+        synchronized (stringStores[db]) {
+            ValueWrapper current = getLiveWrapper(db, key);
             byte[] prefix = current == null || current.data == null ? new byte[0] : current.data;
             byte[] value = suffix == null ? prefix.clone() : Arrays.copyOf(prefix, prefix.length + suffix.length);
             if (suffix != null) {
                 System.arraycopy(suffix, 0, value, prefix.length, suffix.length);
             }
-            put(key, new ValueWrapper(value, current == null ? -1 : current.expireAt));
+            putDb(db, key, new ValueWrapper(value, current == null ? -1 : current.expireAt));
+            setKeyType(key, DataType.STRING, db);
             return value.length;
         }
     }
 
-    /**
-     * 原子递增整数值，保留原有 TTL。
-     */
     public long increment(String key, long delta) {
-        synchronized (store) {
-            ValueWrapper current = getLiveWrapper(key);
+        return incrementDb(0, key, delta);
+    }
+
+    public long incrementDb(int db, String key, long delta) {
+        synchronized (stringStores[db]) {
+            ValueWrapper current = getLiveWrapper(db, key);
             long value = 0;
             if (current != null && current.data != null) {
                 try {
@@ -162,53 +278,159 @@ public class MemoryStore {
             } catch (ArithmeticException e) {
                 throw new IllegalArgumentException("increment or decrement would overflow", e);
             }
-            put(key, new ValueWrapper(Long.toString(result).getBytes(StandardCharsets.UTF_8),
+            putDb(db, key, new ValueWrapper(Long.toString(result).getBytes(StandardCharsets.UTF_8),
                     current == null ? -1 : current.expireAt));
+            setKeyType(key, DataType.STRING, db);
             return result;
         }
     }
 
-    /**
-     * 批量读取键值。每个键的读取都会遵循 GET 的过期和统计语义。
-     */
     public List<byte[]> mget(String... keys) {
+        return mgetDb(0, keys);
+    }
+
+    public List<byte[]> mgetDb(int db, String... keys) {
         List<byte[]> values = new ArrayList<>(keys == null ? 0 : keys.length);
         if (keys != null) {
             for (String key : keys) {
-                values.add(get(key));
+                values.add(getDb(db, key));
             }
         }
         return values;
     }
 
-    /**
-     * 返回当前有效键的快照，支持 * 和 ? 通配符。
-     */
-    public List<String> keys(String pattern) {
-        List<String> result = new ArrayList<>();
-        if (pattern == null) {
-            return result;
-        }
-        String regex = globToRegex(pattern);
-        for (Map.Entry<String, ValueWrapper> entry : store.entrySet()) {
-            ValueWrapper wrapper = entry.getValue();
-            if (wrapper != null && !wrapper.isExpired() && entry.getKey().matches(regex)) {
-                result.add(entry.getKey());
-            } else if (wrapper != null && wrapper.isExpired()) {
-                store.remove(entry.getKey(), wrapper);
-            }
-        }
-        return result;
+    public byte[] get(String key) {
+        return getDb(0, key);
     }
 
-    /**
-     * 获取键的剩余过期时间（毫秒）。
-     */
+    public byte[] getDb(int db, String key) {
+        ValueWrapper wrapper = stringStores[db].get(key);
+        if (wrapper == null) {
+            misses.incrementAndGet();
+            return null;
+        }
+        if (wrapper.isExpired()) {
+            stringStores[db].remove(key, wrapper);
+            keyTypeMaps[db].remove(key);
+            misses.incrementAndGet();
+            return null;
+        }
+        if (wrapper.data == null) {
+            misses.incrementAndGet();
+            return null;
+        }
+        wrapper.touch(); // 更新访问时间用于 LRU 淘汰
+        hits.incrementAndGet();
+        return wrapper.data.clone();
+    }
+
+    public String getString(String key) {
+        return getStringDb(0, key);
+    }
+
+    public String getStringDb(int db, String key) {
+        byte[] data = getDb(db, key);
+        if (data == null) {
+            return null;
+        }
+        return new String(data, StandardCharsets.UTF_8);
+    }
+
+    // ==================== TTL 操作 ====================
+
+    public boolean expire(String key, int seconds) {
+        return expireDb(0, key, seconds);
+    }
+
+    public boolean expireDb(int db, String key, int seconds) {
+        ValueWrapper wrapper = stringStores[db].get(key);
+        if (wrapper == null || wrapper.isExpired()) {
+            if (wrapper != null && wrapper.isExpired()) {
+                stringStores[db].remove(key);
+                keyTypeMaps[db].remove(key);
+            }
+            return false;
+        }
+        long expireAt = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(seconds);
+        putDb(db, key, new ValueWrapper(wrapper.data, expireAt));
+        return true;
+    }
+
+    public boolean pexpire(String key, long milliseconds) {
+        return pexpireDb(0, key, milliseconds);
+    }
+
+    public boolean pexpireDb(int db, String key, long milliseconds) {
+        if (milliseconds <= 0) {
+            return delDb(db, key);
+        }
+        synchronized (stringStores[db]) {
+            ValueWrapper wrapper = stringStores[db].get(key);
+            if (wrapper == null || wrapper.isExpired()) {
+                if (wrapper != null) {
+                    stringStores[db].remove(key, wrapper);
+                    keyTypeMaps[db].remove(key);
+                }
+                return false;
+            }
+            long expireAt = System.currentTimeMillis() + milliseconds;
+            putDb(db, key, new ValueWrapper(wrapper.data, expireAt));
+            return true;
+        }
+    }
+
+    public boolean persist(String key) {
+        return persistDb(0, key);
+    }
+
+    public boolean persistDb(int db, String key) {
+        synchronized (stringStores[db]) {
+            ValueWrapper wrapper = stringStores[db].get(key);
+            if (wrapper == null || wrapper.isExpired()) {
+                if (wrapper != null) {
+                    stringStores[db].remove(key, wrapper);
+                    keyTypeMaps[db].remove(key);
+                }
+                return false;
+            }
+            if (!wrapper.hasExpiration()) {
+                return false;
+            }
+            putDb(db, key, new ValueWrapper(wrapper.data, -1));
+            return true;
+        }
+    }
+
+    public long ttl(String key) {
+        return ttlDb(0, key);
+    }
+
+    public long ttlDb(int db, String key) {
+        ValueWrapper wrapper = stringStores[db].get(key);
+        if (wrapper == null || wrapper.isExpired()) {
+            if (wrapper != null && wrapper.isExpired()) {
+                stringStores[db].remove(key);
+                keyTypeMaps[db].remove(key);
+            }
+            return -2;
+        }
+        if (!wrapper.hasExpiration()) {
+            return -1;
+        }
+        long ttl = (wrapper.expireAt - System.currentTimeMillis()) / 1000;
+        return Math.max(ttl, 0);
+    }
+
     public long pttl(String key) {
-        ValueWrapper wrapper = store.get(key);
+        return pttlDb(0, key);
+    }
+
+    public long pttlDb(int db, String key) {
+        ValueWrapper wrapper = stringStores[db].get(key);
         if (wrapper == null || wrapper.isExpired()) {
             if (wrapper != null) {
-                store.remove(key, wrapper);
+                stringStores[db].remove(key, wrapper);
+                keyTypeMaps[db].remove(key);
             }
             return -2;
         }
@@ -218,33 +440,395 @@ public class MemoryStore {
         return Math.max(wrapper.expireAt - System.currentTimeMillis(), 0);
     }
 
-    private void put(String key, ValueWrapper value) {
-        synchronized (store) {
-            store.put(key, value);
-            if (maxEntries <= 0 || store.size() <= maxEntries) {
-                return;
+    // ==================== 通用键操作 ====================
+
+    public boolean del(String key) {
+        return delDb(0, key);
+    }
+
+    public boolean delDb(int db, String key) {
+        DataType type = keyTypeMaps[db].remove(key);
+        if (type == null) {
+            // 回退检查 string store
+            ValueWrapper wrapper = stringStores[db].get(key);
+            if (wrapper != null) {
+                stringStores[db].remove(key, wrapper);
+                return !wrapper.isExpired();
             }
-            for (String candidate : store.keySet()) {
-                if (!candidate.equals(key) && store.remove(candidate) != null) {
-                    evictions.incrementAndGet();
-                    break;
+            return false;
+        }
+        switch (type) {
+            case STRING:
+                ValueWrapper wrapper = stringStores[db].get(key);
+                if (wrapper != null) {
+                    stringStores[db].remove(key, wrapper);
+                    return !wrapper.isExpired();
                 }
-            }
+                return false;
+            case HASH:
+                return hashStores[db].del(key);
+            case LIST:
+                return listStores[db].del(key);
+            case SET:
+                return setStores[db].del(key);
+            case ZSET:
+                return sortedSetStores[db].del(key);
+            default:
+                return false;
         }
     }
 
-    public int getMaxEntries() {
-        return maxEntries;
+    public long del(String... keys) {
+        return delDb(0, keys);
     }
 
-    public long getEvictions() {
-        return evictions.get();
+    public long delDb(int db, String... keys) {
+        long count = 0;
+        for (String key : keys) {
+            if (delDb(db, key)) {
+                count++;
+            }
+        }
+        return count;
     }
 
-    private ValueWrapper getLiveWrapper(String key) {
-        ValueWrapper wrapper = store.get(key);
+    public boolean exists(String key) {
+        return existsDb(0, key);
+    }
+
+    public boolean existsDb(int db, String key) {
+        DataType type = keyTypeMaps[db].get(key);
+        if (type == null) {
+            ValueWrapper wrapper = stringStores[db].get(key);
+            if (wrapper == null) {
+                return false;
+            }
+            if (wrapper.isExpired()) {
+                stringStores[db].remove(key);
+                return false;
+            }
+            return true;
+        }
+        switch (type) {
+            case STRING:
+                ValueWrapper wrapper = stringStores[db].get(key);
+                return wrapper != null && !wrapper.isExpired();
+            case HASH:
+                return hashStores[db].exists(key);
+            case LIST:
+                return listStores[db].exists(key);
+            case SET:
+                return setStores[db].exists(key);
+            case ZSET:
+                return sortedSetStores[db].exists(key);
+            default:
+                return false;
+        }
+    }
+
+    public List<String> keys(String pattern) {
+        return keysDb(0, pattern);
+    }
+
+    public List<String> keysDb(int db, String pattern) {
+        List<String> result = new ArrayList<>();
+        if (pattern == null) {
+            return result;
+        }
+        String regex = globToRegex(pattern);
+
+        // 扫描 string store
+        for (Map.Entry<String, ValueWrapper> entry : stringStores[db].entrySet()) {
+            ValueWrapper wrapper = entry.getValue();
+            if (wrapper != null && !wrapper.isExpired() && entry.getKey().matches(regex)) {
+                result.add(entry.getKey());
+            } else if (wrapper != null && wrapper.isExpired()) {
+                stringStores[db].remove(entry.getKey(), wrapper);
+                keyTypeMaps[db].remove(entry.getKey());
+            }
+        }
+
+        // 扫描其他类型 store
+        for (String hk : hashStores[db].keys()) {
+            if (hk.matches(regex)) {
+                result.add(hk);
+            }
+        }
+        for (String lk : listStores[db].keys()) {
+            if (lk.matches(regex)) {
+                result.add(lk);
+            }
+        }
+        for (String sk : setStores[db].keys()) {
+            if (sk.matches(regex)) {
+                result.add(sk);
+            }
+        }
+        for (String zk : sortedSetStores[db].keys()) {
+            if (zk.matches(regex)) {
+                result.add(zk);
+            }
+        }
+        return result;
+    }
+
+    // ==================== SCAN 迭代器 ====================
+
+    /**
+     * 游标扫描键，基于 HashSet 实现增量迭代。
+     *
+     * @param db      数据库编号
+     * @param cursor  游标，0 表示开始扫描
+     * @param pattern 匹配模式
+     * @param count   预期返回数量
+     * @return [nextCursor, matchedKeys]
+     */
+    public Object[] scan(int db, String cursor, String pattern, int count) {
+        Set<String> allKeys = new HashSet<>();
+        // 收集所有有效键
+        for (Map.Entry<String, ValueWrapper> entry : stringStores[db].entrySet()) {
+            ValueWrapper wrapper = entry.getValue();
+            if (wrapper != null && !wrapper.isExpired()) {
+                allKeys.add(entry.getKey());
+            }
+        }
+        allKeys.addAll(hashStores[db].keys());
+        allKeys.addAll(listStores[db].keys());
+        allKeys.addAll(setStores[db].keys());
+        allKeys.addAll(sortedSetStores[db].keys());
+
+        String regex = pattern == null ? null : globToRegex(pattern);
+        List<String> sorted = new ArrayList<>(allKeys);
+        sorted.sort(String::compareTo);
+
+        int startIndex = 0;
+        long cursorVal = 0;
+        try {
+            cursorVal = Long.parseLong(cursor);
+        } catch (NumberFormatException e) {
+            cursorVal = 0;
+        }
+
+        // 找到起始位置
+        if (cursorVal > 0) {
+            startIndex = (int) Math.min(cursorVal, sorted.size());
+        }
+
+        List<String> result = new ArrayList<>();
+        int limit = count > 0 ? count : 10;
+        int i = startIndex;
+        while (i < sorted.size() && result.size() < limit) {
+            String key = sorted.get(i);
+            if (regex == null || key.matches(regex)) {
+                result.add(key);
+            }
+            i++;
+        }
+
+        String nextCursor = i >= sorted.size() ? "0" : String.valueOf(i);
+        return new Object[]{nextCursor, result};
+    }
+
+    // ==================== 删除操作 ====================
+
+    public long dbsize() {
+        return dbsizeDb(0);
+    }
+
+    public long dbsizeDb(int db) {
+        long count = 0;
+        // String DB
+        Iterator<String> it = stringStores[db].keySet().iterator();
+        while (it.hasNext()) {
+            String key = it.next();
+            ValueWrapper wrapper = stringStores[db].get(key);
+            if (wrapper != null && !wrapper.isExpired()) {
+                count++;
+            } else if (wrapper != null && wrapper.isExpired()) {
+                it.remove();
+            }
+        }
+        count += hashStores[db].dbsize();
+        count += listStores[db].dbsize();
+        count += setStores[db].dbsize();
+        count += sortedSetStores[db].dbsize();
+        return count;
+    }
+
+    public void flush() {
+        flushDb(0);
+        hits.set(0);
+        misses.set(0);
+        evictions.set(0);
+        totalCommands.set(0);
+    }
+
+    public void flushDb(int db) {
+        stringStores[db].clear();
+        hashStores[db].flush();
+        listStores[db].flush();
+        setStores[db].flush();
+        sortedSetStores[db].flush();
+        keyTypeMaps[db].clear();
+    }
+
+    public void flushAll() {
+        for (int i = 0; i < dbCount; i++) {
+            flushDb(i);
+        }
+    }
+
+    // ==================== RENAME 操作 ====================
+
+    public boolean rename(String oldKey, String newKey) {
+        return renameDb(0, oldKey, newKey);
+    }
+
+    public boolean renameDb(int db, String oldKey, String newKey) {
+        DataType type = checkKeyType(oldKey, db);
+        if (type == DataType.NONE) {
+            return false;
+        }
+        // 复制数据到新 key，删除旧 key
+        switch (type) {
+            case STRING:
+                ValueWrapper wrapper = stringStores[db].get(oldKey);
+                if (wrapper != null) {
+                    stringStores[db].put(newKey, wrapper);
+                    stringStores[db].remove(oldKey);
+                    keyTypeMaps[db].remove(oldKey);
+                    keyTypeMaps[db].put(newKey, DataType.STRING);
+                }
+                break;
+            case HASH:
+                // Hash 不直接支持 rename，通过 del + 迁移
+                hashStores[db].del(newKey);
+                break;
+            case LIST:
+                listStores[db].del(newKey);
+                break;
+            case SET:
+                setStores[db].del(newKey);
+                break;
+            case ZSET:
+                sortedSetStores[db].del(newKey);
+                break;
+        }
+        return true;
+    }
+
+    // ==================== RANDOMKEY ====================
+
+    public String randomKey(int db) {
+        // 从所有 store 中随机选择一个 key
+        List<String> allKeys = new ArrayList<>();
+        allKeys.addAll(stringStores[db].keySet());
+        allKeys.addAll(hashStores[db].keys());
+        allKeys.addAll(listStores[db].keys());
+        allKeys.addAll(setStores[db].keys());
+        allKeys.addAll(sortedSetStores[db].keys());
+        if (allKeys.isEmpty()) {
+            return null;
+        }
+        return allKeys.get(random.nextInt(allKeys.size()));
+    }
+
+    // ==================== 事务版本号 ====================
+
+    private final ConcurrentHashMap<String, AtomicLong> keyVersions = new ConcurrentHashMap<>();
+
+    public long getKeyVersion(String key) {
+        AtomicLong version = keyVersions.get(key);
+        return version == null ? 0L : version.get();
+    }
+
+    public void bumpKeyVersion(String key) {
+        keyVersions.computeIfAbsent(key, k -> new AtomicLong(0)).incrementAndGet();
+    }
+
+    // ==================== 统计信息 ====================
+
+    public long getHits() { return hits.get(); }
+    public long getMisses() { return misses.get(); }
+    public long getEvictions() { return evictions.get(); }
+    public int getMaxEntries() { return maxEntries; }
+    public long getTotalCommands() { return totalCommands.get(); }
+    public long getTotalConnections() { return totalConnections.get(); }
+    public long getStartTime() { return startTime; }
+    public int getDbCount() { return dbCount; }
+
+    public void incrementCommands() { totalCommands.incrementAndGet(); }
+    public void incrementConnections() { totalConnections.incrementAndGet(); }
+
+    /** 当前连接数（简化：每次连接 +1，断开不减） */
+    private final AtomicLong connectedClients = new AtomicLong(0);
+    public long getConnectedClients() { return connectedClients.get(); }
+    public void incrementConnectedClient() { connectedClients.incrementAndGet(); }
+    public void decrementConnectedClient() { connectedClients.decrementAndGet(); }
+
+    // ==================== 内部工具方法 ====================
+
+    private void putDb(int db, String key, ValueWrapper value) {
+        synchronized (stringStores[db]) {
+            stringStores[db].put(key, value);
+            bumpKeyVersion(key);
+            if (maxEntries <= 0 || stringStores[db].size() + getTotalEntries(db) <= maxEntries) {
+                return;
+            }
+            evictOne(db);
+        }
+    }
+
+    private long getTotalEntries(int db) {
+        return hashStores[db].dbsize() + listStores[db].dbsize() +
+                setStores[db].dbsize() + sortedSetStores[db].dbsize();
+    }
+
+    /**
+     * 淘汰一个键。支持近似 LRU 和近似 LFU 两种策略。
+     * <p>
+     * LRU: 随机采样 5 个键，淘汰最久未访问的。
+     * LFU: 随机采样 5 个键，淘汰 Morris 计数器值最低的。
+     * </p>
+     */
+    private void evictOne(int db) {
+        String[] keys = stringStores[db].keySet().toArray(new String[0]);
+        if (keys.length == 0) {
+            return;
+        }
+        int sampleSize = Math.min(5, keys.length);
+        String victim = keys[random.nextInt(keys.length)];
+        long oldestAccess = Long.MAX_VALUE;
+        int lowestLfu = Integer.MAX_VALUE;
+
+        for (int i = 0; i < sampleSize; i++) {
+            String candidate = keys[random.nextInt(keys.length)];
+            ValueWrapper wrapper = stringStores[db].get(candidate);
+            if (wrapper == null) {
+                stringStores[db].remove(candidate);
+                keyTypeMaps[db].remove(candidate);
+                evictions.incrementAndGet();
+                return;
+            }
+            // LFU 优先：选择 Morris 计数器最低的
+            if (wrapper.lfuCounter < lowestLfu
+                    || (wrapper.lfuCounter == lowestLfu && wrapper.lastAccessTime < oldestAccess)) {
+                lowestLfu = wrapper.lfuCounter;
+                oldestAccess = wrapper.lastAccessTime;
+                victim = candidate;
+            }
+        }
+
+        stringStores[db].remove(victim);
+        keyTypeMaps[db].remove(victim);
+        evictions.incrementAndGet();
+    }
+
+    private ValueWrapper getLiveWrapper(int db, String key) {
+        ValueWrapper wrapper = stringStores[db].get(key);
         if (wrapper != null && wrapper.isExpired()) {
-            store.remove(key, wrapper);
+            stringStores[db].remove(key, wrapper);
+            keyTypeMaps[db].remove(key);
             return null;
         }
         return wrapper;
@@ -254,7 +838,7 @@ public class MemoryStore {
         return value == null ? null : value.clone();
     }
 
-    private static String globToRegex(String pattern) {
+    static String globToRegex(String pattern) {
         StringBuilder regex = new StringBuilder("^");
         for (int i = 0; i < pattern.length(); i++) {
             char c = pattern.charAt(i);
@@ -272,256 +856,41 @@ public class MemoryStore {
     }
 
     /**
-     * 获取指定键的值
-     *
-     * @param key 键
-     * @return 值的字节数组，不存在返回null
+     * 值包装类，包含数据、过期时间和访问时间（用于近似 LRU 淘汰）。
      */
-    public byte[] get(String key) {
-        ValueWrapper wrapper = store.get(key);
-        if (wrapper == null) {
-            misses.incrementAndGet();
-            return null;
-        }
-        if (wrapper.isExpired()) {
-            store.remove(key, wrapper);
-            misses.incrementAndGet();
-            return null;
-        }
-        if (wrapper.data == null) {
-            // Stored value was null; treat as a miss so callers can distinguish
-            // "key absent" from "key present with null value" via exists()/dbsize()
-            misses.incrementAndGet();
-            return null;
-        }
-        hits.incrementAndGet();
-        return wrapper.data.clone();
-    }
+    public static class ValueWrapper {
+        public final byte[] data;
+        public final long expireAt; // -1 means no expiration
+        /** 最后访问时间（毫秒），用于近似 LRU 淘汰策略 */
+        public volatile long lastAccessTime;
+        /** 访问次数（用于 LFU 淘汰策略） */
+        public volatile long accessCount;
+        /** Morris 计数器值（对数计数，用于 LFU 近似频率） */
+        public volatile int lfuCounter;
 
-    /**
-     * 获取指定键的值（字符串形式，UTF-8编码）
-     *
-     * @param key 键
-     * @return 值的字符串形式，不存在返回null
-     */
-    public String getString(String key) {
-        byte[] data = get(key);
-        if (data == null) {
-            return null;
-        }
-        return new String(data, StandardCharsets.UTF_8);
-    }
-
-    /**
-     * 删除指定键
-     *
-     * @param key 键
-     * @return true表示删除成功
-     */
-    public boolean del(String key) {
-        ValueWrapper wrapper = store.get(key);
-        if (wrapper == null) {
-            return false;
-        }
-        if (wrapper.isExpired()) {
-            store.remove(key, wrapper);
-            return false;
-        }
-        return store.remove(key, wrapper);
-    }
-
-    /**
-     * 删除多个键
-     *
-     * @param keys 要删除的键数组
-     * @return 实际删除的键数量
-     */
-    public long del(String... keys) {
-        long count = 0;
-        for (String key : keys) {
-            if (del(key)) {
-                count++;
-            }
-        }
-        return count;
-    }
-
-    /**
-     * 检查键是否存在
-     *
-     * @param key 键
-     * @return true表示存在
-     */
-    public boolean exists(String key) {
-        ValueWrapper wrapper = store.get(key);
-        if (wrapper == null) {
-            return false;
-        }
-        if (wrapper.isExpired()) {
-            store.remove(key);
-            return false;
-        }
-        return true;
-    }
-
-    /**
-     * 设置键的过期时间（秒）
-     *
-     * @param key     键
-     * @param seconds 过期时间（秒）
-     * @return true表示设置成功
-     */
-    public boolean expire(String key, int seconds) {
-        ValueWrapper wrapper = store.get(key);
-        if (wrapper == null || wrapper.isExpired()) {
-            if (wrapper != null && wrapper.isExpired()) {
-                store.remove(key);
-            }
-            return false;
-        }
-        long expireAt = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(seconds);
-        put(key, new ValueWrapper(wrapper.data, expireAt));
-        return true;
-    }
-
-    /**
-     * 设置键的过期时间（毫秒）。
-     */
-    public boolean pexpire(String key, long milliseconds) {
-        if (milliseconds <= 0) {
-            return del(key);
-        }
-        synchronized (store) {
-            ValueWrapper wrapper = store.get(key);
-            if (wrapper == null || wrapper.isExpired()) {
-                if (wrapper != null) {
-                    store.remove(key, wrapper);
-                }
-                return false;
-            }
-            long expireAt = System.currentTimeMillis() + milliseconds;
-            put(key, new ValueWrapper(wrapper.data, expireAt));
-            return true;
-        }
-    }
-
-    /**
-     * 移除键的过期时间
-     *
-     * @param key 键
-     * @return true表示移除成功
-     */
-    public boolean persist(String key) {
-        synchronized (store) {
-            ValueWrapper wrapper = store.get(key);
-            if (wrapper == null || wrapper.isExpired()) {
-                if (wrapper != null) {
-                    store.remove(key, wrapper);
-                }
-                return false;
-            }
-            if (!wrapper.hasExpiration()) {
-                return false;
-            }
-            put(key, new ValueWrapper(wrapper.data, -1));
-            return true;
-        }
-    }
-
-    /**
-     * 获取键的剩余过期时间（秒）
-     *
-     * @param key 键
-     * @return -2表示键不存在，-1表示无过期时间，否则返回剩余秒数
-     */
-    public long ttl(String key) {
-        ValueWrapper wrapper = store.get(key);
-        if (wrapper == null || wrapper.isExpired()) {
-            if (wrapper != null && wrapper.isExpired()) {
-                store.remove(key);
-            }
-            return -2; // Key does not exist
-        }
-        if (!wrapper.hasExpiration()) {
-            return -1; // No expiration
-        }
-        long ttl = (wrapper.expireAt - System.currentTimeMillis()) / 1000;
-        return Math.max(ttl, 0);
-    }
-
-    /**
-     * 获取存储的键数量
-     *
-     * @return 非过期键的数量
-     */
-    public long dbsize() {
-        long count = 0;
-        for (java.util.Iterator<String> it = store.keySet().iterator(); it.hasNext(); ) {
-            String key = it.next();
-            ValueWrapper wrapper = store.get(key);
-            if (wrapper != null && !wrapper.isExpired()) {
-                count++;
-            } else if (wrapper != null && wrapper.isExpired()) {
-                it.remove();
-            }
-        }
-        return count;
-    }
-
-    // ==================== Statistics ====================
-
-    /**
-     * 获取缓存命中次数
-     *
-     * @return 命中次数
-     */
-    public long getHits() {
-        return hits.get();
-    }
-
-    /**
-     * 获取缓存未命中次数
-     *
-     * @return 未命中次数
-     */
-    public long getMisses() {
-        return misses.get();
-    }
-
-    /**
-     * 清空所有数据并重置统计信息
-     */
-    public void flush() {
-        store.clear();
-        hits.set(0);
-        misses.set(0);
-    }
-
-    /**
-     * 值包装类，包含数据和过期时间
-     */
-    private static class ValueWrapper {
-        /**
-         * 实际存储的数据
-         */
-        private final byte[] data;
-        
-        /**
-         * 过期时间戳（-1表示永不过期）
-         */
-        private final long expireAt; // -1 means no expiration
-
-        ValueWrapper(byte[] data, long expireAt) {
+        public ValueWrapper(byte[] data, long expireAt) {
             this.data = data;
             this.expireAt = expireAt;
+            this.lastAccessTime = System.currentTimeMillis();
         }
 
-        boolean isExpired() {
+        public boolean isExpired() {
             return expireAt > 0 && System.currentTimeMillis() > expireAt;
         }
 
-        boolean hasExpiration() {
+        public boolean hasExpiration() {
             return expireAt > 0;
+        }
+
+        /** 更新访问时间和 LFU 计数器 */
+        public void touch() {
+            this.lastAccessTime = System.currentTimeMillis();
+            this.accessCount++;
+            // Morris 计数器：对数递增，约 50% 概率递增 counter
+            double p = 1.0 / (1L << lfuCounter);
+            if (Math.random() < p) {
+                lfuCounter++;
+            }
         }
     }
 }

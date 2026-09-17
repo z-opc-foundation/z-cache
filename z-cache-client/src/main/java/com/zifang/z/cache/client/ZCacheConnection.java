@@ -221,6 +221,42 @@ public class ZCacheConnection implements AutoCloseable {
     }
 
 
+    /**
+     * 写入命令到 channel 但不立即 flush（用于 Pipeline 批量写入）。
+     *
+     * @param command 命令名称
+     * @param args    命令参数
+     * @return 响应 Future
+     */
+    public CompletableFuture<Object> writeCommand(String command, Object... args) {
+        ensureConnected();
+        RespArray request = RespArray.command(command, args);
+        CompletableFuture<Object> future = new CompletableFuture<>();
+        pendingResponses.offer(future);
+        Channel channel = channelRef.get();
+        if (channel == null) {
+            pendingResponses.remove(future);
+            future.completeExceptionally(new ZCacheClientException("Connection channel is unavailable"));
+            return future;
+        }
+        channel.write(request).addListener(writeFuture -> {
+            if (!writeFuture.isSuccess() && pendingResponses.remove(future)) {
+                future.completeExceptionally(writeFuture.cause());
+            }
+        });
+        return future;
+    }
+
+    /**
+     * 刷新 channel，将所有缓存的命令一次性发送出去。
+     */
+    public void flush() {
+        Channel channel = channelRef.get();
+        if (channel != null && channel.isActive()) {
+            channel.flush();
+        }
+    }
+
     private void failPendingResponses(Throwable cause) {
         CompletableFuture<Object> pending;
         while ((pending = pendingResponses.poll()) != null) {
