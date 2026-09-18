@@ -988,6 +988,34 @@ public class ZCacheClient implements AutoCloseable {
         return new ZCachePipeline(this);
     }
 
+    // ==================== 分布式锁 ====================
+
+    /**
+     * 创建分布式锁客户端。
+     *
+     * <p>返回的 {@link com.zifang.z.cache.client.lock.DistributedLock} 实例
+     * 与当前 ZCacheClient 共享连接，使用 try-with-resources 或手动 close() 释放 watchdog 资源。
+     *
+     * <p>示例：
+     * <pre>{@code
+     * try (ZCacheClient client = new ZCacheClient("localhost", 16379)) {
+     *     client.connect();
+     *     DistributedLock locks = client.distributedLock();
+     *     Lock lock = locks.tryLock("order:123", 30_000);
+     *     if (lock != null) {
+     *         try { doBusiness(); }
+     *         finally { locks.unlock(lock); }
+     *     }
+     * }
+     * }</pre>
+     *
+     * @return 新的 DistributedLock 实例
+     * @since 1.3.0
+     */
+    public com.zifang.z.cache.client.lock.DistributedLock distributedLock() {
+        return new com.zifang.z.cache.client.lock.DistributedLockImpl(this);
+    }
+
     // ==================== 管理命令 ====================
 
     /**
