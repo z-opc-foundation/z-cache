@@ -5,6 +5,8 @@ import com.zifang.z.cache.core.logging.SlowLog;
 import com.zifang.z.cache.core.persistence.AofPersistence;
 import com.zifang.z.cache.core.pubsub.PubSubManager;
 import com.zifang.z.cache.core.storage.*;
+import com.zifang.z.cache.core.stream.StreamStore;
+import com.zifang.z.cache.core.stream.StreamEntry;
 import io.netty.channel.ChannelHandlerContext;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -44,6 +46,7 @@ public class CommandHandler {
     private static ListStore listStore;
     private static SetStore setStore;
     private static SortedSetStore sortedSetStore;
+    private static StreamStore streamStore;
 
     /** MONITOR 模式的客户端集合（共享） */
     private static final java.util.Set<ChannelHandlerContext> monitorClients =
@@ -80,6 +83,7 @@ public class CommandHandler {
     public static void setListStore(ListStore ls) { listStore = ls; }
     public static void setSetStore(SetStore ss) { setStore = ss; }
     public static void setSortedSetStore(SortedSetStore zss) { sortedSetStore = zss; }
+    public static void setStreamStore(StreamStore ss) { streamStore = ss; }
     public void setChannelContext(ChannelHandlerContext ctx) { this.channelContext = ctx; }
 
     /**
@@ -262,6 +266,19 @@ public class CommandHandler {
                 case "DEBUG":    result = handleDebug(args);   break;
                 case "MONITOR":  result = handleMonitor(args);  break;
                 case "RESET":    result = handleReset();        break;
+                // ---- Stream 命令 ----
+                case "XADD":       result = handleXadd(args);      break;
+                case "XLEN":       result = handleXlen(args);      break;
+                case "XRANGE":     result = handleXrange(args, false); break;
+                case "XREVRANGE":  result = handleXrange(args, true);  break;
+                case "XDEL":       result = handleXdel(args);      break;
+                case "XTRIM":      result = handleXtrim(args);     break;
+                case "XREAD":      result = handleXread(args);     break;
+                case "XREADGROUP": result = handleXreadgroup(args); break;
+                case "XGROUP":     result = handleXgroup(args);    break;
+                case "XACK":       result = handleXack(args);      break;
+                case "XPENDING":   result = handleXpending(args);  break;
+                case "XINFO":      result = handleXinfo(args);     break;
                 default:
                     logger.warn("Unknown command: {}", cmd);
                     result = RespError.unknownCommand(cmd);
@@ -1146,6 +1163,333 @@ public class CommandHandler {
                 logger.warn("Failed to send to monitor client, removing: {}", e.getMessage());
                 it.remove();
             }
+        }
+    }
+
+    // ==================== Stream 命令 ====================
+
+    /**
+     * XADD key [MAXLEN maxlen] id field value [field value ...]
+     */
+    private Object handleXadd(String[] args) {
+        if (streamStore == null) return RespError.of("ERR", "Stream not configured");
+        if (args.length < 4) return RespError.wrongNumberOfArguments("XADD");
+
+        String key = args[1];
+        long maxLen = 0;
+        int i = 2;
+
+        // 解析 MAXLEN ~ count
+        if ("MAXLEN".equalsIgnoreCase(args[i])) {
+            i++;
+            if ("~".equals(args[i])) i++; // 跳过近似标记
+            maxLen = Long.parseLong(args[i]);
+            i++;
+        }
+
+        String id = args[i++];
+        if (i + 1 > args.length || (args.length - i) % 2 != 0) {
+            return RespError.of("ERR", "XADD needs at least one field value pair");
+        }
+
+        Map<String, String> fields = new LinkedHashMap<>();
+        while (i + 1 < args.length) {
+            fields.put(args[i], args[i + 1]);
+            i += 2;
+        }
+
+        try {
+            String entryId = streamStore.xadd(currentDb, key, fields, id, maxLen);
+            return RespBulkString.of(entryId);
+        } catch (Exception e) {
+            return RespError.of("ERR", e.getMessage());
+        }
+    }
+
+    /**
+     * XLEN key
+     */
+    private Object handleXlen(String[] args) {
+        if (streamStore == null) return RespError.of("ERR", "Stream not configured");
+        if (args.length != 2) return RespError.wrongNumberOfArguments("XLEN");
+        return RespInteger.of((int) streamStore.xlen(currentDb, args[1]));
+    }
+
+    /**
+     * XRANGE key start end [COUNT count]
+     * XREVRANGE key end start [COUNT count]
+     */
+    private Object handleXrange(String[] args, boolean reverse) {
+        if (streamStore == null) return RespError.of("ERR", "Stream not configured");
+        if (args.length < 4) return RespError.wrongNumberOfArguments(reverse ? "XREVRANGE" : "XRANGE");
+
+        String key = args[1];
+        String start = args[2];
+        String end = args[3];
+        int count = -1;
+
+        if (args.length > 4 && "COUNT".equalsIgnoreCase(args[4]) && args.length > 5) {
+            count = Integer.parseInt(args[5]);
+        }
+
+        List<StreamEntry> entries = reverse
+                ? streamStore.xrevrange(currentDb, key, end, start, count)
+                : streamStore.xrange(currentDb, key, start, end, count);
+
+        Object[] result = new Object[entries.size()];
+        for (int i = 0; i < entries.size(); i++) {
+            StreamEntry e = entries.get(i);
+            Object[] fields = new Object[e.getFields().size() * 2];
+            int fi = 0;
+            for (Map.Entry<String, String> fe : e.getFields().entrySet()) {
+                fields[fi++] = RespBulkString.of(fe.getKey());
+                fields[fi++] = RespBulkString.of(fe.getValue());
+            }
+            result[i] = RespArray.of(RespBulkString.of(e.getId()), RespArray.of(fields));
+        }
+        return RespArray.of(result);
+    }
+
+    /**
+     * XDEL key id [id ...]
+     */
+    private Object handleXdel(String[] args) {
+        if (streamStore == null) return RespError.of("ERR", "Stream not configured");
+        if (args.length < 3) return RespError.wrongNumberOfArguments("XDEL");
+        String[] ids = new String[args.length - 2];
+        System.arraycopy(args, 2, ids, 0, ids.length);
+        return RespInteger.of((int) streamStore.xdel(currentDb, args[1], ids));
+    }
+
+    /**
+     * XTRIM key MAXLEN [~] count
+     */
+    private Object handleXtrim(String[] args) {
+        if (streamStore == null) return RespError.of("ERR", "Stream not configured");
+        if (args.length < 4) return RespError.wrongNumberOfArguments("XTRIM");
+        long maxLen = Long.parseLong(args[3]);
+        return RespInteger.of((int) streamStore.xtrim(currentDb, args[1], maxLen));
+    }
+
+    /**
+     * XREAD [COUNT count] [BLOCK milliseconds] STREAMS key [key ...] id [id ...]
+     */
+    private Object handleXread(String[] args) {
+        if (streamStore == null) return RespError.of("ERR", "Stream not configured");
+        if (args.length < 4) return RespError.wrongNumberOfArguments("XREAD");
+
+        int count = -1;
+        int i = 1;
+
+        // 解析 COUNT
+        if ("COUNT".equalsIgnoreCase(args[i]) && i + 1 < args.length) {
+            count = Integer.parseInt(args[i + 1]);
+            i += 2;
+        }
+
+        // 跳过 BLOCK（非阻塞实现）
+        if ("BLOCK".equalsIgnoreCase(args[i]) && i + 1 < args.length) {
+            i += 2;
+        }
+
+        if (!"STREAMS".equalsIgnoreCase(args[i])) {
+            return RespError.syntaxError();
+        }
+        i++;
+
+        int numKeys = (args.length - i) / 2;
+        String[] keys = new String[numKeys];
+        String[] ids = new String[numKeys];
+        for (int k = 0; k < numKeys; k++) {
+            keys[k] = args[i + k];
+            ids[k] = args[i + numKeys + k];
+        }
+
+        Object[] result = new Object[numKeys];
+        int ri = 0;
+        for (int k = 0; k < numKeys; k++) {
+            List<StreamEntry> entries = streamStore.xrange(currentDb, keys[k], ids[k], "+", count);
+            if (!entries.isEmpty()) {
+                Object[] entryArr = new Object[entries.size()];
+                for (int j = 0; j < entries.size(); j++) {
+                    StreamEntry e = entries.get(j);
+                    Object[] fields = new Object[e.getFields().size() * 2];
+                    int fi = 0;
+                    for (Map.Entry<String, String> fe : e.getFields().entrySet()) {
+                        fields[fi++] = RespBulkString.of(fe.getKey());
+                        fields[fi++] = RespBulkString.of(fe.getValue());
+                    }
+                    entryArr[j] = RespArray.of(RespBulkString.of(e.getId()), RespArray.of(fields));
+                }
+                result[ri++] = RespArray.of(RespBulkString.of(keys[k]), RespArray.of(entryArr));
+            }
+        }
+        return ri == 0 ? RespArray.nullArray() : RespArray.of(Arrays.copyOf(result, ri));
+    }
+
+    /**
+     * XREADGROUP GROUP group consumer [COUNT count] [BLOCK ms] STREAMS key [key ...] id [id ...]
+     */
+    private Object handleXreadgroup(String[] args) {
+        if (streamStore == null) return RespError.of("ERR", "Stream not configured");
+        if (args.length < 7) return RespError.wrongNumberOfArguments("XREADGROUP");
+
+        int i = 1;
+        if (!"GROUP".equalsIgnoreCase(args[i])) return RespError.syntaxError();
+        String group = args[i + 1];
+        String consumer = args[i + 2];
+        i += 3;
+
+        int count = -1;
+        if ("COUNT".equalsIgnoreCase(args[i]) && i + 1 < args.length) {
+            count = Integer.parseInt(args[i + 1]);
+            i += 2;
+        }
+        if ("BLOCK".equalsIgnoreCase(args[i]) && i + 1 < args.length) {
+            i += 2; // 跳过 BLOCK
+        }
+        if (!"STREAMS".equalsIgnoreCase(args[i])) return RespError.syntaxError();
+        i++;
+
+        int numKeys = (args.length - i) / 2;
+        Map<String, String> streams = new LinkedHashMap<>();
+        for (int k = 0; k < numKeys; k++) {
+            streams.put(args[i + k], args[i + numKeys + k]);
+        }
+
+        Map<String, List<StreamEntry>> result = streamStore.xreadgroup(currentDb, group, consumer, streams, count);
+
+        Object[] streamResults = new Object[result.size()];
+        int ri = 0;
+        for (Map.Entry<String, List<StreamEntry>> entry : result.entrySet()) {
+            Object[] entryArr = new Object[entry.getValue().size()];
+            for (int j = 0; j < entry.getValue().size(); j++) {
+                StreamEntry e = entry.getValue().get(j);
+                Object[] fields = new Object[e.getFields().size() * 2];
+                int fi = 0;
+                for (Map.Entry<String, String> fe : e.getFields().entrySet()) {
+                    fields[fi++] = RespBulkString.of(fe.getKey());
+                    fields[fi++] = RespBulkString.of(fe.getValue());
+                }
+                entryArr[j] = RespArray.of(RespBulkString.of(e.getId()), RespArray.of(fields));
+            }
+            streamResults[ri++] = RespArray.of(RespBulkString.of(entry.getKey()), RespArray.of(entryArr));
+        }
+        return ri == 0 ? RespArray.nullArray() : RespArray.of(Arrays.copyOf(streamResults, ri));
+    }
+
+    /**
+     * XGROUP [CREATE key group id] [DESTROY key group] [CREATECONSUMER key group consumer] [DELCONSUMER key group consumer]
+     */
+    private Object handleXgroup(String[] args) {
+        if (streamStore == null) return RespError.of("ERR", "Stream not configured");
+        if (args.length < 2) return RespError.wrongNumberOfArguments("XGROUP");
+        String sub = args[1].toUpperCase();
+        switch (sub) {
+            case "CREATE": {
+                if (args.length < 5) return RespError.wrongNumberOfArguments("XGROUP CREATE");
+                boolean ok = streamStore.xgroupCreate(currentDb, args[2], args[3], args[4]);
+                return ok ? RespSimpleString.of("OK") : RespError.of("ERR", "BUSYGROUP Consumer Group name already exists");
+            }
+            case "DESTROY": {
+                if (args.length < 4) return RespError.wrongNumberOfArguments("XGROUP DESTROY");
+                boolean ok = streamStore.xgroupDestroy(currentDb, args[2], args[3]);
+                return RespInteger.of(ok ? 1 : 0);
+            }
+            case "CREATECONSUMER": {
+                if (args.length < 5) return RespError.wrongNumberOfArguments("XGROUP CREATECONSUMER");
+                com.zifang.z.cache.core.stream.Stream stream = streamStore.getStream(currentDb, args[2]);
+                if (stream == null) return RespInteger.of(0);
+                com.zifang.z.cache.core.stream.ConsumerGroup cg = stream.getGroup(args[3]);
+                if (cg == null) return RespInteger.of(0);
+                cg.getOrCreateConsumer(args[4]);
+                return RespInteger.of(1);
+            }
+            case "DELCONSUMER": {
+                if (args.length < 5) return RespError.wrongNumberOfArguments("XGROUP DELCONSUMER");
+                com.zifang.z.cache.core.stream.Stream stream = streamStore.getStream(currentDb, args[2]);
+                if (stream == null) return RespInteger.of(0);
+                com.zifang.z.cache.core.stream.ConsumerGroup cg = stream.getGroup(args[3]);
+                if (cg == null) return RespInteger.of(0);
+                return cg.destroyConsumer(args[4]) ? RespInteger.of(1) : RespInteger.of(0);
+            }
+            default:
+                return RespError.syntaxError();
+        }
+    }
+
+    /**
+     * XACK key group id [id ...]
+     */
+    private Object handleXack(String[] args) {
+        if (streamStore == null) return RespError.of("ERR", "Stream not configured");
+        if (args.length < 4) return RespError.wrongNumberOfArguments("XACK");
+        String[] ids = new String[args.length - 3];
+        System.arraycopy(args, 3, ids, 0, ids.length);
+        return RespInteger.of((int) streamStore.xack(currentDb, args[1], args[2], ids));
+    }
+
+    /**
+     * XPENDING key group [IDLE min-idle-time] [START end] [END end] [COUNT count] [consumer]
+     */
+    private Object handleXpending(String[] args) {
+        if (streamStore == null) return RespError.of("ERR", "Stream not configured");
+        if (args.length < 3) return RespError.wrongNumberOfArguments("XPENDING");
+
+        Object[] summary = streamStore.xpending(currentDb, args[1], args[2]);
+        if (summary == null) return RespArray.nullArray();
+
+        long pendingCount = (Long) summary[0];
+        String lowestId = (String) summary[1];
+        String highestId = (String) summary[2];
+        String[] consumers = (String[]) summary[3];
+
+        Object[] result = new Object[consumers.length];
+        for (int i = 0; i < consumers.length; i++) {
+            result[i] = RespArray.of(RespBulkString.of(consumers[i]), RespBulkString.of("0"));
+        }
+        return RespArray.of(
+                RespInteger.of((int) pendingCount),
+                lowestId != null ? RespBulkString.of(lowestId) : RespBulkString.nullBulkString(),
+                highestId != null ? RespBulkString.of(highestId) : RespBulkString.nullBulkString(),
+                RespArray.of(result)
+        );
+    }
+
+    /**
+     * XINFO [GROUPS key] [STREAM key] [CONSUMERS key group]
+     */
+    private Object handleXinfo(String[] args) {
+        if (streamStore == null) return RespError.of("ERR", "Stream not configured");
+        if (args.length < 3) return RespError.wrongNumberOfArguments("XINFO");
+        String sub = args[1].toUpperCase();
+        switch (sub) {
+            case "GROUPS": {
+                com.zifang.z.cache.core.stream.Stream stream = streamStore.getStream(currentDb, args[2]);
+                if (stream == null) return RespArray.nullArray();
+                java.util.Set<String> names = stream.groupNames();
+                Object[] result = new Object[names.size()];
+                int i = 0;
+                for (String name : names) {
+                    com.zifang.z.cache.core.stream.ConsumerGroup cg = stream.getGroup(name);
+                    result[i++] = RespArray.of(
+                            RespBulkString.of("name"), RespBulkString.of(name),
+                            RespBulkString.of("consumers"), RespInteger.of(cg != null ? cg.getConsumers().size() : 0),
+                            RespBulkString.of("pending"), RespInteger.of(cg != null ? cg.pendingCount() : 0)
+                    );
+                }
+                return RespArray.of(result);
+            }
+            case "STREAM": {
+                com.zifang.z.cache.core.stream.Stream stream = streamStore.getStream(currentDb, args[2]);
+                if (stream == null) return RespArray.nullArray();
+                return RespArray.of(
+                        RespBulkString.of("length"), RespInteger.of((int) stream.length()),
+                        RespBulkString.of("groups"), RespInteger.of(stream.groupNames().size())
+                );
+            }
+            default:
+                return RespError.syntaxError();
         }
     }
 
