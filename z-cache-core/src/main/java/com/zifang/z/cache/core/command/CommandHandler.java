@@ -45,6 +45,13 @@ public class CommandHandler {
     private static SetStore setStore;
     private static SortedSetStore sortedSetStore;
 
+    /** MONITOR 模式的客户端集合（共享） */
+    private static final java.util.Set<ChannelHandlerContext> monitorClients =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /** 每连接客户端名称（CLIENT SETNAME / GETNAME） */
+    private volatile String clientName;
+
     // ======================== 构造 ========================
 
     public CommandHandler(MemoryStore store) {
@@ -82,6 +89,9 @@ public class CommandHandler {
     public void onDisconnect() {
         if (pubSubManager != null && channelContext != null) {
             pubSubManager.removeClient(channelContext);
+        }
+        if (channelContext != null) {
+            monitorClients.remove(channelContext);
         }
         if (transactionManager != null) {
             transactionManager.cleanup(transactionContext);
@@ -248,6 +258,10 @@ public class CommandHandler {
                 case "FLUSHDB":  result = handleFlushdb();  break;
                 case "FLUSHALL": result = handleFlushall(); break;
                 case "INFO":     result = handleInfo(args);    break;
+                case "CLIENT":   result = handleClient(args);  break;
+                case "DEBUG":    result = handleDebug(args);   break;
+                case "MONITOR":  result = handleMonitor(args);  break;
+                case "RESET":    result = handleReset();        break;
                 default:
                     logger.warn("Unknown command: {}", cmd);
                     result = RespError.unknownCommand(cmd);
@@ -255,6 +269,10 @@ public class CommandHandler {
             if (slowLog != null) {
                 long duration = System.nanoTime() - startTime;
                 slowLog.log(duration, args);
+            }
+            // MONITOR 转发：向所有 MONITOR 客户端推送命令
+            if (!monitorClients.isEmpty() && !"MONITOR".equals(cmd)) {
+                forwardToMonitors(args);
             }
             // AOF 追加写命令
             appendAof(args);
@@ -963,6 +981,172 @@ public class CommandHandler {
             sb.append("\r\n");
         }
         return RespBulkString.of(sb.toString());
+    }
+
+    // ==================== CLIENT / DEBUG / MONITOR / RESET ====================
+
+    /**
+     * CLIENT 命令：连接管理（LIST / GETNAME / SETNAME / ID / KILL / INFO / NO-EVICT）。
+     */
+    private Object handleClient(String[] args) {
+        if (args.length < 2) return RespError.wrongNumberOfArguments("CLIENT");
+        switch (args[1].toUpperCase()) {
+            case "LIST": {
+                // 输出 Redis 兼容格式的客户端列表
+                StringBuilder sb = new StringBuilder();
+                sb.append("id=").append(channelContext.channel().hashCode() & 0x7FFFFFFF);
+                sb.append(" addr=").append(channelContext.channel().remoteAddress());
+                sb.append(" name=").append(clientName != null ? clientName : "");
+                sb.append(" db=").append(currentDb);
+                sb.append(" sub=0 psub=0");
+                sb.append(" flags=N");
+                sb.append("\r\n");
+                return RespBulkString.of(sb.toString());
+            }
+            case "GETNAME": {
+                return clientName != null ? RespBulkString.of(clientName) : RespBulkString.nullBulkString();
+            }
+            case "SETNAME": {
+                if (args.length < 3) return RespError.wrongNumberOfArguments("CLIENT SETNAME");
+                this.clientName = args[2];
+                return RespSimpleString.of("OK");
+            }
+            case "ID": {
+                return RespInteger.of(channelContext.channel().hashCode() & 0x7FFFFFFF);
+            }
+            case "KILL": {
+                // CLIENT KILL 需要 addr 参数，简化实现：关闭当前连接
+                if (args.length < 3) return RespError.wrongNumberOfArguments("CLIENT KILL");
+                // 在 Redis 中 CLIENT KILL 需要匹配地址，这里简化为返回 OK
+                return RespSimpleString.of("OK");
+            }
+            case "INFO": {
+                return handleClientInfo();
+            }
+            case "NO-EVICT": {
+                // CLIENT NO-EVICT ON/OFF — 简化实现，仅返回 OK
+                return RespSimpleString.of("OK");
+            }
+            default:
+                return RespError.syntaxError();
+        }
+    }
+
+    /**
+     * CLIENT INFO 子命令：返回当前连接的详细信息。
+     */
+    private Object handleClientInfo() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("id=").append(channelContext.channel().hashCode() & 0x7FFFFFFF);
+        sb.append(" addr=").append(channelContext.channel().remoteAddress());
+        sb.append(" name=").append(clientName != null ? clientName : "");
+        sb.append(" db=").append(currentDb);
+        sb.append(" sub=0 psub=0");
+        sb.append(" multi=-1");
+        sb.append(" flags=N");
+        sb.append(" cmd=client");
+        sb.append("\r\n");
+        return RespBulkString.of(sb.toString());
+    }
+
+    /**
+     * DEBUG 命令：调试工具（SLEEP / OBJECT / SLOWLOG-RESET / ERROR）。
+     * <p>仅实现安全子命令，不暴露 SEGFAULT 等危险操作。
+     */
+    private Object handleDebug(String[] args) {
+        if (args.length < 2) return RespError.wrongNumberOfArguments("DEBUG");
+        switch (args[1].toUpperCase()) {
+            case "SLEEP": {
+                if (args.length < 3) return RespError.wrongNumberOfArguments("DEBUG SLEEP");
+                try {
+                    long ms = Long.parseLong(args[2]);
+                    Thread.sleep(ms);
+                    return RespSimpleString.of("OK");
+                } catch (NumberFormatException e) {
+                    return RespError.of("ERR", "value is not an integer or out of range");
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return RespError.of("ERR", "sleep interrupted");
+                }
+            }
+            case "OBJECT": {
+                // DEBUG OBJECT key — 返回简化的对象信息
+                if (args.length < 3) return RespError.wrongNumberOfArguments("DEBUG OBJECT");
+                String key = args[2];
+                if (!keyExists(key)) {
+                    return RespBulkString.nullBulkString();
+                }
+                return RespBulkString.of("Value at:0x" + Integer.toHexString(key.hashCode())
+                        + " refcount:1 encoding:raw serializedlength:0 lru:0 lru_seconds_idle:0");
+            }
+            case "SLOWLOG-RESET": {
+                if (slowLog != null) slowLog.reset();
+                return RespInteger.of(1);
+            }
+            case "ERROR": {
+                // DEBUG ERROR — 返回错误（用于测试客户端错误处理）
+                return RespError.of("ERR", "DEBUG ERROR: this is a debug error");
+            }
+            default:
+                return RespError.of("ERR", "DEBUG subcommand '" + args[1] + "' not supported. Supported: SLEEP, OBJECT, SLOWLOG-RESET, ERROR");
+        }
+    }
+
+    /**
+     * MONITOR 命令：开启/关闭实时命令监控。
+     * <p>MONITOR 开启后，该连接进入监控模式，服务端将所有命令推送到该连接。
+     * 再次执行 MONITOR 关闭监控。
+     */
+    private Object handleMonitor(String[] args) {
+        if (channelContext == null) return RespError.of("ERR", "no connection context");
+        if (monitorClients.contains(channelContext)) {
+            // 已在 MONITOR 模式，再次执行则退出
+            monitorClients.remove(channelContext);
+            return RespSimpleString.of("OK");
+        }
+        monitorClients.add(channelContext);
+        // Redis 兼容：MONITOR 返回 OK，然后开始推送命令
+        return RespSimpleString.of("OK");
+    }
+
+    /**
+     * RESET 命令：重置连接状态（退出 MONITOR 模式、清除客户端名称、切换到 db0）。
+     */
+    private Object handleReset() {
+        monitorClients.remove(channelContext);
+        this.clientName = null;
+        this.currentDb = 0;
+        return RespSimpleString.of("OK");
+    }
+
+    /**
+     * 向所有 MONITOR 客户端转发命令。
+     * <p>格式与 Redis MONITOR 兼容：timestamp.epoch [db id addr] "command" "arg1" "arg2" ...
+     */
+    private void forwardToMonitors(String[] args) {
+        if (monitorClients.isEmpty()) return;
+        long epoch = System.currentTimeMillis() / 1000;
+        int db = currentDb;
+        int id = channelContext.channel().hashCode() & 0x7FFFFFFF;
+        String addr = String.valueOf(channelContext.channel().remoteAddress());
+
+        StringBuilder sb = new StringBuilder();
+        sb.append(epoch).append(".000000 [").append(db).append(" ").append(id).append(" ").append(addr).append("]");
+        for (String arg : args) {
+            sb.append(" \"").append(arg.replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
+        }
+
+        RespBulkString msg = RespBulkString.of(sb.toString());
+        java.util.Iterator<ChannelHandlerContext> it = monitorClients.iterator();
+        while (it.hasNext()) {
+            ChannelHandlerContext monitorCtx = it.next();
+            try {
+                monitorCtx.writeAndFlush(msg);
+            } catch (Exception e) {
+                logger.warn("Failed to send to monitor client, removing: {}", e.getMessage());
+                it.remove();
+            }
+        }
     }
 
     // ==================== 工具 ====================
