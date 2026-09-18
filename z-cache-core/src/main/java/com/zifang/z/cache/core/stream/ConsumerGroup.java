@@ -70,10 +70,8 @@ public class ConsumerGroup {
         if (parsed[0] > lastDeliveredId) {
             lastDeliveredId = parsed[0];
         }
-        Consumer consumer = consumers.get(consumerName);
-        if (consumer != null) {
-            consumer.incrementPendingCount();
-        }
+        Consumer consumer = getOrCreateConsumer(consumerName);
+        consumer.incrementPendingCount();
     }
 
     /**

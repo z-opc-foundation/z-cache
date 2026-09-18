@@ -50,8 +50,11 @@ public final class StreamEntry {
      * 解析 ID 为 [timestamp, sequence]。
      */
     public static long[] parseId(String id) {
-        if (id == null || id.isEmpty()) {
+        if (id == null || id.isEmpty() || "-".equals(id)) {
             return new long[]{0, 0};
+        }
+        if ("+".equals(id)) {
+            return new long[]{Long.MAX_VALUE, Long.MAX_VALUE};
         }
         int dash = id.indexOf('-');
         if (dash < 0) {
@@ -78,8 +81,6 @@ public final class StreamEntry {
      * 判断 entry ID 是否在 [start, end] 范围内（包含边界）。
      */
     public static boolean inRange(String entryId, String start, String end) {
-        if ("+".equals(start)) start = "9999999999999-9999999";
-        if ("-".equals(end)) end = "0-0";
         return compareIds(entryId, start) >= 0 && compareIds(entryId, end) <= 0;
     }
 

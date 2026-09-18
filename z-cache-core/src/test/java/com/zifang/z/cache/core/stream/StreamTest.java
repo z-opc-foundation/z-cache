@@ -1,0 +1,245 @@
+package com.zifang.z.cache.core.stream;
+
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * Stream 核心数据结构单元测试。
+ *
+ * @author zifang
+ * @since 1.3.0
+ */
+class StreamTest {
+
+    private Stream stream;
+
+    @BeforeEach
+    void setUp() {
+        stream = new Stream();
+    }
+
+    // ==================== XADD ====================
+
+    @Test
+    void testAddEntry_AutoId() {
+        Map<String, String> fields = new LinkedHashMap<>();
+        fields.put("field1", "value1");
+        String id = stream.addEntry(fields, "*");
+        assertNotNull(id);
+        assertTrue(id.contains("-"));
+        assertEquals(1, stream.length());
+    }
+
+    @Test
+    void testAddEntry_SpecificId() {
+        Map<String, String> fields = new LinkedHashMap<>();
+        fields.put("name", "zifang");
+        String id = stream.addEntry(fields, "1000-0");
+        assertEquals("1000-0", id);
+        assertEquals(1, stream.length());
+    }
+
+    @Test
+    void testAddEntry_MultipleFields() {
+        Map<String, String> fields = new LinkedHashMap<>();
+        fields.put("a", "1");
+        fields.put("b", "2");
+        fields.put("c", "3");
+        stream.addEntry(fields, "*");
+        StreamEntry entry = stream.getEntries().get(0);
+        assertEquals(3, entry.getFields().size());
+        assertEquals("1", entry.getFields().get("a"));
+    }
+
+    // ==================== XRANGE ====================
+
+    @Test
+    void testRange_Ascending() {
+        stream.addEntry(Map.of("k", "v1"), "100-0");
+        stream.addEntry(Map.of("k", "v2"), "200-0");
+        stream.addEntry(Map.of("k", "v3"), "300-0");
+
+        List<StreamEntry> result = stream.range("-", "+", 0);
+        assertEquals(3, result.size());
+        assertEquals("100-0", result.get(0).getId());
+        assertEquals("300-0", result.get(2).getId());
+    }
+
+    @Test
+    void testRange_WithCount() {
+        for (int i = 1; i <= 10; i++) {
+            stream.addEntry(Map.of("k", "v" + i), i + "-0");
+        }
+        List<StreamEntry> result = stream.range("-", "+", 5);
+        assertEquals(5, result.size());
+    }
+
+    @Test
+    void testRevRange_Descending() {
+        stream.addEntry(Map.of("k", "v1"), "100-0");
+        stream.addEntry(Map.of("k", "v2"), "200-0");
+        stream.addEntry(Map.of("k", "v3"), "300-0");
+
+        List<StreamEntry> result = stream.revRange("-", "+", 0);
+        assertEquals(3, result.size());
+        assertEquals("300-0", result.get(0).getId());
+    }
+
+    // ==================== XLEN ====================
+
+    @Test
+    void testLength() {
+        assertEquals(0, stream.length());
+        stream.addEntry(Map.of("k", "v"), "*");
+        assertEquals(1, stream.length());
+        stream.addEntry(Map.of("k", "v2"), "*");
+        assertEquals(2, stream.length());
+    }
+
+    // ==================== XDEL ====================
+
+    @Test
+    void testDelete() {
+        stream.addEntry(Map.of("k", "v1"), "100-0");
+        stream.addEntry(Map.of("k", "v2"), "200-0");
+        long deleted = stream.delete("100-0");
+        assertEquals(1, deleted);
+        assertEquals(1, stream.length());
+    }
+
+    // ==================== XTRIM ====================
+
+    @Test
+    void testTrim() {
+        for (int i = 1; i <= 5; i++) {
+            stream.addEntry(Map.of("k", "v" + i), i + "-0");
+        }
+        long removed = stream.trim(3);
+        assertEquals(2, removed);
+        assertEquals(3, stream.length());
+    }
+
+    // ==================== 消费组 ====================
+
+    @Test
+    void testCreateGroup() {
+        stream.addEntry(Map.of("k", "v1"), "100-0");
+        assertTrue(stream.createGroup("mygroup", "0"));
+        assertNotNull(stream.getGroup("mygroup"));
+    }
+
+    @Test
+    void testCreateGroup_Duplicate() {
+        stream.createGroup("g1", "0");
+        assertFalse(stream.createGroup("g1", "0"));
+    }
+
+    @Test
+    void testDestroyGroup() {
+        stream.createGroup("g1", "0");
+        assertTrue(stream.destroyGroup("g1"));
+        assertNull(stream.getGroup("g1"));
+    }
+
+    // ==================== ConsumerGroup ====================
+
+    @Test
+    void testConsumerGroup_Ack() {
+        stream.addEntry(Map.of("k", "v1"), "100-0");
+        stream.createGroup("g1", "0");
+        ConsumerGroup cg = stream.getGroup("g1");
+
+        cg.markDelivered("100-0", "consumer1");
+        assertEquals(1, cg.pendingCount());
+
+        long acked = cg.ack("100-0");
+        assertEquals(1, acked);
+        assertEquals(0, cg.pendingCount());
+    }
+
+    @Test
+    void testConsumerGroup_MultipleConsumers() {
+        stream.addEntry(Map.of("k", "v1"), "100-0");
+        stream.addEntry(Map.of("k", "v2"), "200-0");
+        stream.createGroup("g1", "0");
+        ConsumerGroup cg = stream.getGroup("g1");
+
+        cg.markDelivered("100-0", "c1");
+        cg.markDelivered("200-0", "c2");
+
+        assertEquals(2, cg.pendingCount());
+        assertEquals(2, cg.getConsumers().size());
+    }
+
+    // ==================== StreamStore ====================
+
+    @Test
+    void testStreamStore_Xadd() {
+        StreamStore store = new StreamStore(1);
+        Map<String, String> fields = Map.of("name", "test");
+        String id = store.xadd(0, "mystream", fields, "*", 0);
+        assertNotNull(id);
+        assertEquals(1, store.xlen(0, "mystream"));
+    }
+
+    @Test
+    void testStreamStore_Xrange() {
+        StreamStore store = new StreamStore(1);
+        store.xadd(0, "s1", Map.of("a", "1"), "100-0", 0);
+        store.xadd(0, "s1", Map.of("a", "2"), "200-0", 0);
+
+        List<StreamEntry> result = store.xrange(0, "s1", "-", "+", 0);
+        assertEquals(2, result.size());
+    }
+
+    @Test
+    void testStreamStore_ConsumerGroup() {
+        StreamStore store = new StreamStore(1);
+        store.xadd(0, "s1", Map.of("a", "1"), "100-0", 0);
+        store.xadd(0, "s1", Map.of("a", "2"), "200-0", 0);
+
+        assertTrue(store.xgroupCreate(0, "s1", "g1", "0"));
+
+        Map<String, String> streams = Map.of("s1", ">");
+        Map<String, List<StreamEntry>> result = store.xreadgroup(0, "g1", "c1", streams, 10);
+        assertEquals(1, result.size());
+        assertEquals(2, result.get("s1").size());
+
+        // ACK one
+        long acked = store.xack(0, "s1", "g1", "100-0");
+        assertEquals(1, acked);
+    }
+
+    @Test
+    void testStreamStore_Xdel() {
+        StreamStore store = new StreamStore(1);
+        store.xadd(0, "s1", Map.of("a", "1"), "100-0", 0);
+        store.xadd(0, "s1", Map.of("a", "2"), "200-0", 0);
+
+        long deleted = store.xdel(0, "s1", "100-0");
+        assertEquals(1, deleted);
+        assertEquals(1, store.xlen(0, "s1"));
+    }
+
+    // ==================== StreamEntry ID 解析 ====================
+
+    @Test
+    void testParseId() {
+        long[] parsed = StreamEntry.parseId("1695000000000-5");
+        assertEquals(1695000000000L, parsed[0]);
+        assertEquals(5, parsed[1]);
+    }
+
+    @Test
+    void testCompareIds() {
+        assertTrue(StreamEntry.compareIds("200-0", "100-0") > 0);
+        assertTrue(StreamEntry.compareIds("100-0", "100-1") < 0);
+        assertEquals(0, StreamEntry.compareIds("100-0", "100-0"));
+    }
+}
