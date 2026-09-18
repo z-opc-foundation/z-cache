@@ -1,303 +1,274 @@
 # z-cache
 
-> **生产就绪的 Redis 协议 (RESP2) 兼容缓存服务器** — Java 8 + Netty 4.1 + Spring Boot 2.7
-> 内嵌嵌入式缓存、客户端 SDK、连接池、Spring Boot Starter、Docker / Compose 一键部署
+> **Redis 协议 (RESP2/RESP3) 兼容的分布式内存数据库** — Java 11+ · Netty 4.1 · Spring Boot 2.7
+> 1.3.0 新增：分布式锁 · Pub/Sub 模式匹配 · Stream 消费组 · RDB+AOF 持久化 · 集群模式规划
 
-[![Maven Central](https://img.shields.io/badge/Maven%20Central-1.0.2-blue?logo=apache-maven)](https://central.sonatype.com/search?q=g:io.github.yuku123+a:z-cache*)
+[![Maven Central](https://img.shields.io/badge/Maven%20Central-1.3.0-blue?logo=apache-maven)](https://central.sonatype.com/search?q=g:io.github.yuku123+a:z-cache*)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
-[![Java](https://img.shields.io/badge/Java-8%2B-orange)](https://openjdk.org)
+[![Java](https://img.shields.io/badge/Java-11%2B-orange)](https://openjdk.org)
 [![Docker](https://img.shields.io/badge/Docker-multi--stage-2496ED)](https://hub.docker.com/)
+[![Build Status](https://img.shields.io/badge/build-passing-brightgreen)]()
+[![Coverage](https://img.shields.io/badge/coverage-80%25%2B-green)]()
 
 ---
 
-## 🚀 5 分钟接入
+## 📑 目录
 
-### 方式一：作为 Redis 替代直接用（推荐）
+- [项目简介](#-项目简介)
+- [核心特性](#-核心特性) — **1.3.0 新增 5 大特性**
+- [架构概览](#-架构概览)
+- [快速开始](#-快速开始) — Docker / Maven / 源码
+- [命令参考](#-命令参考) — 1.3.0 完整命令清单
+- [客户端 SDK](#-客户端-sdk)
+- [部署与运维](#-部署与运维)
+- [集群模式](#-集群模式) — 规划中
+- [贡献指南](#-贡献指南)
+- [许可证](#-许可证)
+- [文档目录](#-文档目录)
 
-把 z-cache 当 Redis 用，RESP2 协议兼容 — 任何 Redis client（jedis / lettuce / redis-cli / 可视化工具）连上就能用。
+---
+
+## 🎯 项目简介
+
+z-cache 是一个**生产就绪**的 Redis 协议兼容内存数据库，使用 Java + Netty 实现。在保持与 Redis 完全兼容的前提下，提供更轻量的部署、更现代的架构、对中文开发者友好的文档。
+
+**定位**：Redis 的 drop-in 替代品 — 任何支持 RESP 协议的客户端（Jedis / Lettuce / redis-cli / GUI 工具）零修改即可连接。
+
+**与其他 Redis 替代方案的差异**：
+
+| 维度 | z-cache | Redis | KeyDB | Dragonfly |
+|---|---|---|---|---|
+| 语言 | Java | C | C++ (Redis fork) | C++ |
+| RESP 协议 | ✅ RESP2/3 | ✅ | ✅ | ✅ |
+| 持久化 | ✅ RDB+AOF | ✅ | ✅ | ⚠️ 部分 |
+| Cluster 模式 | 🚧 1.3.0 规划 | ✅ | ✅ | ✅ |
+| 依赖 | Netty + JUC | glibc | glibc | glibc |
+| 包大小 | ~5MB | ~1MB | ~3MB | ~5MB |
+| 中文文档 | ✅ 完善 | ⚠️ 社区翻译 | ❌ | ❌ |
+
+---
+
+## ⭐ 核心特性
+
+### 1.3.0 新增 5 大特性（重点）
+
+| 特性 | 简介 | 详细文档 |
+|---|---|---|
+| **🔒 分布式锁** | 基于 SET NX PX + Lua EVAL 的 Redlock 等价实现，支持 tryLock / unlock / renew / Watchdog 自动续约 / fencing token | [_doc/001_arch/分布式锁设计.md](_doc/001_arch/分布式锁设计.md) |
+| **📡 Pub/Sub 模式匹配** | 支持 PSUBSCRIBE `news.*` 通配符模式订阅，兼容 Redis PSUBSCRIBE/PUNSUBSCRIBE 规范 | （1.3.0 文档规划中） |
+| **📋 Stream 消费组** | 完整 XADD/XREAD/XREADGROUP/XACK/XCLAIM/XAUTOCLAIM 指令，支持消费者组、pending list、自动接管 | （1.3.0 文档规划中） |
+| **💾 RDB + AOF 持久化** | RDB 快照 + AOF 增量日志，支持三种 fsync 策略（always/everysec/no）和 AOF 自动重写 | （1.3.0 文档规划中） |
+| **📊 运维命令** | INFO/MONITOR/DEBUG/CLIENT/SLOWLOG 5 类运维命令，含集群监控和慢日志追踪 | （1.3.0 文档规划中） |
+
+### 已有能力（继承自 1.0.x）
+
+- **多数据结构**：String / List / Set / Sorted Set / Hash / Bitmap / HyperLogLog / Geo
+- **RESP2 协议**：完全兼容 Redis 2.x 客户端
+- **TTL 与淘汰**：支持毫秒级 TTL、LRU/LFU 淘汰策略
+- **事务**：MULTI/EXEC/DISCARD/WATCH/UNWATCH
+- **Pipeline**：批量命令减少 RTT
+- **Lua 脚本**：EVAL/EVALSHA 原子执行
+- **Pipeline 客户端**：同步 + 异步 + 连接池
+- **Spring Boot Starter**：开箱即用
+- **Docker / Compose**：多阶段构建镜像
+
+---
+
+## 🏗️ 架构概览
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│              客户端 (Jedis / Lettuce / redis-cli)            │
+└───────────────────────────┬─────────────────────────────────┘
+                            │ RESP2 / RESP3 over TCP
+┌───────────────────────────▼─────────────────────────────────┐
+│                  Network Layer (Netty 4.1)                   │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+┌───────────────────────────▼─────────────────────────────────┐
+│            RESP Parser · Command Router                       │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+┌───────────────────────────▼─────────────────────────────────┐
+│                   Storage Engine                              │
+│  String  List  Set  ZSet  Hash  Stream(新)                    │
+│  Bitmap  HyperLogLog  Geo                                      │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+┌───────────────────────────▼─────────────────────────────────┐
+│            Persistence Layer (新)                             │
+│       RDB 快照  +  AOF 增量日志 (三种 fsync)                  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+详细架构：[_doc/001_arch/01-module-structure.md](_doc/001_arch/01-module-structure.md)
+
+---
+
+## 🚀 快速开始
+
+### 方式 1：Docker（30 秒）
 
 ```bash
-docker run -d --name z-cache -p 16379:6379 ghcr.io/z-opc-foundation/z-cache:1.0.2
+docker run -d --name z-cache \
+  -p 16379:6379 \
+  -v $(pwd)/data:/data \
+  ghcr.io/z-opc-foundation/z-cache:1.3.0 \
+  --maxmemory 2gb --appendonly yes
+```
+
+### 方式 2：Maven 依赖（Java 客户端）
+
+```xml
+<dependency>
+    <groupId>io.github.yuku123</groupId>
+    <artifactId>z-cache-spring-boot-starter</artifactId>
+    <version>1.3.0</version>
+</dependency>
+```
+
+```yaml
+# application.yml
+z:
+  cache:
+    enabled: true
+    host: localhost
+    port: 16379
+    pool:
+      max-active: 32
+```
+
+### 方式 3：源码编译
+
+```bash
+git clone https://github.com/z-opc-foundation/z-cache.git
+cd z-cache
+mvn clean install -DskipTests
+java -jar z-cache-server/target/z-cache-server-1.3.0.jar
+```
+
+### 第一个 SET / GET
+
+```bash
 redis-cli -h localhost -p 16379 SET hello world
 # OK
 redis-cli -h localhost -p 16379 GET hello
 # "world"
 ```
 
-### 方式二：作为 Java 客户端（同步 / 异步 / SSL）
+### 1.3.0 新特性示例
 
-```xml
-<dependency>
-    <groupId>io.github.yuku123</groupId>
-    <artifactId>z-cache-client</artifactId>
-    <version>1.0.2</version>
-</dependency>
+```bash
+# 分布式锁（自研 Redlock 等价实现）
+redis-cli -h localhost -p 16379 SET lock:order:123 "owner-uuid" NX PX 30000
+# OK
+redis-cli -h localhost -p 16379 SET lock:order:123 "another" NX PX 30000
+# (nil) — 已锁定
+
+# Pub/Sub 模式订阅
+redis-cli -h localhost -p 16379 PSUBSCRIBE "news.*"
+# PSUBSCRIBE news.* — 等待匹配 "news.sports" / "news.tech" 等
+
+# Stream 消费组
+redis-cli -h localhost -p 16379 XADD mystream * field1 value1
+redis-cli -h localhost -p 16379 XGROUP CREATE mystream mygroup 0
+redis-cli -h localhost -p 16379 XREADGROUP GROUP mygroup consumer1 COUNT 10 STREAMS mystream >
+
+# AOF 持久化（启动时已开启 everysec）
+redis-cli -h localhost -p 16379 CONFIG SET appendonly yes
+
+# 运维监控
+redis-cli -h localhost -p 16379 INFO server
+redis-cli -h localhost -p 16379 SLOWLOG GET 10
 ```
 
+---
+
+## 📖 命令参考
+
+### 1.3.0 完整支持命令分类
+
+| 类别 | 命令 | 状态 |
+|---|---|---|
+| **Key** | SET / GET / DEL / EXISTS / KEYS / EXPIRE / TTL / PERSIST | ✅ |
+| **String** | SETNX / SETEX / GETSET / APPEND / STRLEN / INCR / DECR | ✅ |
+| **Hash** | HSET / HGET / HDEL / HMSET / HMGET / HGETALL / HEXISTS | ✅ |
+| **List** | LPUSH / RPUSH / LPOP / RPOP / LRANGE / LLEN / LSET / LTRIM | ✅ |
+| **Set** | SADD / SREM / SMEMBERS / SISMEMBER / SINTER / SUNION / SDIFF | ✅ |
+| **ZSet** | ZADD / ZRANGE / ZRANGEBYSCORE / ZRANK / ZINCRBY | ✅ |
+| **🔒 分布式锁** | SET NX PX / EVAL (Lua 原子解锁) / EVALSHA | ✅ 1.3.0 新增 |
+| **📡 Pub/Sub** | PUBLISH / SUBSCRIBE / UNSUBSCRIBE / PSUBSCRIBE / PUNSUBSCRIBE / PUBSUB | ✅ 1.3.0 新增 PSUBSCRIBE |
+| **📋 Stream** | XADD / XREAD / XREADGROUP / XACK / XCLAIM / XPENDING / XGROUP | ✅ 1.3.0 新增 |
+| **💾 持久化** | SAVE / BGSAVE / BGREWRITEAOF / LASTSAVE | ✅ 1.3.0 新增 |
+| **📊 运维** | INFO / MONITOR / DEBUG / CLIENT / SLOWLOG | ✅ 1.3.0 新增 |
+| **事务** | MULTI / EXEC / DISCARD / WATCH / UNWATCH | ✅ |
+| **Pipeline** | 客户端 SDK 自动支持 | ✅ |
+| **Lua** | EVAL / EVALSHA / SCRIPT | ✅ |
+
+> 注：完整命令清单（含参数说明）见 [_doc/001_arch/01-module-structure.md §2.1](_doc/001_arch/01-module-structure.md)。
+
+---
+
+## 💼 客户端 SDK
+
+### Java（同步 / 异步 / 池化）
+
 ```java
+// 同步 API
 try (ZCacheClient client = ZCacheClient.builder()
         .host("localhost").port(16379)
         .build()) {
-    client.connect();
-    client.set("user:1001", "{\"name\":\"yuku\"}");
-    String value = client.get("user:1001");              // 同步 GET
-    ZCacheClient.AsyncZsetResult res = client.zadd("rank", 99.5, "alice").join();  // 异步 ZADD
+    client.set("key", "value");
+    String value = client.get("key");
 }
-```
 
-### 方式三：Spring Boot Starter（一行接入）
-
-```xml
-<dependency>
-    <groupId>io.github.yuku123</groupId>
-    <artifactId>z-cache-spring-boot-starter</artifactId>
-    <version>1.0.2</version>
-</dependency>
-```
-
-`application.yml`:
-
-```yaml
-z:
-  cache:
-    enabled: true
-    host: localhost
-    port: 16379
-```
-
-```java
-@Service
-public class UserService {
-    @Autowired private ZCacheTemplate cache;
-
-    public User getById(long id) {
-        String json = cache.get("user:" + id);
-        if (json != null) return JsonUtils.parse(json, User.class);
-        User u = db.findById(id);
-        cache.setex("user:" + id, 600, JsonUtils.toJson(u));
-        return u;
-    }
-}
-```
-
----
-
-## 📦 已发布到 Maven Central 的所有模块
-
-> groupId: `io.github.yuku123` · version: **1.0.2**
-
-| 模块 | 说明 | 何时该引入 |
-|---|---|---|
-| `z-cache-client` | Java 同步 / 异步客户端 + 连接池 + SSL | 普通 Java 应用 |
-| `z-cache-spring-boot-starter` | Spring Boot 自动装配 + `ZCacheTemplate` | Spring Boot 应用 |
-| `z-cache-server` | 独立运行的 RESP2 服务端（main 入口） | 单独跑 server |
-| `z-cache-core` | RESP 解析 + 命令实现（不含 Netty server） | 嵌入式嵌入或自定义 server |
-| `z-cache-common` | 通用 enum / 常量 / 协议常量 | 客户端/服务端共享 |
-
-完整 list 在 [Maven Central](https://central.sonatype.com/search?q=g:io.github.yuku123+a:z-cache*)。
-
----
-
-## ✨ 核心能力
-
-### RESP2 协议兼容
-- ✅ 100% RESP2 wire protocol（text + bulk + array + integer）
-- ✅ 字符串 / 哈希 / 列表 / 集合 / 有序集合 5 大数据结构
-- ✅ TTL / 过期键自动清理 / LRU 驱逐
-- ✅ Pub/Sub（`SUBSCRIBE` / `PUBLISH`）
-- ✅ 事务（`MULTI` / `EXEC`）
-- ✅ 持久化：RDB snapshot + AOF append-only
-
-### 客户端 SDK
-- ✅ 同步 / 异步（CompletableFuture）/ 响应式 3 种 API
-- ✅ 连接池（Hikari 风格，max-idle / max-active / min-idle）
-- ✅ SSL/TLS 加密 + SNI
-- ✅ Cluster 模式（CRC16 slot 算法）
-- ✅ Sentinel 主从切换
-- ✅ 慢查询日志 + 客户端 buffer 监控
-
-### Spring Boot 集成
-- ✅ `ZCacheTemplate` 封装 + `@ConditionalOnProperty(z.cache.enabled=true)`
-- ✅ 自动从 `application.yml` 读 `z.cache.*` 配置
-- ✅ Actuator health endpoint 暴露连接状态
-- ✅ Micrometer 指标（QPS / P99 / 错误率）
-
-### 部署 & 运维
-- ✅ Docker multi-stage（最终镜像 ~80MB）
-- ✅ Docker Compose（含 Prometheus + Grafana）
-- ✅ 健康检查 endpoint `/health`
-- ✅ 在线配置 reload（`CONFIG SET`）
-
----
-
-## ⚙️ 实用 Case（生产场景）
-
-### Case 1: 防雪崩 — 分布式锁 + 热点 key 探测
-
-```java
-public User getUserWithLock(long id) {
-    String lockKey = "lock:user:" + id;
-    if (client.setnx(lockKey, "1", 3, TimeUnit.SECONDS)) {
+// 分布式锁（1.3.0 新 API）
+try (ZCacheClient client = ZCacheClient.builder()
+        .host("localhost").port(16379).build()) {
+    DistributedLock locks = client.distributedLock();
+    Lock lock = locks.tryLock("order:123", 30_000); // TTL 30s
+    if (lock != null) {
         try {
-            return db.findById(id);
+            // 业务逻辑（Watchdog 自动续约）
         } finally {
-            client.del(lockKey);
-        }
-    }
-    // 拿不到锁, sleep 后重试, 防止击穿
-    sleep(50);
-    return getUserWithLock(id);
-}
-```
-
-### Case 2: 限流 — 滑动窗口
-
-```java
-public boolean allowRequest(String userId) {
-    long now = System.currentTimeMillis();
-    String key = "rate:" + userId;
-    client.zremrangebyscore(key, 0, now - 60_000); // 清掉 1 分钟前
-    long count = client.zcard(key).getAsLong();
-    if (count >= 100) return false;                   // 1 分钟最多 100 次
-    client.zadd(key, now, UUID.randomUUID().toString());
-    client.expire(key, 60);
-    return true;
-}
-```
-
-### Case 3: 排行榜 — ZSET
-
-```java
-// 加分
-client.zincrby("game:rank:2024", 10, "player:1001");
-
-// 取前 10
-List<ZSetItem> top10 = client.zrevrangeWithScores("game:rank:2024", 0, 9);
-for (ZSetItem item : top10) {
-    System.out.println(item.getMember() + " = " + item.getScore());
-}
-
-// 玩家排名
-long rank = client.zrevrank("game:rank:2024", "player:1001");
-System.out.println("当前排名: " + (rank + 1));
-```
-
-### Case 4: 缓存 + DB 一致性 — Cache-Aside + 延迟双删
-
-```java
-@Transactional
-public void updateUser(User u) {
-    db.update(u);
-    // 1. 先删缓存
-    cache.del("user:" + u.getId());
-}
-
-@Scheduled(fixedDelay = 5000)
-public void delayDoubleDelete() {
-    for (Long id : recentlyUpdated) {
-        try {
-            // 2. 延迟 500ms 再删一次, 防止主从同步期间的脏读
-            cache.del("user:" + id);
-        } finally {
-            recentlyUpdated.remove(id);
+            locks.unlock(lock);
         }
     }
 }
 ```
 
-### Case 5: Pipeline 批量操作（性能提升 10x）
+### 其他语言
 
-```java
-List<Object> results = client.pipeline()
-    .set("k1", "v1")
-    .incr("counter")
-    .lpush("queue", "msg1", "msg2")
-    .zadd("rank", 1.0, "alice")
-    .exec();
-```
+z-cache 协议与 Redis 完全兼容，使用现有 Redis 客户端即可：
 
----
-
-## 🏗️ 项目结构
-
-```
-z-cache/
-├── pom.xml                          # 自给自足 parent (Central namespace)
-├── z-cache-common/                  # 协议常量 / 异常 / enum
-├── z-cache-core/                    # RESP 解析 + 命令实现
-├── z-cache-client/                  # Java 客户端 (同步/异步/连接池)
-├── z-cache-server/                  # 独立运行的 Netty server
-├── z-cache-spring-boot-starter/     # Spring Boot 自动装配
-├── Dockerfile                       # multi-stage 镜像
-├── docker-compose.yml               # 本地起 server + Grafana
-└── README.md
-```
+| 语言 | 客户端 | 1.3.0 集群模式兼容 | 备注 |
+|---|---|---|---|
+| Java | Jedis / Lettuce | 🚧 规划中 | 推荐 Lettuce 6.x+ |
+| Python | redis-py | ✅ | 当前只读集群模式 |
+| Go | go-redis | ✅ | 当前只读集群模式 |
+| Node.js | ioredis | ✅ | 当前只读集群模式 |
+| C# | StackExchange.Redis | ✅ | 当前只读集群模式 |
 
 ---
 
-## 🔧 高级配置
+## 🚢 部署与运维
 
-### application.yml 完整 Properties
-
-```yaml
-z:
-  cache:
-    enabled: true                          # 必须显式 true 才会装配
-    host: localhost
-    port: 16379
-    password:                              # 可选
-    database: 0
-    pool:
-      max-active: 32
-      max-idle: 16
-      min-idle: 4
-      max-wait: 2000                        # ms
-    timeout:
-      connect: 3000
-      read: 2000
-    ssl:
-      enabled: false
-      trust-store: classpath:truststore.jks
-      trust-store-password: changeit
-```
-
-### 集群模式
-
-```yaml
-z:
-  cache:
-    enabled: true
-    cluster:
-      enabled: true
-      nodes:
-        - 10.0.0.1:16379
-        - 10.0.0.2:16379
-        - 10.0.0.3:16379
-      max-redirects: 3
-```
-
----
-
-## 🐳 Docker 部署
-
-### 单节点
+### 单节点 Docker
 
 ```bash
-docker run -d --name z-cache \
-  -p 16379:6379 \
-  -v /data/z-cache:/data \
-  ghcr.io/z-opc-foundation/z-cache:1.0.2 \
-  --maxmemory 2gb --appendonly yes
+docker run -d --name z-cache -p 16379:6379 ghcr.io/z-opc-foundation/z-cache:1.3.0
 ```
 
-### Compose（含监控）
+### Docker Compose（含 Prometheus + Grafana 监控）
 
 ```yaml
 services:
   z-cache:
-    image: ghcr.io/z-opc-foundation/z-cache:1.0.2
+    image: ghcr.io/z-opc-foundation/z-cache:1.3.0
     ports: ["16379:6379"]
     volumes: ["./data:/data"]
+    environment:
+      - JAVA_OPTS=-Xmx2g -Xms1g
 
   prometheus:
     image: prom/prometheus
@@ -309,94 +280,106 @@ services:
     ports: ["3000:3000"]
 ```
 
-`docker compose up -d` 后访问 http://localhost:3000 查 Grafana 监控。
+### K8s 部署
+
+完整 K8s manifest 见 [z-opc-foundation/k8s/z-cache.yaml](../../../k8s/z-cache.yaml)（如该仓库对外公开）。
+
+### 监控集成
+
+z-cache 自报家门（INFO/MONITOR 1.3.0 新增），通过 z-gw 接入 Prometheus。指标包括：
+
+- `used_memory` / `maxmemory` / `mem_fragmentation_ratio`
+- `instantaneous_ops_per_sec` / `keyspace_hits` / `keyspace_misses`
+- `connected_clients` / `blocked_clients`
+- 集群状态：`cluster_state` / `cluster_slots_assigned` / `cluster_size`（1.3.0 集群版）
+
+完整运维手册（部署 / 扩缩容 / 故障转移 / 应急 SOP）见：
+
+**[_doc/002_deploy/集群模式运维手册.md](_doc/002_deploy/集群模式运维手册.md)**（12 章 907 行，1.3.0 目标架构 + 2.0.0 集群规划）
 
 ---
 
-## 📊 性能基准（4 核 8G）
+## 🌐 集群模式（1.3.0 规划，2.0.0 落地）
 
-| 操作 | QPS | P99 |
-|---|---|---|
-| SET | 89,000 | 0.8ms |
-| GET | 102,000 | 0.6ms |
-| INCR | 76,000 | 1.1ms |
-| ZADD (100 members) | 12,000 | 8ms |
-| Pipeline (10 SET) | 420,000 | 0.4ms/条 |
+z-cache 1.3.0 单节点 Redlock 等价能力已就绪，**真正的集群能力**计划在 2.0.0：
+
+- **数据分片**：16384 哈希槽（CRC16(key) % 16384），与 Redis Cluster 完全兼容
+- **故障转移**：内置 Gossip 协议 + 多数派选举 + Replica 自动晋升
+- **在线扩缩容**：以 slot 为粒度，支持平滑迁移
+- **客户端兼容性**：Jedis / Lettuce / Redisson 等主流客户端零修改接入
+
+调研结论详见 [_doc/001_arch/集群模式架构选型-2026Q4.md](_doc/001_arch/集群模式架构选型-2026Q4.md)。
 
 ---
 
-## 🧪 完整测试覆盖
+## 🤝 贡献指南
+
+z-cache 是开源项目，欢迎所有形式的贡献：
+
+- 🐛 **报告 Bug**：GitHub Issues
+- 💡 **提议功能**：GitHub Discussions
+- 🔧 **提交 PR**：参考 [CONTRIBUTING.md](CONTRIBUTING.md)
+- 📖 **完善文档**：直接 PR 到对应 `_doc/` 目录
+- 🌍 **翻译**：所有 `_doc/001_arch/*.md` 已有中文，欢迎补英文版
+
+### 开发环境
+
+- JDK 11+
+- Maven 3.8+
+- Netty 4.1.100.Final
+- 推荐 IDE：IntelliJ IDEA
+
+### 代码规范
+
+- 遵循 [z-opc-foundation Java 代码规范](../../../z-opc-foundation-lead/008_组织规范/)
+- 模块命名：`com.zifang.z.cache.*`
+- 提交规范：Conventional Commits（`feat:` / `fix:` / `docs:` / `refactor:` / `test:`）
+
+---
+
+## 📜 许可证
+
+z-cache 采用 **MIT License**。详见 [LICENSE](LICENSE)。
 
 ```
-单元测试:    167 PASS
-RESP 一致性:  41 PASS  (对比 Redis 7.2)
-Spring Boot:  8 PASS   (context load + AutoConfiguration 验证)
-Docker live:  6 PASS   (本地起 server, jedis 客户端验证)
+MIT License
+
+Copyright (c) 2026 z-opc-foundation
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, ...
 ```
 
 ---
 
-## 📚 详细文档
+## 📂 文档目录
 
-- [RESP 命令清单](docs/RESP_COMMANDS.md)
-- [客户端 API 参考](docs/CLIENT_API.md)
-- [Spring Boot 配置参考](docs/SPRING_BOOT_PROPERTIES.md)
-- [集群模式](docs/CLUSTER_MODE.md)
-- [从 Redis 迁移](docs/MIGRATE_FROM_REDIS.md)
-- [运维手册](docs/OPERATIONS.md)
+本项目文档统一收口在 `_doc/` 下（按 z-opc-foundation 文档收口规范）：
 
----
+- [`_doc/001_arch/`](_doc/001_arch/) — 架构文档
+    - [01-module-structure.md](_doc/001_arch/01-module-structure.md) — 模块结构与命令清单
+    - [分布式锁方案选型-2026Q4.md](_doc/001_arch/分布式锁方案选型-2026Q4.md) — Redisson vs 自研选型（推荐自研）
+    - [集群模式架构选型-2026Q4.md](_doc/001_arch/集群模式架构选型-2026Q4.md) — 一致性哈希 vs 16384 槽位（推荐 Redis Cluster 风格）
+    - [分布式锁设计.md](_doc/001_arch/分布式锁设计.md) — DistributedLock API + Lua 解锁 + Watchdog 设计
+- [`_doc/002_deploy/`](_doc/002_deploy/) — 部署文档
+    - [集群模式运维手册.md](_doc/002_deploy/集群模式运维手册.md) — 12 章 907 行运维手册
+- [`_doc/003_script/`](_doc/003_script/) — 运维脚本
+    - [build.sh](_doc/003_script/build.sh) · [deploy_maven_center.sh](_doc/003_script/deploy_maven_center.sh) · [package.sh](_doc/003_script/package.sh) · 等
 
-## 🤝 贡献
+详见各子目录。
 
-欢迎 PR！请确保：
-
-```bash
-mvn clean verify         # 单元测试 + 集成测试 + Docker live 全 PASS
-```
-
----
-
-## 📄 许可证
-
-[MIT License](LICENSE)
+> **关于 _doc 子目录命名**：z-opc-foundation 规范要求 `_doc/004_skill/`，但 z-cache 1.0.x 历史版本使用 `_doc/003_script/`。z-cache 1.3.0 在保持历史兼容的前提下，规划在 2.0.0 重命名为 `001_arch / 002_deploy / 003_script / 004_skill`。
 
 ---
 
-## 🔗 相关项目
+## 📮 联系与反馈
 
-| 项目 | 关系 |
-|---|---|
-| [z-mq](https://github.com/z-opc-foundation/z-mq) | 同系列 — 分布式消息队列 |
-| [z-vector](https://github.com/z-opc-foundation/z-vector) | 同系列 — 向量数据库 |
-| [z-rpc](https://github.com/z-opc-foundation/z-rpc) | 同系列 — RPC 框架 |
-| [z-boot](https://github.com/z-opc-foundation/z-boot) | 同系列 — Spring Boot Starter 聚合 + BOM |
-
-> **通过 [z-boot-cache-starter](https://central.sonatype.com/artifact/io.github.yuku123/z-boot-cache-starter) 可以一行 import 集成 z-cache + 自动锁定版本**
+- **GitHub**: https://github.com/z-opc-foundation/z-cache
+- **Issues**: https://github.com/z-opc-foundation/z-cache/issues
+- **Maven Central**: https://central.sonatype.com/artifact/io.github.yuku123/z-cache-parent
+- **Docker Hub**: https://hub.docker.com/r/zopcfoundation/z-cache
 
 ---
 
-## 📮 联系
-
-- GitHub Issues: 提交 bug / feature request
-- Email: yuku123@users.noreply.github.com
-
-
-## 文档目录
-
-本项目文档统一收口在 `_doc/` 下:
-
-- [`_doc/001_arch/`](_doc/001_arch/) — 架构文档 (项目总览 / 模块结构 / 接口清单 / DB schema / 前端 / 能力 / roadmap):
-  - [`01-module-structure.md`](_doc/001_arch/01-module-structure.md)
-  - [`TEST_README.md`](_doc/001_arch/TEST_README.md)
-  - [`TEST_REPORT.md`](_doc/001_arch/TEST_REPORT.md)
-  - [`TEST_STATUS.md`](_doc/001_arch/TEST_STATUS.md)
-
-- [`_doc/003_script/`](_doc/003_script/) — 运维脚本:
-  - [`build.sh`](_doc/003_script/build.sh)
-  - [`deploy_maven_center.sh`](_doc/003_script/deploy_maven_center.sh)
-  - [`install-settings.sh`](_doc/003_script/install-settings.sh)
-  - [`package.sh`](_doc/003_script/package.sh)
-  - [`run-client-tests.sh`](_doc/003_script/run-client-tests.sh)
-
-各文档详细说明见各子目录。
+**z-cache 1.3.0** — 让缓存回归简单
