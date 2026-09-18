@@ -8,6 +8,7 @@ import com.zifang.z.cache.core.protocol.RespDecoder;
 import com.zifang.z.cache.core.protocol.RespEncoder;
 import com.zifang.z.cache.core.pubsub.PubSubManager;
 import com.zifang.z.cache.core.storage.MemoryStore;
+import com.zifang.z.cache.core.stream.StreamStore;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.channel.*;
 import io.netty.channel.nio.NioEventLoopGroup;
@@ -172,6 +173,10 @@ public class RedisServer {
         } catch (Exception e) {
             logger.warn("Failed to start AOF: {}", e.getMessage());
         }
+
+        // 初始化 Stream 存储
+        CommandHandler.setStreamStore(new StreamStore(16));
+        logger.info("Stream store initialized");
     }
 
     /**
