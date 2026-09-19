@@ -2,6 +2,11 @@
 
 All notable changes to z-cache will be documented in this file.
 
+## [1.3.1] - 2026-09-19
+
+### Fixed
+- Upgraded Netty from 4.1.100 to 4.1.138 to fix CVE-2023-44487 (HTTP/2 Rapid Reset)
+
 ## [1.3.0] - 2026-09-19
 
 ### Added

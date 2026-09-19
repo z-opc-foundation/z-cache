@@ -7,11 +7,11 @@
     <parent>
         <groupId>io.github.yuku123</groupId>
         <artifactId>z-cache</artifactId>
-        <version>1.3.0</version>
+        <version>1.3.1</version>
     </parent>
 
     <groupId>io.github.yuku123</groupId>
-    <version>1.3.0</version>
+    <version>1.3.1</version>
     <artifactId>z-cache-spring-boot-starter</artifactId>
     <name>z-cache-spring-boot-starter</name>
     <description>z-cache Spring Boot 自动配置与模板组件</description>
