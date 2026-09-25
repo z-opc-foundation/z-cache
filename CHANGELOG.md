@@ -74,10 +74,18 @@ All notable changes to z-cache will be documented in this file.
 - 快照是"边读边写"的一致性级别：调度线程直接遍历活键空间，不做 fork，所以定时快照可能拍到
   一次写入的中途状态。`SAVE` 与优雅停机同样是这个级别（这比之前的"根本没有快照"仍是净收益）。
 
-### 发布提醒
-- **`1.3.2` 已经在 Central 上且不可撤销**：它的 pom 与 `1.3.1` 一样坏（parent 指向从未发布的
-  `com.zifang:z-opc:1.0.0-SNAPSHOT`、`z-util-serialize-*` 钉在 Central 上不存在的 `1.0.9`）。
-  外部消费者请直接用 `1.3.3` 及以上。
+### 已经发布到 Central 的版本实测状态（2026-09-26，逐个坐标 curl）
+| 版本 | repo1 | 外部消费者 |
+|---|---|---|
+| `1.0.2` | 200 | ❌ pom 的 parent 指向未发布的 `z-opc:1.0.0-SNAPSHOT`，且 `z-util-serialize-*:1.0.9` 不存在 |
+| `1.3.0` | **404（整个版本从未发布成功）** | — |
+| `1.3.1` | 200 | ❌ 同 `1.0.2` |
+| `1.3.2` | **404（六模块 pom+jar 十二个坐标全 404）** | — |
+| `1.3.3` | 200（含 `-sources` / `-javadoc`） | ✅ 第一个外部真正能解析的版本 |
+
+所以 `1.3.2` 并不像本次提交中途以为的那样"已经传上去、坏版本永久留在 Central"——
+它的 bundle 上传了，但没有任何坐标落到 repo1。不可撤销这件事对 `1.0.2` 与 `1.3.1` 成立，
+对 `1.3.0` / `1.3.2` 不成立。
 
 ## [1.3.3] - 2026-09-26
 
@@ -91,7 +99,9 @@ All notable changes to z-cache will be documented in this file.
   `Failed to read artifact descriptor for io.github.yuku123:z-cache-core:jar:1.3.1`
   （这条是本次在空本地仓库里跑 consumer 探针实测到的输出）。
   本机 `mvn` 之所以从没报错，只是因为兄弟目录 `../pom.xml` 恰好就在磁盘上。
-  `1.3.0` 是例外：它发布时聚合 pom 里没有 parent，所以只有这一版在 parent 这条线上是通的。
+- `1.3.0` 是例外：它发布时聚合 pom 里没有 parent，`parent` 那条线本身是通的——
+  但实测 repo1 上 `1.3.0` 整个版本 404（`z-cache/1.3.0/z-cache-1.3.0.pom` 与
+  `z-cache-core/1.3.0/z-cache-core-1.3.0.jar` 都是），它压根没发布成功，所以也谈不上"能用"。
 - `central` profile 下接入 `flatten-maven-plugin`（`flattenMode=oss`，`updatePomFile=true`）：
   发布用的 pom 去掉 parent、把继承来的依赖版本全部写成字面值，install/deploy 用它替换。
   不带 `-P central` 的本地 monorepo 构建链完全不变。
