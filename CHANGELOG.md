@@ -2,6 +2,31 @@
 
 All notable changes to z-cache will be documented in this file.
 
+## [1.3.3] - 2026-09-26
+
+### Fixed
+
+#### 发布出去的构件外部消费者根本解析不动
+- Central 上 `io.github.yuku123:z-cache:1.0.2` 与 `:1.3.1` 这两个聚合 pom 的 parent 写着
+  monorepo 的 `com.zifang:z-opc:1.0.0-SNAPSHOT`——它从未（也不能）出现在 Central 上
+  （`com/zifang/z-opc/` 实测 HTTP 404）。任何仓库外的项目第一次解析就得到
+  `Could not find artifact com.zifang:z-opc:pom:1.0.0-SNAPSHOT (absent)` +
+  `Failed to read artifact descriptor for io.github.yuku123:z-cache-core:jar:1.3.1`
+  （这条是本次在空本地仓库里跑 consumer 探针实测到的输出）。
+  本机 `mvn` 之所以从没报错，只是因为兄弟目录 `../pom.xml` 恰好就在磁盘上。
+  `1.3.0` 是例外：它发布时聚合 pom 里没有 parent，所以只有这一版在 parent 这条线上是通的。
+- `central` profile 下接入 `flatten-maven-plugin`（`flattenMode=oss`，`updatePomFile=true`）：
+  发布用的 pom 去掉 parent、把继承来的依赖版本全部写成字面值，install/deploy 用它替换。
+  不带 `-P central` 的本地 monorepo 构建链完全不变。
+
+#### z-cache-core 依赖了一个 Central 上不存在的版本
+- `z-util-serialize-core` / `z-util-serialize-schema` 在 `1.0.2` 与 `1.3.1` 的 pom 里都钉在
+  `1.0.9`，而这个版本只存在于本机 `~/.m2`（由 monorepo 里的 z-util 现场 install 出来的），
+  Central 实测只有 `1.0.10`（`.../1.0.9/z-util-serialize-core-1.0.9.jar` → HTTP 404）。
+  即便修好了 parent，消费者下一步仍会卡在 `z-util-serialize-core:jar:1.0.9 (absent)`。
+  抬到 `1.0.10`（实测该 jar 里 `CodecRegistry` / `ReflectCodec` / `ZSerializer` / `ZDeserializer`
+  四个被实际 import 的类都在）。
+
 ## [1.3.2] - 2026-09-26
 
 ### Fixed
