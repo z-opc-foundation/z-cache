@@ -7,6 +7,8 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -19,6 +21,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -135,6 +138,16 @@ public class RdbPersistence {
      * 默认 RDB 文件路径
      */
     private volatile String dbFilePath = "dump.rdb";
+
+    /**
+     * 最近一次成功保存的 Unix 秒时间戳，0 表示从未保存过。LASTSAVE 命令读它。
+     */
+    private volatile long lastSaveTime;
+
+    /**
+     * 正在执行的后台保存数量。BGSAVE 用它拒绝并发快照。
+     */
+    private final AtomicInteger bgSaving = new AtomicInteger(0);
 
     /**
      * 创建 RDB 持久化调度器。
@@ -278,8 +291,9 @@ public class RdbPersistence {
      */
     public void save() throws IOException {
         if (storeAccessor == null) {
-            LOGGER.warning("StoreAccessor not set, skipping RDB save");
-            return;
+            // 以前这里只打一条 WARNING 就返回：调用方（SAVE 命令、stop()）拿到的是"成功"，
+            // 磁盘上却什么也没有。快照没落地必须是异常，不是静默通过。
+            throw new IOException("StoreAccessor not set, RDB save aborted");
         }
 
         LOGGER.info("Starting RDB save to: " + dbFilePath);
@@ -290,12 +304,11 @@ public class RdbPersistence {
 
         try {
             writeRdbFile(tempFile);
-            // 原子替换
-            if (targetFile.exists()) {
-                targetFile.delete();
-            }
-            tempFile.renameTo(targetFile);
+            // renameTo 返回 false 时快照其实没落地，而调用方（SAVE / stop()）拿到的是"成功"。
+            // Files.move 失败直接抛 IOException，REPLACE_EXISTING 也覆盖了原来的 delete + rename 两步。
+            Files.move(tempFile.toPath(), targetFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
             writeCounter.set(0);
+            lastSaveTime = System.currentTimeMillis() / 1000L;
             LOGGER.info("RDB save completed successfully");
         } catch (IOException e) {
             if (tempFile.exists()) {
@@ -304,6 +317,37 @@ public class RdbPersistence {
             LOGGER.log(Level.SEVERE, "Failed to save RDB file", e);
             throw e;
         }
+    }
+
+    /**
+     * 后台触发一次 RDB 快照（BGSAVE 语义）。
+     * <p>
+     * 与 {@link #save()} 的区别只在执行线程：本方法立刻返回，快照在调度线程上完成。
+     * </p>
+     *
+     * @return true 表示已受理；false 表示已有一个后台快照在跑，本次被拒绝（与 Redis 一致）
+     */
+    public boolean saveAsync() {
+        if (storeAccessor == null || !bgSaving.compareAndSet(0, 1)) {
+            return false;
+        }
+        scheduler.execute(() -> {
+            try {
+                save();
+            } catch (Exception e) {
+                LOGGER.log(Level.WARNING, "Background RDB save failed", e);
+            } finally {
+                bgSaving.set(0);
+            }
+        });
+        return true;
+    }
+
+    /**
+     * @return 最近一次成功保存的 Unix 秒时间戳，0 表示从未保存过
+     */
+    public long getLastSaveTime() {
+        return lastSaveTime;
     }
 
     /**
@@ -378,23 +422,37 @@ public class RdbPersistence {
             dos.writeInt(RDB_VERSION);
             checksum = updateChecksum(checksum, RDB_VERSION);
 
-            // 获取所有数据
-            Map<String, Object> stringEntries = storeAccessor.getAllStringEntries();
-            Map<String, Object> hashEntries = storeAccessor.getAllHashEntries();
-            Map<String, Object> listEntries = storeAccessor.getAllListEntries();
-            Map<String, Object> setEntries = storeAccessor.getAllSetEntries();
-            Map<String, Object> sortedSetEntries = storeAccessor.getAllSortedSetEntries();
-            Map<String, Long> expirationEntries = storeAccessor.getAllExpirationEntries();
+            // 逐库导出。以前这里硬编码 dbCount=1 / dbIndex=0：服务对外承诺 16 个库，
+            // 而快照只装得下 DB 0，SELECT 3 之后写进去的数据在重启后静默消失。
+            List<DbSection> sections = new ArrayList<>();
+            for (int db = 0; db < storeAccessor.getDbCount(); db++) {
+                DbSection section = new DbSection(db,
+                        storeAccessor.getAllStringEntries(db),
+                        storeAccessor.getAllHashEntries(db),
+                        storeAccessor.getAllListEntries(db),
+                        storeAccessor.getAllSetEntries(db),
+                        storeAccessor.getAllSortedSetEntries(db),
+                        storeAccessor.getAllExpirationEntries(db));
+                if (section.totalEntries() > 0) {
+                    sections.add(section);
+                }
+            }
 
-            // 计算数据库数量（这里简化为单数据库）
-            int dbCount = 1;
-            dos.writeInt(dbCount);
-            checksum = updateChecksum(checksum, dbCount);
+            dos.writeInt(sections.size());
+            checksum = updateChecksum(checksum, sections.size());
 
+            for (DbSection section : sections) {
             // 写入数据库编号
-            int dbIndex = 0;
+            int dbIndex = section.dbIndex;
             dos.writeInt(dbIndex);
             checksum = updateChecksum(checksum, dbIndex);
+
+            Map<String, Object> stringEntries = section.stringEntries;
+            Map<String, Object> hashEntries = section.hashEntries;
+            Map<String, Object> listEntries = section.listEntries;
+            Map<String, Object> setEntries = section.setEntries;
+            Map<String, Object> sortedSetEntries = section.sortedSetEntries;
+            Map<String, Long> expirationEntries = section.expirationEntries;
 
             // 计算总键值对数量
             int totalEntries = stringEntries.size() + hashEntries.size() + listEntries.size()
@@ -475,6 +533,7 @@ public class RdbPersistence {
                 checksum = writeLong(dos, expireAt, checksum);
                 checksum = writeSortedSet(dos, sortedSetValue, checksum);
             }
+            }
 
             // 写入结束标记
             dos.writeByte(END_MARKER);
@@ -523,6 +582,10 @@ public class RdbPersistence {
             int entryCount = dis.readInt();
             checksum = updateChecksum(checksum, entryCount);
 
+            // 文件里的库号可能来自更高配置的实例（比如 dump 来自 32 库的部署）。
+            // 越界的段照样要读完，否则后面整个 checksum 流就错位了；只是不落库。
+            boolean restorable = dbIndex >= 0 && dbIndex < storeAccessor.getDbCount();
+
             for (int i = 0; i < entryCount; i++) {
                 byte type = dis.readByte();
                 checksum = updateChecksum(checksum, type);
@@ -537,31 +600,41 @@ public class RdbPersistence {
                     case TYPE_STRING:
                         byte[] value = readBytes(dis);
                         checksum = updateChecksum(checksum, value);
-                        storeAccessor.restoreString(key, value, expireAt);
+                        if (restorable) {
+                            storeAccessor.restoreString(dbIndex, key, value, expireAt);
+                        }
                         break;
 
                     case TYPE_HASH:
                         Map<byte[], byte[]> hashEntries = readHash(dis);
                         checksum = updateChecksum(checksum, hashEntries);
-                        storeAccessor.restoreHash(key, hashEntries, expireAt);
+                        if (restorable) {
+                            storeAccessor.restoreHash(dbIndex, key, hashEntries, expireAt);
+                        }
                         break;
 
                     case TYPE_LIST:
                         List<byte[]> listEntries = readList(dis);
                         checksum = updateChecksum(checksum, listEntries);
-                        storeAccessor.restoreList(key, listEntries, expireAt);
+                        if (restorable) {
+                            storeAccessor.restoreList(dbIndex, key, listEntries, expireAt);
+                        }
                         break;
 
                     case TYPE_SET:
                         Set<byte[]> setEntries = readSet(dis);
                         checksum = updateChecksum(checksum, setEntries);
-                        storeAccessor.restoreSet(key, setEntries, expireAt);
+                        if (restorable) {
+                            storeAccessor.restoreSet(dbIndex, key, setEntries, expireAt);
+                        }
                         break;
 
                     case TYPE_SORTED_SET:
                         Map<byte[], Double> sortedSetEntries = readSortedSet(dis);
                         checksum = updateChecksumSortedSet(checksum, sortedSetEntries);
-                        storeAccessor.restoreSortedSet(key, sortedSetEntries, expireAt);
+                        if (restorable) {
+                            storeAccessor.restoreSortedSet(dbIndex, key, sortedSetEntries, expireAt);
+                        }
                         break;
 
                     default:
@@ -580,6 +653,37 @@ public class RdbPersistence {
         long fileChecksum = dis.readLong();
         if (fileChecksum != checksum) {
             throw new IOException("Checksum mismatch: expected " + fileChecksum + ", got " + checksum);
+        }
+    }
+
+    /**
+     * 一个数据库在快照里的全部导出数据。空库不写入文件，段头自带库号，
+     * 所以读侧按 dbIndex 落库而不是按出现顺序猜。
+     */
+    private static final class DbSection {
+        final int dbIndex;
+        final Map<String, Object> stringEntries;
+        final Map<String, Object> hashEntries;
+        final Map<String, Object> listEntries;
+        final Map<String, Object> setEntries;
+        final Map<String, Object> sortedSetEntries;
+        final Map<String, Long> expirationEntries;
+
+        DbSection(int dbIndex, Map<String, Object> stringEntries, Map<String, Object> hashEntries,
+                  Map<String, Object> listEntries, Map<String, Object> setEntries,
+                  Map<String, Object> sortedSetEntries, Map<String, Long> expirationEntries) {
+            this.dbIndex = dbIndex;
+            this.stringEntries = stringEntries;
+            this.hashEntries = hashEntries;
+            this.listEntries = listEntries;
+            this.setEntries = setEntries;
+            this.sortedSetEntries = sortedSetEntries;
+            this.expirationEntries = expirationEntries;
+        }
+
+        int totalEntries() {
+            return stringEntries.size() + hashEntries.size() + listEntries.size()
+                    + setEntries.size() + sortedSetEntries.size();
         }
     }
 

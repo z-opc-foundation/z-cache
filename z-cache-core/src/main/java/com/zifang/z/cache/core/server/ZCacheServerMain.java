@@ -156,6 +156,13 @@ public class ZCacheServerMain {
         System.out.println("  -p, --port <port>    Listen port (default: 6379)");
         System.out.println("  --max-entries <n>    Maximum keys, 0 means unlimited");
         System.out.println("  --data-dir <dir>     Enable RDB/AOF persistence and snapshots in <dir>");
+        System.out.println();
+        System.out.println("Persistence tuning (system properties, only with --data-dir):");
+        System.out.println("  -Dzcache.save-seconds <n>   RDB snapshot check interval, default 300; 0 disables periodic snapshots");
+        System.out.println("  -Dzcache.save-changes <n>   Writes needed before a snapshot, default 1000; 0 disables");
+        System.out.println("  -Dzcache.appendfsync <p>    always | everysec (default) | no");
+        System.out.println("  Recovery order matches Redis: a non-empty appendonly.aof is replayed and");
+        System.out.println("  dump.rdb is then ignored, so the two are never applied on top of each other.");
         System.out.println("  -h, --help           Show this help message");
         System.out.println();
         System.out.println("Examples:");

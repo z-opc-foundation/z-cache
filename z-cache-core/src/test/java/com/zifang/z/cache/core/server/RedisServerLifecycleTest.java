@@ -1,6 +1,7 @@
 package com.zifang.z.cache.core.server;
 
 import com.zifang.z.cache.core.command.CommandHandler;
+import com.zifang.z.cache.core.persistence.AofPersistence;
 import com.zifang.z.cache.core.stream.StreamStore;
 import org.junit.jupiter.api.Test;
 
@@ -367,6 +368,311 @@ class RedisServerLifecycleTest {
         } finally {
             server.stop();
             thread.join(DEADLINE_MS);
+        }
+    }
+
+    /**
+     * 快照必须装得下全部 16 个库，并且重启后带 TTL 回来。
+     * <p>
+     * 1.3.3 及之前：RDB 写侧硬编码 dbCount=1 / dbIndex=0，只导出 DB 0，
+     * {@code getAllExpirationEntries()} 直接 {@code return new HashMap<>()}。
+     * 所以 {@code SELECT 3} 之后写进去的数据在重启后静默消失，而 SETEX 的键回来变成了永久键
+     * —— 两个方向都是丢数据，且都没有任何报错。
+     * <p>
+     * 这里重启前显式删掉 AOF：恢复顺序是"有 AOF 只认 AOF"，不删的话下面读到的全是重放结果，
+     * 快照那一份根本没进过内存。
+     */
+    @Test
+    void saveSnapshotsEveryDatabaseAndTheirTtls() throws Exception {
+        java.nio.file.Path dir = java.nio.file.Files.createTempDirectory("zcache-rdb");
+        int port = freePort();
+        RedisServer first = new RedisServer("127.0.0.1", port, 0);
+        first.setDataDir(dir.toString());
+        Thread thread = startAndWait(first, port);
+        try (Socket socket = connect(port)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+
+            send(socket, "SELECT", "3");
+            assertEquals("+OK", readReply(in));
+            send(socket, "SET", "k3", "v3");
+            assertEquals("+OK", readReply(in), "前置条件: DB3 写入必须成功");
+            send(socket, "SETEX", "t3", "3600", "tv");
+            assertEquals("+OK", readReply(in));
+            send(socket, "SETEX", "gone", "1", "x");
+            assertEquals("+OK", readReply(in));
+
+            send(socket, "SELECT", "7");
+            assertEquals("+OK", readReply(in));
+            send(socket, "LPUSH", "l7", "e1");
+            assertEquals(":1", readReply(in), "前置条件: DB7 列表必须真有 1 个元素");
+
+            // 等 gone 过期（1s + 余量），让快照根本不该带上它
+            Thread.sleep(1_300);
+            send(socket, "SELECT", "3");
+            assertEquals("+OK", readReply(in));
+            send(socket, "GET", "gone");
+            assertEquals("$-1", readReply(in), "前置条件: gone 已经过期不可见");
+
+            send(socket, "SAVE");
+            assertEquals("+OK", readReply(in), "SAVE 必须如实回 +OK（配了 dataDir 时）");
+
+            send(socket, "LASTSAVE");
+            String lastSave = readReply(in);
+            assertTrue(lastSave.startsWith(":") && Long.parseLong(lastSave.substring(1)) > 0,
+                    "LASTSAVE 要报出真实的快照时刻，实际: " + lastSave);
+        } finally {
+            first.stop();
+            thread.join(DEADLINE_MS);
+        }
+        assertTrue(java.nio.file.Files.size(dir.resolve("dump.rdb")) > 0,
+                "SAVE 报了 +OK，磁盘上就必须有文件");
+
+        java.nio.file.Files.deleteIfExists(dir.resolve("appendonly.aof"));
+
+        int port2 = freePort();
+        RedisServer second = new RedisServer("127.0.0.1", port2, 0);
+        second.setDataDir(dir.toString());
+        Thread thread2 = startAndWait(second, port2);
+        try (Socket socket = connect(port2)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+
+            send(socket, "SELECT", "3");
+            assertEquals("+OK", readReply(in));
+            send(socket, "GET", "k3");
+            assertEquals("v3", readReply(in), "DB3 的键必须活过重启（旧实现只导出 DB 0）");
+            send(socket, "TTL", "t3");
+            long ttl = Long.parseLong(readReply(in).substring(1));
+            assertTrue(ttl > 3_000 && ttl <= 3_600,
+                    "SETEX 的剩余时间必须一起回来，实际 TTL=" + ttl + "（旧实现会报 -1，变成永久键）");
+            send(socket, "GET", "gone");
+            assertEquals("$-1", readReply(in), "停机期间到期的键不得复活");
+            send(socket, "DBSIZE");
+            assertEquals(":2", readReply(in), "DB3 只该有 k3 与 t3 两个键");
+
+            send(socket, "SELECT", "7");
+            assertEquals("+OK", readReply(in));
+            send(socket, "LLEN", "l7");
+            assertEquals(":1", readReply(in), "DB7 的列表必须活过重启");
+
+            // 反向证据：分库导出不是"全都塞进 DB 0"
+            send(socket, "SELECT", "0");
+            assertEquals("+OK", readReply(in));
+            send(socket, "GET", "k3");
+            assertEquals("$-1", readReply(in), "k3 属于 DB3，不该出现在 DB0");
+            send(socket, "DBSIZE");
+            assertEquals(":0", readReply(in));
+        } finally {
+            second.stop();
+            thread2.join(DEADLINE_MS);
+        }
+    }
+
+    /**
+     * 没配 dataDir 时 SAVE 不能装作成功。
+     * <p>
+     * 旧实现里 SAVE / BGSAVE 都直接返回一个写死的 OK，LASTSAVE 返回当前时间 —— 三个命令
+     * 一个字都没落到磁盘上，运维看着"SAVE 成功、LASTSAVE 在涨"以为有快照。
+     */
+    @Test
+    void saveWithoutDataDirFailsHonestly() throws Exception {
+        int port = freePort();
+        RedisServer server = new RedisServer("127.0.0.1", port, 0);
+        Thread thread = startAndWait(server, port);
+        try (Socket socket = connect(port)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+
+            send(socket, "SET", "k", "v");
+            assertEquals("+OK", readReply(in));
+
+            send(socket, "SAVE");
+            String save = readReply(in);
+            assertTrue(save.startsWith("-ERR"), "没有 dataDir 就没有快照目标，SAVE 必须报错，实际: " + save);
+
+            send(socket, "LASTSAVE");
+            assertEquals(":0", readReply(in), "从未成功保存过，LASTSAVE 只能是 0");
+
+            send(socket, "PING");
+            assertEquals("+PONG", readReply(in), "SAVE 失败不能把连接带坏");
+        } finally {
+            server.stop();
+            thread.join(DEADLINE_MS);
+        }
+    }
+
+    /**
+     * AOF 必须真的能恢复数据 —— 它是发行形态里唯一一直在写的持久化路径。
+     * <p>
+     * 1.3.3 及之前 {@code loadAof()} 在主代码里零调用方：AOF 只写不读，宣传的掉电恢复
+     * 一次都没有兑现过。而且它一旦被读起来会暴露三件事（这条测试逐条钉住）：
+     * <ul>
+     *   <li>写命令表里没有 {@code SELECT} 的库号，重放会把 5 号库的数据全落进 DB 0；</li>
+     *   <li>BLPOP 消费掉的那个值在日志里毫无痕迹，重放后它又回到源列表里，可以被消费第二次；</li>
+     *   <li>重放本身会再写一遍 AOF，日志每开一次机翻一倍。</li>
+     * </ul>
+     * 三代实例（A 写 → B 读并再写 → C 读）是为了第三条：只看 B 的话，"重复写入"要下一次开机才现形。
+     */
+    @Test
+    void aofReplayRestoresDataAcrossThreeGenerations() throws Exception {
+        java.nio.file.Path dir = java.nio.file.Files.createTempDirectory("zcache-aof");
+
+        // ---- 第一代：只写，不 SAVE ----
+        int p1 = freePort();
+        RedisServer gen1 = new RedisServer("127.0.0.1", p1, 0);
+        gen1.setDataDir(dir.toString());
+        Thread t1 = startAndWait(gen1, p1);
+        try (Socket socket = connect(p1)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+            send(socket, "SELECT", "5");
+            assertEquals("+OK", readReply(in));
+            send(socket, "SET", "in5", "v5");
+            assertEquals("+OK", readReply(in));
+            send(socket, "LPUSH", "dbl", "x");
+            assertEquals(":1", readReply(in), "前置条件: 列表先只有 1 个元素");
+            send(socket, "LPUSH", "q", "a");
+            assertEquals(":1", readReply(in));
+            send(socket, "BLPOP", "q", "0");
+            assertEquals(java.util.Arrays.asList("q", "a"), readArray(in),
+                    "前置条件: BLPOP 当时真的弹到了 a");
+            send(socket, "LLEN", "q");
+            assertEquals(":0", readReply(in), "前置条件: 弹完就空了");
+            send(socket, "SET", "multi", "first\r\nsecond");
+            assertEquals("+OK", readReply(in), "前置条件: 含换行的值必须写得进去");
+        } finally {
+            gen1.stop();
+            t1.join(DEADLINE_MS);
+        }
+        // 只留 AOF：快照那一份由上一条测试负责，这里叠上来就分不清是谁恢复的了
+        java.nio.file.Files.deleteIfExists(dir.resolve("dump.rdb"));
+
+        // ---- 第二代：靠重放恢复，再写一条 ----
+        int p2 = freePort();
+        RedisServer gen2 = new RedisServer("127.0.0.1", p2, 0);
+        gen2.setDataDir(dir.toString());
+        Thread t2 = startAndWait(gen2, p2);
+        try (Socket socket = connect(p2)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+            send(socket, "GET", "in5");
+            assertEquals("$-1", readReply(in), "重放必须尊重库号：in5 在 DB5，不该出现在 DB0");
+            send(socket, "SELECT", "5");
+            assertEquals("+OK", readReply(in));
+            send(socket, "GET", "in5");
+            assertEquals("v5", readReply(in), "AOF 里的写入必须活过重启（旧实现根本不放 AOF）");
+            send(socket, "LLEN", "dbl");
+            assertEquals(":1", readReply(in), "重放只能演一遍：LPUSH dbl 落库后列表仍是 1 个");
+            send(socket, "LLEN", "q");
+            assertEquals(":0", readReply(in), "BLPOP 消费掉的值不得被重放回炉");
+            send(socket, "GET", "multi");
+            assertEquals("first\r\nsecond", readReply(in), "含 CRLF 的值必须按声明长度原样取回");
+            send(socket, "SET", "in6", "v6");
+            assertEquals("+OK", readReply(in));
+        } finally {
+            gen2.stop();
+            t2.join(DEADLINE_MS);
+        }
+        java.nio.file.Files.deleteIfExists(dir.resolve("dump.rdb"));
+
+        // ---- 第三代：证明第二代的重放没有回写 AOF ----
+        int p3 = freePort();
+        RedisServer gen3 = new RedisServer("127.0.0.1", p3, 0);
+        gen3.setDataDir(dir.toString());
+        Thread t3 = startAndWait(gen3, p3);
+        try (Socket socket = connect(p3)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+            send(socket, "SELECT", "5");
+            assertEquals("+OK", readReply(in));
+            send(socket, "GET", "in6");
+            assertEquals("v6", readReply(in), "第二代的新写入也要活到第三代");
+            send(socket, "LLEN", "dbl");
+            assertEquals(":1", readReply(in), "重放若回写 AOF，这一代就会看到 dbl 被 LPUSH 了两次");
+            send(socket, "GET", "multi");
+            assertEquals("first\r\nsecond", readReply(in));
+        } finally {
+            gen3.stop();
+            t3.join(DEADLINE_MS);
+        }
+    }
+
+    /**
+     * 定时快照必须真的会自己落盘 —— 这是"进程被 kill -9 之后还能捞回多少"的唯一兜底。
+     * <p>
+     * 修之前有两处：{@code RdbPersistence.start()} 一个调用方都没有（调度器根本没跑），
+     * 而就算跑了，{@code onWrite()} 也是零调用 → {@code writeCounter} 恒为 0 →
+     * {@code shouldSave()} 永远判 false。两处任缺其一，"每隔 N 秒自动快照"都只是类注释。
+     */
+    @Test
+    void periodicSnapshotRunsWithoutExplicitSave() throws Exception {
+        System.setProperty("zcache.save-seconds", "1");
+        System.setProperty("zcache.save-changes", "1");
+        java.nio.file.Path dir = java.nio.file.Files.createTempDirectory("zcache-periodic");
+        int port = freePort();
+        RedisServer server = new RedisServer("127.0.0.1", port, 0);
+        server.setDataDir(dir.toString());
+        Thread thread = null;
+        try {
+            thread = startAndWait(server, port);
+            try (Socket socket = connect(port)) {
+                DataInputStream in = new DataInputStream(socket.getInputStream());
+                send(socket, "SET", "auto-saved", "yes");
+                assertEquals("+OK", readReply(in), "前置条件: 写入必须成功（这一次写入就是快照的触发条件）");
+            }
+
+            java.nio.file.Path snapshot = dir.resolve("dump.rdb");
+            long deadline = System.currentTimeMillis() + DEADLINE_MS;
+            while (System.currentTimeMillis() < deadline && !java.nio.file.Files.exists(snapshot)) {
+                Thread.sleep(100);
+            }
+            assertTrue(java.nio.file.Files.exists(snapshot),
+                    "save-seconds=1 / save-changes=1 时，不需要任何 SAVE，快照必须自己出现");
+            String raw = new String(java.nio.file.Files.readAllBytes(snapshot), StandardCharsets.ISO_8859_1);
+            assertTrue(raw.contains("auto-saved"),
+                    "落盘的必须真是这份数据，而不是一个空壳文件");
+        } finally {
+            System.clearProperty("zcache.save-seconds");
+            System.clearProperty("zcache.save-changes");
+            server.stop();
+            if (thread != null) {
+                thread.join(DEADLINE_MS);
+            }
+        }
+    }
+
+    /**
+     * AOF 的 fsync 档位要真能配，而且配错时不能装作采纳了。
+     * <p>
+     * {@code setFsyncPolicy} / {@code parseFsyncPolicy} 一直是对外 API，但服务器侧没人读配置，
+     * 所以 {@code appendfsync always} 怎么写都是 EVERYSEC —— 用户以为每条命令都落盘了。
+     */
+    @Test
+    void appendfsyncPolicyIsHonouredAndBadValuesAreVisible() throws Exception {
+        System.setProperty("zcache.appendfsync", "always");
+        int port = freePort();
+        RedisServer strict = new RedisServer("127.0.0.1", port, 0);
+        strict.setDataDir(java.nio.file.Files.createTempDirectory("zcache-fsync").toString());
+        Thread thread = startAndWait(strict, port);
+        try (Socket socket = connect(port)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+            send(socket, "SET", "k", "v");
+            assertEquals("+OK", readReply(in));
+            assertNotNull(strict.getAofPersistence(), "配了 dataDir 就必须有 AOF");
+            assertEquals(AofPersistence.FSYNC_ALWAYS, strict.getAofPersistence().getFsyncPolicy(),
+                    "appendfsync=always 必须真的生效");
+        } finally {
+            strict.stop();
+            thread.join(DEADLINE_MS);
+        }
+
+        System.setProperty("zcache.appendfsync", "weekly");
+        int port2 = freePort();
+        RedisServer bogus = new RedisServer("127.0.0.1", port2, 0);
+        bogus.setDataDir(java.nio.file.Files.createTempDirectory("zcache-fsync2").toString());
+        Thread thread2 = startAndWait(bogus, port2);
+        try {
+            assertEquals(AofPersistence.FSYNC_EVERYSEC, bogus.getAofPersistence().getFsyncPolicy(),
+                    "非法档位不能被静默采纳成别的值");
+        } finally {
+            System.clearProperty("zcache.appendfsync");
+            bogus.stop();
+            thread2.join(DEADLINE_MS);
         }
     }
 

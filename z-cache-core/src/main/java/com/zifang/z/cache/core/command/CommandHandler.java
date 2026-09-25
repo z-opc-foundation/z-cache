@@ -3,6 +3,7 @@ package com.zifang.z.cache.core.command;
 import com.zifang.z.cache.common.protocol.*;
 import com.zifang.z.cache.core.logging.SlowLog;
 import com.zifang.z.cache.core.persistence.AofPersistence;
+import com.zifang.z.cache.core.persistence.RdbPersistence;
 import com.zifang.z.cache.core.pubsub.PubSubManager;
 import com.zifang.z.cache.core.storage.*;
 import com.zifang.z.cache.core.stream.StreamStore;
@@ -42,6 +43,7 @@ public class CommandHandler {
     private static PubSubManager pubSubManager;
     private static SlowLog slowLog;
     private static AofPersistence aofPersistence;
+    private static RdbPersistence rdbPersistence;
     private static StreamStore streamStore;
 
     /** MONITOR 模式的客户端集合（共享） */
@@ -69,6 +71,7 @@ public class CommandHandler {
     public static void setPubSubManager(PubSubManager m) { pubSubManager = m; }
     public static void setSlowLog(SlowLog l) { slowLog = l; }
     public static void setAofPersistence(AofPersistence a) { aofPersistence = a; }
+    public static void setRdbPersistence(RdbPersistence r) { rdbPersistence = r; }
     public static void setStreamStore(StreamStore ss) { streamStore = ss; }
 
     public static StreamStore getStreamStore() { return streamStore; }
@@ -99,6 +102,25 @@ public class CommandHandler {
     }
 
     // ======================== 核心分发 ========================
+
+    /**
+     * AOF 重放入口：把日志里的一条命令按普通命令执行。
+     * <p>
+     * 和客户端路径的差别只有三处：不回写 AOF（调用方已 {@link #setLoading(boolean)} 置位）、
+     * 不绑连接（没有 PubSub / MONITOR 语义）、不参与鉴权（重放用的是服务内部对象）。
+     * 走的是同一个 {@link #handle(Object)}，所以"重放后 GET 得到什么"和"客户端当时 GET
+     * 得到什么"用的是同一份代码 —— 这正是以前缺的那一环：AOF 只写不读，落盘的功能一个字都没兑现。
+     */
+    public void replayCommand(String[] args) {
+        if (args == null || args.length == 0) {
+            return;
+        }
+        Object[] parts = new Object[args.length];
+        for (int i = 0; i < args.length; i++) {
+            parts[i] = RespBulkString.of(args[i] == null ? "" : args[i]);
+        }
+        handle(RespArray.of(parts));
+    }
 
     public Object handle(Object request) {
         if (request == null) return RespError.of("ERR", "empty request");
@@ -251,9 +273,9 @@ public class CommandHandler {
                 case "PUNSUBSCRIBE": result = handlePunsubscribe(args); break;
                 case "PUBLISH":      result = handlePublish(args);      break;
                 case "PUBSUB":       result = handlePubsub(args);       break;
-                case "BGSAVE":  result = RespSimpleString.of("OK"); break;
-                case "SAVE":    result = RespSimpleString.of("OK"); break;
-                case "LASTSAVE":result = RespInteger.of((int)(System.currentTimeMillis()/1000)); break;
+                case "BGSAVE":  result = handleBgsave(); break;
+                case "SAVE":    result = handleSave(); break;
+                case "LASTSAVE":result = handleLastsave(); break;
                 case "SLOWLOG": result = handleSlowlog(args); break;
                 case "FLUSHDB":  result = handleFlushdb();  break;
                 case "FLUSHALL": result = handleFlushall(); break;
@@ -287,8 +309,8 @@ public class CommandHandler {
             if (!monitorClients.isEmpty() && !"MONITOR".equals(cmd)) {
                 forwardToMonitors(args);
             }
-            // AOF 追加写命令
-            appendAof(args);
+            // 写命令收尾：AOF 追加 + RDB 写入计数
+            propagateWriteToPersistence(args, result);
             return result;
         } catch (Exception e) {
             logger.error("Error executing command: {} - {}", cmd, e.getMessage(), e);
@@ -931,7 +953,43 @@ public class CommandHandler {
         }
     }
 
+    /**
+     * SAVE — 同步写一份 RDB 快照。
+     * <p>
+     * 1.3.3 及之前 SAVE / BGSAVE 都直接复用 handleSet 风格的假成功（返回 OK 但从不落盘），
+     * 未配置 dataDir 时也照样回 OK。这里把两种情况分开：没有快照目标就如实报错。
+     */
+    private Object handleSave() {
+        if (rdbPersistence == null) {
+            return RespError.of("ERR", "SAVE is not supported: no data directory configured");
+        }
+        try {
+            rdbPersistence.save();
+            return RespSimpleString.of("OK");
+        } catch (Exception e) {
+            logger.error("SAVE failed: {}", e.getMessage(), e);
+            return RespError.of("ERR", "save failed: " + e.getMessage());
+        }
+    }
+
+    /** BGSAVE — 受理后台快照；已有快照在跑时如实拒绝，与 Redis 行为一致。 */
+    private Object handleBgsave() {
+        if (rdbPersistence == null) {
+            return RespError.of("ERR", "BGSAVE is not supported: no data directory configured");
+        }
+        if (!rdbPersistence.saveAsync()) {
+            return RespError.of("ERR", "Background save already in progress. Please wait");
+        }
+        return RespSimpleString.of("Background saving started");
+    }
+
+    /** LASTSAVE — 最近一次成功快照的 Unix 秒；从未成功过则为 0，不再拿当前时间冒充。 */
+    private Object handleLastsave() {
+        return RespInteger.of(rdbPersistence == null ? 0L : rdbPersistence.getLastSaveTime());
+    }
+
     private Object handleFlushdb() { store.flushDb(currentDb); return RespSimpleString.of("OK"); }
+
     private Object handleFlushall() { store.flushAll(); return RespSimpleString.of("OK"); }
 
     private Object handleInfo(String[] args) {
@@ -1494,25 +1552,112 @@ public class CommandHandler {
 
     /**
      * 将写命令追加到 AOF 文件（仅记录写命令）。
+     * <p>
+     * 只列"重放这条命令就能得到同样的最终状态"的纯写命令。两点取舍：
+     * <ul>
+     *   <li>MULTI / EXEC / DISCARD 不列 —— EXEC 会把队列里的命令逐条重新走一遍
+     *       {@code handle()}，每条各自落 AOF，再记一遍事务边界只会让重放多跑一次空事务。</li>
+     *   <li>Stream（XADD / XDEL / XTRIM …）不列 —— 我们的 XADD 在 {@code *} 形态下按当前时间
+     *       生成条目 ID，重放会造出一批 ID 完全不同的条目；而 Stream 也没有 RDB 那一份快照兜底。
+     *       记进 AOF 看着像持久化了，实际是一堆对不上的 ID，比不记更容易误导。</li>
+     * </ul>
      */
     private static final java.util.Set<String> WRITE_COMMANDS = new java.util.HashSet<>(java.util.Arrays.asList(
         "SET", "SETEX", "PSETEX", "SETNX", "GETSET", "MSET", "APPEND", "INCR", "DECR", "INCRBY", "DECRBY",
         "DEL", "EXPIRE", "PEXPIRE", "PERSIST", "RENAME", "RENAMENX",
-        "HSET", "HDEL", "HMSET", "HINCRBY", "HSETNX",
-        "LPUSH", "RPUSH", "LPOP", "RPOP", "LSET", "LINSERT", "LREM", "LTRIM", "RPOPLPUSH",
-        "SADD", "SREM", "SMOVE",
-        "ZADD", "ZREM", "ZINCRBY",
-        "MULTI", "EXEC", "DISCARD", "FLUSHDB", "FLUSHALL"
+        "HSET", "HDEL", "HMSET", "HINCRBY", "HINCRBYFLOAT", "HSETNX",
+        "LPUSH", "RPUSH", "LPOP", "RPOP", "LSET", "LINSERT", "LREM", "LTRIM", "RPOPLPUSH", "LMOVE",
+        "SADD", "SREM", "SMOVE", "SPOP", "SINTERSTORE", "SUNIONSTORE", "SDIFFSTORE",
+        "ZADD", "ZREM", "ZINCRBY", "ZREMRANGEBYLEX", "ZREMRANGEBYRANK", "ZREMRANGEBYSCORE",
+        "FLUSHDB", "FLUSHALL"
     ));
 
-    private void appendAof(String[] args) {
-        if (aofPersistence != null && args.length > 0 && WRITE_COMMANDS.contains(args[0].toUpperCase())) {
-            try {
-                aofPersistence.appendCommand(args);
-            } catch (Exception e) {
-                logger.warn("Failed to append to AOF: {}", e.getMessage());
-            }
+    /** 阻塞命令 → 非阻塞等价命令的映射；见 {@link #aofRecordFor}。 */
+    private static final java.util.Set<String> BLOCKING_POP_COMMANDS =
+            new java.util.HashSet<>(java.util.Arrays.asList("BLPOP", "BRPOP", "BRPOPLPUSH"));
+
+    /**
+     * AOF 重放期间为 true：此时每条命令都要照常执行，但绝不能再写回 AOF，
+     * 否则开机重放一次，AOF 就把自己抄了一份，越长越离谱。
+     */
+    private static volatile boolean loading;
+
+    public static void setLoading(boolean loading) { CommandHandler.loading = loading; }
+
+    /**
+     * 写命令执行完之后的两件收尾事：追加 AOF、给 RDB 调度器记一次"库变了"。
+     * <p>
+     * {@code RdbPersistence.onWrite()} 以前一个调用方都没有，于是 {@code writeCounter} 恒为 0、
+     * {@code shouldSave()} 永远为 false —— 就算把调度器 start 起来，它也只会每 N 秒空转一次
+     * 判断"没有任何写入"。定时快照要成立，这一记必须有人打。
+     */
+    private void propagateWriteToPersistence(String[] args, Object result) {
+        if (loading || args.length == 0) {
+            return;
         }
+        String cmd = args[0].toUpperCase();
+        String[] record;
+        if (BLOCKING_POP_COMMANDS.contains(cmd)) {
+            // 没弹出任何值 ⇒ 这条命令什么都没改，AOF 与写计数器都不记
+            record = aofRecordFor(cmd, args, result);
+            if (record == null) {
+                return;
+            }
+        } else if (WRITE_COMMANDS.contains(cmd)) {
+            record = args;
+        } else {
+            return;
+        }
+
+        if (rdbPersistence != null) {
+            rdbPersistence.onWrite();
+        }
+        if (aofPersistence == null) {
+            return;
+        }
+        try {
+            writeAofRecord(record);
+        } catch (Exception e) {
+            logger.warn("Failed to append to AOF: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * 落一条 AOF 记录。当前连接不在 DB 0 时必须先写 SELECT：AOF 重放用的是一个全新
+     * 连接（db 恒为 0），不带上库号的话 {@code SELECT 3} 之后写进去的数据会全部落到 DB 0。
+     */
+    private void writeAofRecord(String[] record) throws java.io.IOException {
+        if (currentDb != 0) {
+            aofPersistence.appendCommand(new String[]{"SELECT", Integer.toString(currentDb)});
+        }
+        aofPersistence.appendCommand(record);
+    }
+
+    /**
+     * 把阻塞弹出命令翻译成 AOF 里该记的形态。
+     * <p>
+     * 阻塞命令超时（回复是 {@code *-1} 或 {@code $-1}）时什么都没弹出，不能记；真的弹到了
+     * 才按非阻塞等价命令（LPOP / RPOP / RPOPLPUSH）记一条 —— Redis 也是这么做的。若不翻译，
+     * "BLPOP 消费掉的那个值"在 AOF 里根本没有痕迹，重放后它会还躺在源列表里被消费第二次。
+     * BLPOP 允许多个 key，所以要记的是回复里给出的那个真正命中的 key。
+     *
+     * @return 要写入 AOF 的命令；null 表示本次调用没有产生任何写入
+     */
+    private static String[] aofRecordFor(String cmd, String[] args, Object result) {
+        if ("BRPOPLPUSH".equals(cmd)) {
+            if (!(result instanceof RespBulkString) || ((RespBulkString) result).isNull()) {
+                return null;
+            }
+            return new String[]{"RPOPLPUSH", args[1], args[2]};
+        }
+        if (!(result instanceof RespArray) || ((RespArray) result).isNull() || ((RespArray) result).size() < 1) {
+            return null;
+        }
+        String poppedKey = ((RespArray) result).toStringArray()[0];
+        if (poppedKey == null) {
+            return null;
+        }
+        return new String[]{"BLPOP".equals(cmd) ? "LPOP" : "RPOP", poppedKey};
     }
 
     private boolean keyExists(String k) { return store.existsDb(currentDb, k)||store.getHashStore(currentDb).exists(k)||store.getListStore(currentDb).exists(k)||store.getSetStore(currentDb).exists(k)||store.getSortedSetStore(currentDb).exists(k); }

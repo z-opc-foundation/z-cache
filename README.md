@@ -2,8 +2,9 @@
 
 > **Redis 协议 (RESP2/RESP3) 兼容的分布式内存数据库** — Java 11+ · Netty 4.1 · Spring Boot 2.7
 > 1.3.0 新增：分布式锁 · Pub/Sub 模式匹配 · Stream 消费组 · RDB+AOF 持久化 · 集群模式规划
+> 1.3.4：RDB 快照补齐 16 个库与 TTL · SAVE/BGSAVE/LASTSAVE 真正落盘 · AOF 启动时重放（含库号与阻塞命令翻译）
 
-[![Maven Central](https://img.shields.io/badge/Maven%20Central-1.3.0-blue?logo=apache-maven)](https://central.sonatype.com/search?q=g:io.github.yuku123+a:z-cache*)
+[![Maven Central](https://img.shields.io/badge/Maven%20Central-1.3.4-blue?logo=apache-maven)](https://central.sonatype.com/search?q=g:io.github.yuku123+a:z-cache*)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 [![Java](https://img.shields.io/badge/Java-11%2B-orange)](https://openjdk.org)
 [![Docker](https://img.shields.io/badge/Docker-multi--stage-2496ED)](https://hub.docker.com/)
@@ -54,20 +55,20 @@ z-cache 是一个**生产就绪**的 Redis 协议兼容内存数据库，使用 
 
 | 特性 | 简介 | 详细文档 |
 |---|---|---|
-| **🔒 分布式锁** | 基于 SET NX PX + Lua EVAL 的 Redlock 等价实现，支持 tryLock / unlock / renew / Watchdog 自动续约 / fencing token | [_doc/001_arch/分布式锁设计.md](_doc/001_arch/分布式锁设计.md) |
+| **🔒 分布式锁** | 基于 SET NX PX 的 tryLock / unlock / renew / Watchdog 自动续约 / fencing token；**没有 Lua**，解锁走"先 GET 校验再 DEL"，非原子 | [_doc/001_arch/分布式锁设计.md](_doc/001_arch/分布式锁设计.md) |
 | **📡 Pub/Sub 模式匹配** | 支持 PSUBSCRIBE `news.*` 通配符模式订阅，兼容 Redis PSUBSCRIBE/PUNSUBSCRIBE 规范 | （1.3.0 文档规划中） |
-| **📋 Stream 消费组** | 完整 XADD/XREAD/XREADGROUP/XACK/XCLAIM/XAUTOCLAIM 指令，支持消费者组、pending list、自动接管 | （1.3.0 文档规划中） |
-| **💾 RDB + AOF 持久化** | RDB 快照 + AOF 增量日志，支持三种 fsync 策略（always/everysec/no）和 AOF 自动重写 | （1.3.0 文档规划中） |
+| **📋 Stream 消费组** | XADD/XREAD/XREADGROUP/XACK/XPENDING/XGROUP/XINFO，支持消费者组与 pending list（XCLAIM/XAUTOCLAIM 未实现） | （1.3.0 文档规划中） |
+| **💾 RDB + AOF 持久化** | RDB 快照（逐库、带 TTL）+ AOF 增量日志（启动时重放），fsync 三档 `always/everysec/no`。AOF 重写未实现（`rewriteAof` 是个只写空文件的壳，且没有任何命令能触发它，因此不要指望 BGREWRITEAOF） | （1.3.0 文档规划中） |
 | **📊 运维命令** | INFO/MONITOR/DEBUG/CLIENT/SLOWLOG 5 类运维命令，含集群监控和慢日志追踪 | （1.3.0 文档规划中） |
 
 ### 已有能力（继承自 1.0.x）
 
-- **多数据结构**：String / List / Set / Sorted Set / Hash / Bitmap / HyperLogLog / Geo
+- **多数据结构**：String / List / Set / Sorted Set / Hash（Bitmap / HyperLogLog / Geo 未实现）
 - **RESP2 协议**：完全兼容 Redis 2.x 客户端
 - **TTL 与淘汰**：支持毫秒级 TTL、LRU/LFU 淘汰策略
 - **事务**：MULTI/EXEC/DISCARD/WATCH/UNWATCH
 - **Pipeline**：批量命令减少 RTT
-- **Lua 脚本**：EVAL/EVALSHA 原子执行
+- **Lua 脚本**：🚧 未实现（服务端没有 EVAL / EVALSHA）
 - **Pipeline 客户端**：同步 + 异步 + 连接池
 - **Spring Boot Starter**：开箱即用
 - **Docker / Compose**：多阶段构建镜像
@@ -174,8 +175,10 @@ redis-cli -h localhost -p 16379 XADD mystream * field1 value1
 redis-cli -h localhost -p 16379 XGROUP CREATE mystream mygroup 0
 redis-cli -h localhost -p 16379 XREADGROUP GROUP mygroup consumer1 COUNT 10 STREAMS mystream >
 
-# AOF 持久化（启动时已开启 everysec）
-redis-cli -h localhost -p 16379 CONFIG SET appendonly yes
+# AOF 持久化（--data-dir 一给就开，默认 everysec）
+# 注意：本服务未实现 CONFIG 命令，运行时改配置请通过启动参数 / -Dzcache.* 完成
+redis-cli -h localhost -p 16379 SAVE            # 同步打一份 RDB 快照
+redis-cli -h localhost -p 16379 LASTSAVE        # 最近一次成功快照的 Unix 秒
 
 # 运维监控
 redis-cli -h localhost -p 16379 INFO server
@@ -196,10 +199,10 @@ redis-cli -h localhost -p 16379 SLOWLOG GET 10
 | **List** | LPUSH / RPUSH / LPOP / RPOP / LRANGE / LLEN / LSET / LTRIM | ✅ |
 | **Set** | SADD / SREM / SMEMBERS / SISMEMBER / SINTER / SUNION / SDIFF | ✅ |
 | **ZSet** | ZADD / ZRANGE / ZRANGEBYSCORE / ZRANK / ZINCRBY | ✅ |
-| **🔒 分布式锁** | SET NX PX / EVAL (Lua 原子解锁) / EVALSHA | ✅ 1.3.0 新增 |
+| **🔒 分布式锁** | SET NX PX ✅ / EVAL·EVALSHA 🚧 未实现 | 服务端没有 Lua 解释器；客户端 `DistributedLock` 会降级成"先 GET 校验再 DEL"，**不是原子的**（跨进程竞争下可能误删别人的锁） |
 | **📡 Pub/Sub** | PUBLISH / SUBSCRIBE / UNSUBSCRIBE / PSUBSCRIBE / PUNSUBSCRIBE / PUBSUB | ✅ 1.3.0 新增 PSUBSCRIBE |
-| **📋 Stream** | XADD / XREAD / XREADGROUP / XACK / XCLAIM / XPENDING / XGROUP | ✅ 1.3.0 新增 |
-| **💾 持久化** | SAVE / BGSAVE / BGREWRITEAOF / LASTSAVE | ✅ 1.3.0 新增 |
+| **📋 Stream** | XADD / XREAD / XREADGROUP / XACK / XPENDING / XGROUP / XINFO | ✅ XCLAIM 🚧 未实现（表里有，命令会回 ERR unknown command） |
+| **💾 持久化** | SAVE / BGSAVE / LASTSAVE | ✅ 1.3.4 起才真正落盘（此前三条命令只回一个写死的成功回复）；BGREWRITEAOF 🚧 未实现 |
 | **📊 运维** | INFO / MONITOR / DEBUG / CLIENT / SLOWLOG | ✅ 1.3.0 新增 |
 | **事务** | MULTI / EXEC / DISCARD / WATCH / UNWATCH | ✅ |
 | **Pipeline** | 客户端 SDK 自动支持 | ✅ |

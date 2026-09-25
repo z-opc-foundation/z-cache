@@ -1,12 +1,14 @@
 package com.zifang.z.cache.core.persistence;
 
-import java.io.BufferedReader;
+import java.io.BufferedInputStream;
 import java.io.BufferedWriter;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.EOFException;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
-import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -359,6 +361,14 @@ arg2\r
 
     /**
      * 加载并重放 AOF 文件。
+     * <p>
+     * 读取是<b>按声明长度取字节</b>的，不是按行取的：写侧记录的 {@code $<len>} 是 UTF-8 字节数，
+     * 而值里完全可以含 {@code \r\n}（SET 的合法取值）。逐行读会把这种值从第一个换行处切断，
+     * 剩下半截还会被当成下一条命令的开头去解析。
+     * </p>
+     * <p>
+     * 尾部被截断（掉电时最后一条命令只写了一半）只丢弃那一条，前面的照常重放 —— 与 Redis 一致。
+     * </p>
      *
      * @param aofFilePath    AOF 文件路径
      * @param commandReplayer 命令重放回调函数
@@ -383,52 +393,96 @@ arg2\r
 
         int commandCount = 0;
 
-        try (BufferedReader reader = new BufferedReader(
-                new InputStreamReader(new FileInputStream(file), StandardCharsets.UTF_8))) {
-
-            String line;
-            while ((line = reader.readLine()) != null) {
-                line = line.trim();
-                if (line.isEmpty()) {
+        try (DataInputStream in = new DataInputStream(
+                new BufferedInputStream(new FileInputStream(file)))) {
+            while (true) {
+                byte[] headerBytes = readRawLine(in);
+                if (headerBytes == null) {
+                    break;
+                }
+                String header = new String(headerBytes, StandardCharsets.UTF_8);
+                if (header.trim().isEmpty()) {
                     continue;
                 }
+                if (!header.startsWith("*")) {
+                    LOGGER.warning("Malformed AOF record near \"" + header + "\", stopping replay here");
+                    break;
+                }
 
-                // 解析 RESP 格式
-                if (line.startsWith("*")) {
-                    int argc = Integer.parseInt(line.substring(1));
-                    String[] command = new String[argc];
+                int argc;
+                try {
+                    argc = Integer.parseInt(header.substring(1).trim());
+                } catch (NumberFormatException e) {
+                    LOGGER.warning("Malformed AOF multi-bulk header \"" + header + "\", stopping replay here");
+                    break;
+                }
 
-                    for (int i = 0; i < argc; i++) {
-                        line = reader.readLine();
-                        if (line == null) {
-                            throw new IOException("Unexpected end of AOF file");
-                        }
+                String[] command;
+                try {
+                    command = readCommand(in, argc);
+                } catch (EOFException truncated) {
+                    LOGGER.warning("AOF tail is truncated, dropping the last incomplete command"
+                            + " (replayed " + commandCount + " commands before it)");
+                    break;
+                }
 
-                        if (line.startsWith("$")) {
-                            int len = Integer.parseInt(line.substring(1));
-                            line = reader.readLine();
-                            if (line == null) {
-                                throw new IOException("Unexpected end of AOF file");
-                            }
-                            command[i] = line;
-                        } else {
-                            // 兼容非标准格式
-                            command[i] = line;
-                        }
-                    }
-
-                    // 重放命令
-                    try {
-                        commandReplayer.accept(command);
-                        commandCount++;
-                    } catch (Exception e) {
-                        LOGGER.log(Level.WARNING, "Error replaying command: " + String.join(" ", command), e);
-                    }
+                try {
+                    commandReplayer.accept(command);
+                    commandCount++;
+                } catch (Exception e) {
+                    LOGGER.log(Level.WARNING, "Error replaying command: " + String.join(" ", command), e);
                 }
             }
         }
 
         LOGGER.info("AOF file loaded successfully, replayed " + commandCount + " commands");
+    }
+
+    /** 读出一条命令的 argc 个参数；任何一处提前 EOF 都抛 {@link EOFException} 交由调用方判截断。 */
+    private static String[] readCommand(DataInputStream in, int argc) throws IOException {
+        String[] command = new String[argc];
+        for (int i = 0; i < argc; i++) {
+            byte[] lengthLine = readRawLine(in);
+            if (lengthLine == null) {
+                throw new EOFException("Unexpected end of AOF inside a command");
+            }
+            String header = new String(lengthLine, StandardCharsets.UTF_8);
+            if (!header.startsWith("$")) {
+                throw new EOFException("Expected a bulk string, got: " + header);
+            }
+            int length = Integer.parseInt(header.substring(1).trim());
+            if (length < 0) {
+                throw new EOFException("Negative bulk length in AOF: " + length);
+            }
+            byte[] payload = new byte[length];
+            in.readFully(payload);
+            readRawLine(in);
+            command[i] = new String(payload, StandardCharsets.UTF_8);
+        }
+        return command;
+    }
+
+    /**
+     * 读到 {@code \r\n} 为止，返回<b>原始字节</b>（不含行尾），行首即撞上 EOF 时返回 null。
+     * <p>
+     * 按字节而不是按字符收：值里的中文在 UTF-8 下是多字节，{@code (char) b} 会把每个字节变成
+     * 一个 Latin-1 字符，再编码回去就不是原来那几个字节了。也不做 trim —— AOF 里的值是二进制
+     * 安全的字节串，首尾空格属于数据。
+     */
+    private static byte[] readRawLine(DataInputStream in) throws IOException {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream(64);
+        int c;
+        while ((c = in.read()) != -1) {
+            if (c == '\r') {
+                int next = in.read();
+                if (next != '\n' && next != -1) {
+                    throw new EOFException("Expected LF after CR in AOF");
+                }
+                return buf.toByteArray();
+            }
+            buf.write(c);
+        }
+        return buf.size() == 0 ? null : buf.toByteArray();
     }
 
     /**
