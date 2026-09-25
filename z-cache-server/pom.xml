@@ -6,11 +6,11 @@
     <parent>
         <groupId>io.github.yuku123</groupId>
         <artifactId>z-cache</artifactId>
-        <version>1.3.1</version>
+        <version>1.3.2</version>
     </parent>
 
     <groupId>io.github.yuku123</groupId>
-    <version>1.3.1</version>
+    <version>1.3.2</version>
     <artifactId>z-cache-server</artifactId>
     <name>z-cache-server</name>
     <description>可直接运行的 z-cache Redis 兼容服务器发行包</description>
@@ -52,6 +52,8 @@
     </dependencies>
 
     <build>
+        <!-- 固定产物名：Dockerfile / 部署脚本按 z-cache-server.jar 引用，抬版本号时不必再改镜像构建 -->
+        <finalName>z-cache-server</finalName>
         <plugins>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
@@ -67,7 +69,13 @@
                             <transformers>
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
                                     <mainClass>com.zifang.z.cache.server.Main</mainClass>
+                                    <manifestEntries>
+                                        <Implementation-Version>${project.version}</Implementation-Version>
+                                    </manifestEntries>
                                 </transformer>
+                                <!-- shade 默认会把多个 META-INF/services 文件互相覆盖；
+                                     slf4j / netty 的 provider 发现全靠这些文件 -->
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
                             </transformers>
                         </configuration>
                     </execution>

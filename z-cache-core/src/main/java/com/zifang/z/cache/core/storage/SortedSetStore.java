@@ -775,6 +775,12 @@ public class SortedSetStore {
         if (spec.startsWith("(")) {
             return member.compareTo(spec.substring(1)) < 0 ? 1 : -1;
         }
+        // "[" 是 Redis 唯一的"含端点"写法，而 ZRANGEBYLEX 的规范用例几乎都是它。
+        // 以前只剥 "("，于是 [a 被当成字面量 "[a" 去比：'a' > '['，
+        // 结果 ZREMRANGEBYLEX key [a [a 恒为 0 条、ZRANGEBYLEX 恒为空。
+        if (spec.startsWith("[")) {
+            return member.compareTo(spec.substring(1));
+        }
         return member.compareTo(spec);
     }
 

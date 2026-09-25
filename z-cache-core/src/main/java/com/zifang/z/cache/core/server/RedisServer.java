@@ -51,17 +51,31 @@ public class RedisServer {
     // Netty components
     private EventLoopGroup bossGroup;
     private EventLoopGroup workerGroup;
+    /**
+     * 命令处理线程组。普通命令在这里跑，必须离开 I/O 线程，
+     * 否则同一 EventLoop 上其它所有连接一起被冻住。
+     */
+    private io.netty.channel.DefaultEventLoopGroup businessGroup;
+    /**
+     * 阻塞命令（BLPOP/BRPOP）专用线程组。
+     * <p>
+     * 和 businessGroup 分开是有原因的：阻塞命令会占满它所在的线程直到真的有值。
+     * 如果它们和普通命令共用一组线程，只要并发挂起的 BLPOP 数超过线程数
+     * （默认实现里是 4 条），整组的普通流量就全停了 —— 十几个客户端各发一条
+     * {@code BLPOP x 0} 就能让服务器对所有正常请求失去响应。
+     */
+    private io.netty.channel.DefaultEventLoopGroup blockingGroup;
     private Channel serverChannel;
 
     // Server state
     private volatile boolean started = false;
 
     public RedisServer() {
-        this("0.0.0.0", DEFAULT_PORT, 0);
+        this("127.0.0.1", DEFAULT_PORT, 0);
     }
 
     public RedisServer(int port) {
-        this("0.0.0.0", port, 0);
+        this("127.0.0.1", port, 0);
     }
 
     public RedisServer(String host, int port, int maxEntries) {
@@ -92,47 +106,68 @@ public class RedisServer {
 
     /**
      * 启动服务器。
+     * <p>
+     * 注意锁的粒度：绑定阶段持锁，随后 {@code closeFuture().sync()} 会阻塞到服务器关闭，
+     * 这段时间绝不能握着监视器 —— 否则 {@link #stop()}（进程 shutdown hook 走的那条，也是
+     * 唯一会落 RDB 快照的路径）会一直等锁，优雅关闭变成死锁。
      */
-    public synchronized void start() throws InterruptedException {
-        if (started) {
-            logger.warn("Server already started on port {}", port);
-            return;
+    public void start() throws InterruptedException {
+        synchronized (this) {
+            if (started) {
+                logger.warn("Server already started on port {}", port);
+                return;
+            }
+
+            logger.info("Starting z-cache server on {}:{}", host, port);
+
+            // 初始化持久化
+            initPersistence();
+
+            bossGroup = new NioEventLoopGroup(1);
+            workerGroup = new NioEventLoopGroup();
+            businessGroup = new io.netty.channel.DefaultEventLoopGroup(
+                    threadCount("zcache.business-threads", Math.max(4, Runtime.getRuntime().availableProcessors() * 2)));
+            blockingGroup = new io.netty.channel.DefaultEventLoopGroup(
+                    threadCount("zcache.blocking-threads", Math.max(16, Runtime.getRuntime().availableProcessors() * 4)));
+
+            try {
+                ServerBootstrap b = new ServerBootstrap();
+                b.group(bossGroup, workerGroup)
+                        .channel(NioServerSocketChannel.class)
+                        .option(ChannelOption.SO_BACKLOG, 128)
+                        .childOption(ChannelOption.SO_KEEPALIVE, true)
+                        .childOption(ChannelOption.TCP_NODELAY, true)
+                        .childHandler(new ChannelInitializer<SocketChannel>() {
+                            @Override
+                            protected void initChannel(SocketChannel ch) {
+                                ChannelPipeline p = ch.pipeline();
+                                p.addLast("decoder", new RespDecoder());
+                                p.addLast("encoder", new RespEncoder());
+                                CommandHandler commandHandler = new CommandHandler(store, password);
+                                // 整条连接钉在 businessGroup 的某一条线程上：普通命令不再
+                                // 挤在承载几十个连接的 I/O EventLoop 上；阻塞命令再单独挪到
+                                // blockingGroup，见该字段注释。
+                                p.addLast(businessGroup, "handler", new RedisServerHandler(
+                                        commandHandler, pubSubManager, store, blockingGroup));
+                            }
+                        });
+
+                ChannelFuture f = b.bind(host, port).sync();
+                serverChannel = f.channel();
+                started = true;
+            } catch (Throwable t) {
+                // bind 失败（端口被占最常见）时必须把线程组收干净：
+                // 之前异常从 synchronized 里逃出去，调用方只看到一个没头没尾的栈。
+                started = false;
+                shutdown();
+                throw t;
+            }
         }
 
-        logger.info("Starting z-cache server on {}:{}", host, port);
-
-        // 初始化持久化
-        initPersistence();
-
-        bossGroup = new NioEventLoopGroup(1);
-        workerGroup = new NioEventLoopGroup();
+        logger.info("z-cache server started successfully on {}:{}", host, port);
 
         try {
-            ServerBootstrap b = new ServerBootstrap();
-            b.group(bossGroup, workerGroup)
-                    .channel(NioServerSocketChannel.class)
-                    .option(ChannelOption.SO_BACKLOG, 128)
-                    .childOption(ChannelOption.SO_KEEPALIVE, true)
-                    .childOption(ChannelOption.TCP_NODELAY, true)
-                    .childHandler(new ChannelInitializer<SocketChannel>() {
-                        @Override
-                        protected void initChannel(SocketChannel ch) {
-                            ChannelPipeline p = ch.pipeline();
-                            p.addLast("decoder", new RespDecoder());
-                            p.addLast("encoder", new RespEncoder());
-                            CommandHandler commandHandler = new CommandHandler(store, password);
-                            p.addLast("handler", new RedisServerHandler(commandHandler, pubSubManager));
-                        }
-                    });
-
-            ChannelFuture f = b.bind(host, port).sync();
-            serverChannel = f.channel();
-            started = true;
-
-            logger.info("z-cache server started successfully on {}:{}", host, port);
-            store.incrementConnections();
-
-            f.channel().closeFuture().sync();
+            serverChannel.closeFuture().sync();
         } finally {
             shutdown();
         }
@@ -142,6 +177,13 @@ public class RedisServer {
      * 初始化持久化组件：加载 RDB + AOF，启动 AOF 写入。
      */
     private void initPersistence() {
+        // Stream 与持久化无关，且 1.3.0 的 X* 命令依赖它。放在 dataDir 早退之前：
+        // 否则不带 --data-dir 的默认启动形态下，全部 Stream 命令返回 "Stream not configured"。
+        if (CommandHandler.getStreamStore() == null) {
+            CommandHandler.setStreamStore(new StreamStore(16));
+            logger.info("Stream store initialized");
+        }
+
         if (dataDir == null || dataDir.isEmpty()) {
             logger.info("No data directory configured, persistence disabled");
             return;
@@ -173,10 +215,6 @@ public class RedisServer {
         } catch (Exception e) {
             logger.warn("Failed to start AOF: {}", e.getMessage());
         }
-
-        // 初始化 Stream 存储
-        CommandHandler.setStreamStore(new StreamStore(16));
-        logger.info("Stream store initialized");
     }
 
     /**
@@ -232,7 +270,36 @@ public class RedisServer {
         }
     }
 
+    /**
+     * 线程组规模：允许用 {@code -Dzcache.business-threads} / {@code -Dzcache.blocking-threads}
+     * 覆盖，非法值不静默生效（以前是"配了也看不出来"）。
+     */
+    private static int threadCount(String property, int fallback) {
+        String raw = System.getProperty(property);
+        if (raw == null || raw.trim().isEmpty()) {
+            return fallback;
+        }
+        try {
+            int value = Integer.parseInt(raw.trim());
+            if (value >= 1) {
+                return value;
+            }
+            logger.warn("{}={} is not positive, using {}", property, raw, fallback);
+        } catch (NumberFormatException e) {
+            logger.warn("{}={} is not an integer, using {}", property, raw, fallback);
+        }
+        return fallback;
+    }
+
     private void shutdown() {
+        if (blockingGroup != null) {
+            blockingGroup.shutdownGracefully();
+            blockingGroup = null;
+        }
+        if (businessGroup != null) {
+            businessGroup.shutdownGracefully();
+            businessGroup = null;
+        }
         if (bossGroup != null) {
             bossGroup.shutdownGracefully();
             bossGroup = null;

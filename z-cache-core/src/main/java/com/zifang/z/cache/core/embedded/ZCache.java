@@ -217,8 +217,9 @@ public class ZCache<K extends Serializable, V extends Serializable> implements A
         if (entry.expireAt < 0) {
             return -1;
         }
-        long ttl = (entry.expireAt - System.currentTimeMillis()) / 1000;
-        return Math.max(ttl, 0);
+        // Redis 语义是向上取整：EX 1 刚写完 TTL 应读回 1，而不是整数除法截断成 0。
+        long remainingMillis = entry.expireAt - System.currentTimeMillis();
+        return (remainingMillis + 999) / 1000;
     }
 
     /**

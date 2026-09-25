@@ -417,8 +417,9 @@ public class MemoryStore {
         if (!wrapper.hasExpiration()) {
             return -1;
         }
-        long ttl = (wrapper.expireAt - System.currentTimeMillis()) / 1000;
-        return Math.max(ttl, 0);
+        // 向上取整，与 Redis TTL 一致：EX 1 刚写入时读回 1 而不是整数除法截断成 0。
+        long remaining = wrapper.expireAt - System.currentTimeMillis();
+        return (remaining + 999) / 1000;
     }
 
     public long pttl(String key) {

@@ -23,10 +23,6 @@ class CommandHandlerJunit5Test {
     @BeforeEach
     void setUp() {
         // 重置静态共享 Store 避免测试间数据泄漏
-        CommandHandler.setHashStore(new HashStore());
-        CommandHandler.setListStore(new ListStore());
-        CommandHandler.setSetStore(new SetStore());
-        CommandHandler.setSortedSetStore(new SortedSetStore());
 
         store = new MemoryStore();
         handler = new CommandHandler(store);

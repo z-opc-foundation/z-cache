@@ -27,10 +27,6 @@ class RedisServerHandlerTest {
     @BeforeEach
     void setUp() {
         // 重置静态共享 Store 避免测试间数据泄漏
-        CommandHandler.setHashStore(new HashStore());
-        CommandHandler.setListStore(new ListStore());
-        CommandHandler.setSetStore(new SetStore());
-        CommandHandler.setSortedSetStore(new SortedSetStore());
         CommandHandler.setSlowLog(new SlowLog());
 
         store = new MemoryStore();

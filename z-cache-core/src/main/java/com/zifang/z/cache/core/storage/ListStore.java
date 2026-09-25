@@ -417,96 +417,84 @@ public class ListStore {
      * </p>
      *
      * @param direction     弹出方向: "LEFT"（头部）或 "RIGHT"（尾部）
+     * @param keys          要监听的 key，按 Redis 语义依参数顺序尝试，命中的 key 随值一起返回
      * @param timeoutSeconds 超时时间（秒），0 表示无限等待
-     * @return 弹出的元素，超时返回 null
+     * @return {@code [key, value]}，超时返回 null
      */
-    public List<byte[]> bpop(String direction, int timeoutSeconds) {
-        if (direction == null) {
+    public List<byte[]> bpop(String direction, List<String> keys, int timeoutSeconds) {
+        if (direction == null || keys == null || keys.isEmpty()) {
             return null;
         }
-        boolean fromLeft = "LEFT".equalsIgnoreCase(direction);
+        final boolean fromLeft = "LEFT".equalsIgnoreCase(direction);
 
-        // 先尝试非阻塞弹出
+        List<byte[]> immediate = tryPop(fromLeft, keys);
+        if (immediate != null) {
+            return immediate;
+        }
+
+        final boolean infinite = timeoutSeconds <= 0;
+        final long deadline = infinite ? 0L : System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(timeoutSeconds);
+
+        while (infinite || System.currentTimeMillis() < deadline) {
+            CountDownLatch latch = new CountDownLatch(1);
+            try {
+                // 先注册再补查一次：否则 push 恰好落在"查完"和"注册"之间就永久睡过去（丢唤醒）
+                registerWaiter(null, latch);
+                List<byte[]> raced = tryPop(fromLeft, keys);
+                if (raced != null) {
+                    return raced;
+                }
+                if (infinite) {
+                    latch.await();
+                } else {
+                    long remaining = deadline - System.currentTimeMillis();
+                    if (remaining > 0) {
+                        latch.await(remaining, TimeUnit.MILLISECONDS);
+                    }
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return null;
+            } finally {
+                // 超时退出时必须摘掉自己的 latch，否则 waitQueues 里只增不减
+                unregisterWaiter(latch);
+            }
+            List<byte[]> popped = tryPop(fromLeft, keys);
+            if (popped != null) {
+                return popped;
+            }
+        }
+        return null;
+    }
+
+    /** 按 keys 的给定顺序找第一个非空列表并弹一头/尾；命中的 key 一起带回。 */
+    private List<byte[]> tryPop(boolean fromLeft, List<String> keys) {
         synchronized (store) {
-            for (String key : store.keySet()) {
+            for (String key : keys) {
                 CopyOnWriteArrayList<byte[]> list = store.get(key);
                 if (list != null && !list.isEmpty()) {
                     byte[] value = fromLeft ? list.remove(0) : list.remove(list.size() - 1);
                     if (list.isEmpty()) {
                         store.remove(key);
                     }
-                    List<byte[]> result = new ArrayList<>();
+                    List<byte[]> result = new ArrayList<>(2);
                     result.add(key.getBytes(StandardCharsets.UTF_8));
                     result.add(value);
                     return result;
                 }
             }
         }
+        return null;
+    }
 
-        // 无可用数据，进入阻塞等待
-        if (timeoutSeconds <= 0) {
-            // 无限等待模式
-            while (true) {
-                CountDownLatch latch = new CountDownLatch(1);
-                registerWaiter(null, latch);
-                try {
-                    latch.await();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return null;
-                }
-                // 被唤醒后尝试弹出
-                synchronized (store) {
-                    for (String key : store.keySet()) {
-                        CopyOnWriteArrayList<byte[]> list = store.get(key);
-                        if (list != null && !list.isEmpty()) {
-                            byte[] value = fromLeft ? list.remove(0) : list.remove(list.size() - 1);
-                            if (list.isEmpty()) {
-                                store.remove(key);
-                            }
-                            List<byte[]> result = new ArrayList<>();
-                            result.add(key.getBytes(StandardCharsets.UTF_8));
-                            result.add(value);
-                            return result;
-                        }
-                    }
-                }
-            }
-        } else {
-            // 带超时等待模式
-            long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(timeoutSeconds);
-            while (System.currentTimeMillis() < deadline) {
-                CountDownLatch latch = new CountDownLatch(1);
-                registerWaiter(null, latch);
-                try {
-                    long remaining = deadline - System.currentTimeMillis();
-                    if (remaining <= 0) {
-                        break;
-                    }
-                    latch.await(remaining, TimeUnit.MILLISECONDS);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return null;
-                }
-                // 被唤醒后尝试弹出
-                synchronized (store) {
-                    for (String key : store.keySet()) {
-                        CopyOnWriteArrayList<byte[]> list = store.get(key);
-                        if (list != null && !list.isEmpty()) {
-                            byte[] value = fromLeft ? list.remove(0) : list.remove(list.size() - 1);
-                            if (list.isEmpty()) {
-                                store.remove(key);
-                            }
-                            List<byte[]> result = new ArrayList<>();
-                            result.add(key.getBytes(StandardCharsets.UTF_8));
-                            result.add(value);
-                            return result;
-                        }
-                    }
-                }
+    private void unregisterWaiter(CountDownLatch latch) {
+        List<CountDownLatch> global = waitQueues.get("_all_");
+        if (global != null) {
+            global.remove(latch);
+            if (global.isEmpty()) {
+                waitQueues.remove("_all_", global);
             }
         }
-        return null;
     }
 
     // ==================== Generic Operations ====================

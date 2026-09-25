@@ -42,10 +42,6 @@ public class CommandHandler {
     private static PubSubManager pubSubManager;
     private static SlowLog slowLog;
     private static AofPersistence aofPersistence;
-    private static HashStore hashStore;
-    private static ListStore listStore;
-    private static SetStore setStore;
-    private static SortedSetStore sortedSetStore;
     private static StreamStore streamStore;
 
     /** MONITOR 模式的客户端集合（共享） */
@@ -67,24 +63,24 @@ public class CommandHandler {
         this.authenticated = password == null;
         this.transactionManager = new TransactionManager();
         this.transactionContext = new TransactionManager.TransactionContext();
-        synchronized (CommandHandler.class) {
-            if (hashStore == null) hashStore = new HashStore();
-            if (listStore == null) listStore = new ListStore();
-            if (setStore == null) setStore = new SetStore();
-            if (sortedSetStore == null) sortedSetStore = new SortedSetStore();
-        }
     }
 
     // ---- 共享组件 setter ----
     public static void setPubSubManager(PubSubManager m) { pubSubManager = m; }
     public static void setSlowLog(SlowLog l) { slowLog = l; }
     public static void setAofPersistence(AofPersistence a) { aofPersistence = a; }
-    public static void setHashStore(HashStore hs) { hashStore = hs; }
-    public static void setListStore(ListStore ls) { listStore = ls; }
-    public static void setSetStore(SetStore ss) { setStore = ss; }
-    public static void setSortedSetStore(SortedSetStore zss) { sortedSetStore = zss; }
     public static void setStreamStore(StreamStore ss) { streamStore = ss; }
+
+    public static StreamStore getStreamStore() { return streamStore; }
     public void setChannelContext(ChannelHandlerContext ctx) { this.channelContext = ctx; }
+
+    /**
+     * 该连接是否正处在 MULTI 的"入队"阶段（EXEC 真正执行时不算）。
+     * 服务器侧只有在这一阶段之外才允许把阻塞命令挪到专用线程上跑。
+     */
+    public boolean queuedInMulti() {
+        return transactionContext.isInTransaction() && !executingTransaction;
+    }
 
     /**
      * 客户端断开连接时的清理逻辑。
@@ -953,7 +949,8 @@ public class CommandHandler {
         }
         if (sec == null || "CLIENTS".equals(sec)) {
             sb.append("# Clients\r\n");
-            sb.append("connected_clients:").append(store.getConnectedClients() > 0 ? store.getConnectedClients() : 1).append("\r\n");
+            // 真实连接数：由 RedisServerHandler 在 channelActive/Inactive 增减，不再用 "0 就当 1" 兜底
+            sb.append("connected_clients:").append(store.getConnectedClients()).append("\r\n");
             sb.append("blocked_clients:0\r\n");
             sb.append("max_clients:10000\r\n");
             sb.append("\r\n");
@@ -984,10 +981,10 @@ public class CommandHandler {
         if (sec == null || "KEYSPACE".equals(sec)) {
             sb.append("# Keyspace\r\n");
             for (int i = 0; i < store.getDbCount(); i++) {
-                long keys = hashStore.dbsize() + listStore.dbsize() + setStore.dbsize() + sortedSetStore.dbsize();
-                Map<String, MemoryStore.ValueWrapper> strStore = store.getStringStore(i);
-                keys += strStore.size();
-                if (i == currentDb) {
+                long keys = store.getHashStore(i).dbsize() + store.getListStore(i).dbsize()
+                        + store.getSetStore(i).dbsize() + store.getSortedSetStore(i).dbsize()
+                        + store.getStringStore(i).size();
+                if (keys > 0) {
                     sb.append("db").append(i).append(":keys=").append(keys).append("\r\n");
                 }
             }
@@ -1533,7 +1530,7 @@ public class CommandHandler {
     private Object handleHincrbyfloat(String[] args) {
         if (args.length != 4) return RespError.wrongNumberOfArguments("HINCRBYFLOAT");
         try {
-            double result = hashStore.hincrbyfloat(args[1], args[2], Double.parseDouble(args[3]));
+            double result = store.getHashStore(currentDb).hincrbyfloat(args[1], args[2], Double.parseDouble(args[3]));
             return RespBulkString.of(formatDouble(result));
         } catch (NumberFormatException e) { return RespError.of("ERR", "value is not a valid float"); }
         catch (IllegalArgumentException e) { return RespError.of("ERR", e.getMessage()); }
@@ -1543,7 +1540,7 @@ public class CommandHandler {
 
     private Object handleLmove(String[] args) {
         if (args.length != 5) return RespError.wrongNumberOfArguments("LMOVE");
-        byte[] v = listStore.lmove(args[1], args[2], args[3], args[4]);
+        byte[] v = store.getListStore(currentDb).lmove(args[1], args[2], args[3], args[4]);
         return v == null ? RespBulkString.nullBulkString() : RespBulkString.of(v);
     }
 
@@ -1552,7 +1549,7 @@ public class CommandHandler {
     private Object handleSpop(String[] args) {
         if (args.length < 2 || args.length > 3) return RespError.wrongNumberOfArguments("SPOP");
         int count = args.length == 3 ? Integer.parseInt(args[2]) : 1;
-        List<byte[]> m = setStore.spop(args[1], count);
+        List<byte[]> m = store.getSetStore(currentDb).spop(args[1], count);
         if (args.length == 2) {
             if (m.isEmpty()) return RespBulkString.nullBulkString();
             return RespBulkString.of(m.get(0));
@@ -1599,39 +1596,39 @@ public class CommandHandler {
 
     private Object handleZlexcount(String[] args) {
         if (args.length != 4) return RespError.wrongNumberOfArguments("ZLEXCOUNT");
-        return RespInteger.of(sortedSetStore.zlexcount(args[1], args[2], args[3]));
+        return RespInteger.of(store.getSortedSetStore(currentDb).zlexcount(args[1], args[2], args[3]));
     }
 
     private Object handleZrangebylex(String[] args, boolean reverse) {
         if (args.length != 4) return RespError.wrongNumberOfArguments(reverse ? "ZREVRANGEBYLEX" : "ZRANGEBYLEX");
-        List<byte[]> r = reverse ? sortedSetStore.zrevrangebylex(args[1], args[2], args[3])
-                : sortedSetStore.zrangebylex(args[1], args[2], args[3]);
+        List<byte[]> r = reverse ? store.getSortedSetStore(currentDb).zrevrangebylex(args[1], args[2], args[3])
+                : store.getSortedSetStore(currentDb).zrangebylex(args[1], args[2], args[3]);
         return toRespArray(r);
     }
 
     private Object handleZremrangebylex(String[] args) {
         if (args.length != 4) return RespError.wrongNumberOfArguments("ZREMRANGEBYLEX");
-        return RespInteger.of(sortedSetStore.zremrangebylex(args[1], args[2], args[3]));
+        return RespInteger.of(store.getSortedSetStore(currentDb).zremrangebylex(args[1], args[2], args[3]));
     }
 
     private Object handleZremrangebyrank(String[] args) {
         if (args.length != 4) return RespError.wrongNumberOfArguments("ZREMRANGEBYRANK");
         try {
-            return RespInteger.of(sortedSetStore.zremrangebyrank(args[1], Long.parseLong(args[2]), Long.parseLong(args[3])));
+            return RespInteger.of(store.getSortedSetStore(currentDb).zremrangebyrank(args[1], Long.parseLong(args[2]), Long.parseLong(args[3])));
         } catch (NumberFormatException e) { return RespError.of("ERR", "value is not an integer or out of range"); }
     }
 
     private Object handleZremrangebyscore(String[] args) {
         if (args.length != 4) return RespError.wrongNumberOfArguments("ZREMRANGEBYSCORE");
         try {
-            return RespInteger.of(sortedSetStore.zremrangebyscore(args[1], parseScore(args[2]), parseScore(args[3])));
+            return RespInteger.of(store.getSortedSetStore(currentDb).zremrangebyscore(args[1], parseScore(args[2]), parseScore(args[3])));
         } catch (NumberFormatException e) { return RespError.of("ERR", "value is not a valid float"); }
     }
 
     private Object handleZrandmember(String[] args) {
         if (args.length < 2 || args.length > 3) return RespError.wrongNumberOfArguments("ZRANDMEMBER");
         int count = args.length == 3 ? Integer.parseInt(args[2]) : 1;
-        List<byte[]> m = sortedSetStore.zrandmember(args[1], count);
+        List<byte[]> m = store.getSortedSetStore(currentDb).zrandmember(args[1], count);
         if (args.length == 2) {
             if (m.isEmpty()) return RespBulkString.nullBulkString();
             return RespBulkString.of(m.get(0));
@@ -1645,11 +1642,20 @@ public class CommandHandler {
 
     private Object handleBpop(String[] args, String direction) {
         if (args.length < 3) return RespError.wrongNumberOfArguments(direction.equals("LEFT") ? "BLPOP" : "BRPOP");
-        int timeout = 0;
+        int timeout;
         try { timeout = Integer.parseInt(args[args.length - 1]); }
         catch (NumberFormatException e) { return RespError.of("ERR", "timeout is not an integer or out of range"); }
-        List<byte[]> result = store.getListStore(currentDb).bpop(direction, timeout);
-        if (result == null) return RespArray.empty();
+        if (timeout < 0) return RespError.of("ERR", "timeout is negative");
+
+        // args[1..len-2] 才是 key 列表。以前整段丢掉，于是 BLPOP anykey 会去弹库里随便一个
+        // 非空列表，并把那个 key 名一起返回给客户端。
+        List<String> keys = new ArrayList<>(args.length - 2);
+        for (int i = 1; i < args.length - 1; i++) keys.add(args[i]);
+
+        List<byte[]> result = store.getListStore(currentDb).bpop(direction, keys, timeout);
+        // 超时是"没有值"，Redis 回空多批量(*-1)而不是长度 0 的数组：客户端按 nil
+        // 判断超时，收到 *0 会当成"取到了一个空结果"。
+        if (result == null) return RespArray.nullArray();
         return RespArray.of(RespBulkString.of(result.get(0)), RespBulkString.of(result.get(1)));
     }
 
