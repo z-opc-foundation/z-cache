@@ -3400,6 +3400,88 @@ class RedisServerProtocolSemanticsTest {
     }
 
     /**
+     * {@code XADD … MAXLEN 0 …} 里的那个 0 是一个真实的裁剪值，不是"没给"。上游把两件事
+     * 分成两个值：{@code maxlen} 的初值是 <b>-1</b>（{@code t_stream.c:1240}，注释原文
+     * "If left to -1 no trimming is performed"），负数在 :1268 就被那句
+     * {@code The MAXLEN argument must be >= 0.} 挡掉，所以到得了裁剪那一跳的只有
+     * {@code >= 0}（:1327）—— 而那一跳排在 :1321 的 {@code addReplyStreamID} <b>之后</b>，
+     * 于是"清空"也要先把这一条的 ID 交回去。
+     * 改前实测（{@code battery66.pre}，30 行）的原始账是 <b>真实不一致 9 行</b>
+     * （{@code zdiff.py}：{@code 行数=30 顺序不同=0 真实不一致=9}）；其中 {@code :19} 只是
+     * 自动 ID 里的那一毫秒（两侧都是 {@code $"<ms>-0"}，逐字节比必然不同），算噪声，
+     * 剩下 8 行 {@code :6 :7 :20 :21 :23 :25 :27 :30} 全是"该空的地方没空"。
+     */
+    @Test
+    void xaddMaxlenZeroClearsTheStreamAfterReplying() throws Exception {
+        int port = freePort();
+        RedisServer server = new RedisServer("127.0.0.1", port, 0);
+        Thread thread = startAndWait(server, port);
+        try (Socket socket = connect(port)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+
+            // ---- 阳性对照：非零的 MAXLEN 一直是活的 ----
+            send(socket, "XADD", "mx:a", "1-1", "a", "1");
+            assertEquals("1-1", readReply(in));
+            send(socket, "XADD", "mx:a", "MAXLEN", "3", "1-2", "a", "2");
+            assertEquals("1-2", readReply(in));
+            send(socket, "XLEN", "mx:a");
+            assertEquals(":2", readReply(in));
+
+            // ---- 0：先交 ID，再把整条流清空 ----
+            send(socket, "XADD", "mx:a", "MAXLEN", "0", "1-3", "a", "3");
+            assertEquals("1-3", readReply(in), ":1321 的回 ID 排在 :1327 的裁剪之前");
+            send(socket, "XLEN", "mx:a");
+            assertEquals(":0", readReply(in),
+                    "改前这里是整条流的长度 —— 0 被当成了不裁剪的哨兵（battery66.pre 第 6 行实测 :4）");
+            send(socket, "XRANGE", "mx:a", "-", "+");
+            assertEquals("*0", readWireReply(in),
+                    "空的是零个元素的数组（:987 的 addDeferredMultiBulkLength 带着 0 收口），不是 *-1");
+
+            // ---- 自动 ID 那一支同样不例外：MAXLEN 0 不吃掉 * 的那一格 ----
+            send(socket, "XADD", "mx:b", "1-1", "a", "1");
+            readReply(in);
+            send(socket, "XADD", "mx:b", "MAXLEN", "0", "*", "a", "2");
+            String autoId = readReply(in);
+            assertTrue(autoId.matches("\\d+-\\d+"), "自动 ID 照常生成，实测 <" + autoId + ">");
+            send(socket, "XLEN", "mx:b");
+            assertEquals(":0", readReply(in));
+
+            // ---- 清空不等于删键：键还在、表顶还在 ----
+            // 上游的 streamTrimByLength（:424）只从 rax 里摘条目，既不动 s->last_id，
+            // 整个 t_stream.c 里也没有一处 dbDelete —— 所以同一个 ID 再写仍要吃单调性闸。
+            send(socket, "XADD", "mx:c", "MAXLEN", "0", "5-5", "a", "1");
+            assertEquals("5-5", readReply(in));
+            send(socket, "XLEN", "mx:c");
+            assertEquals(":0", readReply(in));
+            send(socket, "XADD", "mx:c", "5-5", "a", "2");
+            assertEquals("-ERR The ID specified in XADD is equal or smaller than "
+                    + "the target stream top item", readReply(in),
+                    "假如裁剪顺手删了键，这一条就会被收下、同一个 ID 能重发一遍");
+            send(socket, "XADD", "mx:c", "6-6", "a", "3");
+            assertEquals("6-6", readReply(in));
+            send(socket, "XLEN", "mx:c");
+            assertEquals(":1", readReply(in), "没给 MAXLEN 的那一刀不裁（初值 -1）");
+
+            // ---- XTRIM 的 0 一直是通的（同族的另一格，改前就正确）----
+            send(socket, "XTRIM", "mx:ghost", "MAXLEN", "0");
+            assertEquals(":0", readReply(in), "键不在也是 :0，而不是错");
+            send(socket, "XTRIM", "mx:c", "MAXLEN", "0");
+            assertEquals(":1", readReply(in));
+            send(socket, "XLEN", "mx:c");
+            assertEquals(":0", readReply(in));
+
+            // ---- 负数走的是那一句原文，不是"清空" ----
+            send(socket, "XADD", "mx:d", "MAXLEN", "-1", "1-1", "a", "1");
+            assertEquals("-ERR The MAXLEN argument must be >= 0.", readReply(in), ":1268-1271");
+            send(socket, "XLEN", "mx:d");
+            assertEquals(":0", readReply(in), "被拒的 XADD 不建键");
+        } finally {
+            server.stop();
+            thread.join(2000);
+        }
+    }
+
+    /**
      * XGROUP 的三道闸与分派（上游 {@code t_stream.c:1798-1926}，句子在
      * {@code networking.c:623-630}）。这一支钉的是<b>顺序</b>而不是"认不认得子命令"：
      * 第六个字必须是 MKSTREAM（:1817-1824）→ 取键问类型（:1827-1834）→ 键必须存在、

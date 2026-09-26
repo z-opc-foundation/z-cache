@@ -2448,9 +2448,10 @@ public class CommandHandler {
         if (args.length < 5) return RespError.wrongNumberOfArguments("XADD");
 
         String key = args[1];
-        // 上游的默认是 -1（:1240），我们的 store 那层沿用的是"0 = 不裁剪"（StreamStore.xadd 的
-        // 注释），这一支不动它，只把 MAXLEN 0 的语义差记进 CHANGELOG 的已知边界。
-        long maxLen = 0;
+        // 上游的"没给 MAXLEN"是 -1（:1240），0 是一个真实的裁剪值：:1268 只挡负数，
+        // :1327 的条件是 `maxlen >= 0`，而且那一跳排在 :1321 的 addReplyStreamID **之后** ——
+        // 所以 `XADD k MAXLEN 0 1-1 a 1` 交回 "1-1" 同时把整条流清空。
+        long maxLen = -1;
         String id = null;
         long[] parsedId = null;
 

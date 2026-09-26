@@ -78,13 +78,15 @@ public class StreamStore {
      * @param key    Stream 键
      * @param fields 字段映射
      * @param id     条目 ID（"*" 自动生成）
-     * @param maxLen 最大长度（0 = 不裁剪）
+     * @param maxLen 裁剪到的长度；<b>-1 才是"没给 MAXLEN"</b>（上游 {@code t_stream.c:1240}
+     *               的初值，注释原文 "If left to -1 no trimming is performed"），
+     *               而 0 是一个真实的裁剪值 = 清空（:1268 只挡负数，:1327 的条件是 {@code >= 0}）
      * @return 生成的条目 ID，失败返回 null
      */
     public String xadd(int db, String key, Map<String, String> fields, String id, long maxLen) {
         Stream stream = getOrCreate(db, key);
         String entryId = stream.addEntry(fields, id);
-        if (maxLen > 0) {
+        if (maxLen >= 0) {
             stream.trim(maxLen);
         }
         return entryId;

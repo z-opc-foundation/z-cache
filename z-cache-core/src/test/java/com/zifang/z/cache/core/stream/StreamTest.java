@@ -184,16 +184,44 @@ class StreamTest {
     void testStreamStore_Xadd() {
         StreamStore store = new StreamStore(1);
         Map<String, String> fields = Collections.singletonMap("name", "test");
-        String id = store.xadd(0, "mystream", fields, "*", 0);
+        String id = store.xadd(0, "mystream", fields, "*", -1);
         assertNotNull(id);
         assertEquals(1, store.xlen(0, "mystream"));
+    }
+
+    /**
+     * {@code maxLen} 的两个哨兵分不开，就是这一格的全部风险：<b>-1 才是"没给 MAXLEN"</b>
+     * （上游 {@code t_stream.c:1240} 的初值，注释原文 "If left to -1 no trimming is performed"），
+     * 而 0 是一个真实的裁剪值 = 清空（:1268 只挡负数，:1327 的条件是 {@code >= 0}，
+     * 且那一跳排在 :1321 回 ID <b>之后</b>）。改前这一层写的是 {@code if (maxLen > 0)}，
+     * 于是 {@code XADD k MAXLEN 0 1-1 a 1} 交回了 ID 而一条都不裁。
+     */
+    @Test
+    void testStreamStore_MaxLenMinusOneIsNotGivenWhileZeroClears() {
+        StreamStore store = new StreamStore(1);
+        store.xadd(0, "s", Collections.singletonMap("a", "1"), "1-1", -1);
+        store.xadd(0, "s", Collections.singletonMap("a", "2"), "1-2", -1);
+        assertEquals(2, store.xlen(0, "s"), "-1 是「没给」，两条都该留在流里");
+
+        assertEquals("1-3", store.xadd(0, "s", Collections.singletonMap("a", "3"), "1-3", 0),
+                "先回 ID 再裁剪：清空也要把这一条的 ID 交回去");
+        assertEquals(0, store.xlen(0, "s"));
+
+        // 清空不等于删键：上游 t_stream.c 里一个 dbDelete 都没有，表顶也照旧停在 1-3，
+        // 所以同一个 ID 在命令层仍要吃"等于或小于表顶"那一问（那一闸不在这一层）。
+        assertNotNull(store.getStream(0, "s"));
+        assertArrayEquals(new long[]{1L, 3L}, store.getStream(0, "s").lastId(),
+                "裁剪只摘条目，不动表顶");
+
+        store.xadd(0, "s", Collections.singletonMap("a", "5"), "1-5", 3);
+        assertEquals(1, store.xlen(0, "s"), "正数是按长度裁，不是清空");
     }
 
     @Test
     void testStreamStore_Xrange() {
         StreamStore store = new StreamStore(1);
-        store.xadd(0, "s1", Collections.singletonMap("a", "1"), "100-0", 0);
-        store.xadd(0, "s1", Collections.singletonMap("a", "2"), "200-0", 0);
+        store.xadd(0, "s1", Collections.singletonMap("a", "1"), "100-0", -1);
+        store.xadd(0, "s1", Collections.singletonMap("a", "2"), "200-0", -1);
 
         List<StreamEntry> result = store.xrange(0, "s1", "-", "+", 0);
         assertEquals(2, result.size());
@@ -202,8 +230,8 @@ class StreamTest {
     @Test
     void testStreamStore_ConsumerGroup() {
         StreamStore store = new StreamStore(1);
-        store.xadd(0, "s1", Collections.singletonMap("a", "1"), "100-0", 0);
-        store.xadd(0, "s1", Collections.singletonMap("a", "2"), "200-0", 0);
+        store.xadd(0, "s1", Collections.singletonMap("a", "1"), "100-0", -1);
+        store.xadd(0, "s1", Collections.singletonMap("a", "2"), "200-0", -1);
 
         assertTrue(store.xgroupCreate(0, "s1", "g1", "0"));
 
@@ -230,8 +258,8 @@ class StreamTest {
     @Test
     void testStreamStore_Xdel() {
         StreamStore store = new StreamStore(1);
-        store.xadd(0, "s1", Collections.singletonMap("a", "1"), "100-0", 0);
-        store.xadd(0, "s1", Collections.singletonMap("a", "2"), "200-0", 0);
+        store.xadd(0, "s1", Collections.singletonMap("a", "1"), "100-0", -1);
+        store.xadd(0, "s1", Collections.singletonMap("a", "2"), "200-0", -1);
 
         long deleted = store.xdel(0, "s1", "100-0");
         assertEquals(1, deleted);
