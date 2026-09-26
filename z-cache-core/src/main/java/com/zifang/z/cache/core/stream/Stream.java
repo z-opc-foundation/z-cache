@@ -216,4 +216,14 @@ public class Stream {
 
     public long getMaxLen() { return maxLen; }
     public List<StreamEntry> getEntries() { return Collections.unmodifiableList(entries); }
+
+    /**
+     * 表顶 ID（{@code <ms, seq>} 两个 uint64 的位模式），也就是上游的 {@code s->last_id}。
+     * <p>
+     * 它是"迄今写过的最大 ID"而不是"最后一条条目"：全部 XDEL 或 XTRIM 清空之后仍然停在那个
+     * 位置上，上游也照它判 XADD 的单调性 —— 否则清空一次就能把同一个 ID  reused 出来。
+     */
+    public synchronized long[] lastId() {
+        return new long[]{lastTimestamp.get(), lastSequence.get()};
+    }
 }

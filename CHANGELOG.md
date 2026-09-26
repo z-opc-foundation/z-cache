@@ -185,6 +185,34 @@ All notable changes to z-cache will be documented in this file.
   最后一支（把 XREAD 的 strict 位填反）抓的就是这个错，红在
   `">" 只在 XREADGROUP 上合法（:1535-1539）…` ==> expected: <true> but was: <false>`。
 
+#### XADD 的单调性闸：等于或小于表顶不写，ID 用尽之后连 `*` 也不写
+
+- 上一支把 ID 的**文法**收住了，但没有管**顺序**，于是本机 `battery50` 量到的是这样一条流：
+  先写 `1-1`、`1-2`、`1-3`，再写 `1-2` 和 `1-1` 都成功 —— `XLEN` 从 3 变 5，
+  `XRANGE - +` 交回 `1-1, 1-2, 1-3, 1-2, 1-1`。同一个 ID 出现两次、且不再是升序表，
+  "按 ID 续读"这件事就失去意义了（`XREAD` 那一支的语义下一支才接）。
+- 现在两道闸都排在写入之前，两句文案照抄上游：`:1315` 的
+  `The ID specified in XADD is equal or smaller than the target stream top item` 与
+  `:1304` 的 `The stream has exhausted the last possible ID, unable to add more items`。
+  判序也照上游：`:1304` 在 append **之前**、`:1315` 的 EDOM 在 append **之内**，
+  所以表顶已经用尽时，哪怕客户端写的是 `1-1` 这种"本来就该回前者"的 ID，回的仍是"用尽"那句
+  （变异探针 M9 就是把两句颠倒，红在这一行上）。
+- 表顶是**迄今写过的最大 ID**（上游的 `s->last_id`），不是"最后一条条目"：`XDEL` 删空、
+  `XTRIM MAXLEN 0` 裁空都不把 ID 空间退回来。这一条单独立了一支探针（M11 把表顶改成
+  "读 `entries` 的最后一条"），红在"流都空了也不能把 `5-5` 重发一遍"。
+- 无符号比较在这里第二次咬人：把闸的 `StreamIdFormat.compare` 换成有符号（M10），
+  `XADD k 18446744073709551615-18446744073709551615` 会被当成"比表顶 `1-2` 还小"而拒掉，
+  连带 `XRANGE` 那一支少了条目 —— 两支同时判红。
+- 被拒的 XADD 不留键：语法错、`0-0`、等于或小于表顶三种都在建键之前返回，
+  `EXISTS` 回 `:0`（上游 :1293 那段注释担心的就是"建了流又插不进去"的空键）。
+- `*` 走的还是自增路径，但表顶用尽之后同样回"用尽"那句 —— 因为 `:1304` 的检查与 ID
+  是不是显式无关。这一条是实测行（`battery51:8`、`battery51:30`）。
+- 这一支另跑 4 支具名变异，全部点名判红、按字节还原：
+  M8 摘掉"等于或小于表顶"闸 → `等于表顶 的写法不能写进去 ==> expected: <-ERR The ID specified in XADD is equal or smaller than the target stream top item> but was: <1-1>`；
+  M9 两句闸序颠倒 → `这一条既小于表顶、又落在 ID 用尽之后 —— 上游先回用尽（:1304 早于 append） ==> expected: <-ERR The stream has exhausted…> but was: <-ERR The ID specified in XADD is …`；
+  M10 表顶比较换回有符号 → `uint64 的最大值本身是合法 ID…==> expected: <18446744073709551615-18446744073709551615> but was: <-ERR …equal or smaller…>`（同一支还把 `XRANGE` 那一条拖红）；
+  M11 表顶改读"最后一条条目" → `流都空了也不能把 5-5 重发一遍 ==> expected: <-ERR …equal or smaller…> but was: <5-5>`。
+
 ### Added
 - `RedisServer.serverScope()`：只读拿到本台那一份，测试与嵌入式据此判断作用域边界。
 - `StreamIdFormat`（z-cache-common）：stream ID 的唯一文法（uint64 两段、`-` / `+` 两种位置、
@@ -192,6 +220,10 @@ All notable changes to z-cache will be documented in this file.
   `StreamIdFormatTest` 33 行判据（每行标上游行号），
   `RedisServerProtocolSemanticsTest.streamIdsFollowTheUpstreamGrammarOverTheWire`
   从协议那一侧再走一遍并兜住"不得漏出 JVM 文本"。
+- `Stream.lastId()`（表顶 = 迄今最大 ID，删空 / 裁空都不退回）与 XADD 的两道单调性闸；
+  `RedisServerProtocolSemanticsTest.xaddRejectsIdsAtOrBelowTheStreamTop` 把三种"不升"
+  （等于表顶 / 同 ms 更小 seq / 更小 ms）、两句文案的判序、删空裁空后表顶仍在、
+  被拒不留键，以及"最大 ID 写进去之后 `*` 也回用尽"各钉一行。
 - `RedisServerProtocolSemanticsTest` 增加 2 条端到端回归（`streamKeyspaceIsScopedToOneServerInstance`
   两头都量：B 读不到 A 的流，同时 A 读得到自己的流；
   `serverWithoutDataDirDoesNotDisableOtherServersPersistence` 先钉"带 dataDir 这台本来能 SAVE"
@@ -238,7 +270,7 @@ All notable changes to z-cache will be documented in this file.
   脚本 `~/.cache/zcache_gauges/zmut_bitop.sh`。
 
 - 计数只认实测（`tally.py` 从 surefire 报告聚合，空运行会硬 FATAL 而不是打"0 例全绿"）：
-  `mvn clean test` 全量 **357 + 373 + 134 + 2 = 866 例全绿，0 skipped**（1.3.6 内上一次记录是 832，这一轮加进 stream ID 的 34 条）。上一版本节写的
+  `mvn clean test` 全量 **357 + 374 + 134 + 2 = 867 例全绿，0 skipped**（1.3.6 内上一次记录是 832；stream ID 那两支一共加进 35 条）。上一版本节写的
   "96 + 340 + 133 + 2 = 571" 是位族五支进来之前的旧数，一并订正。
 - 这类跨实例作用域缺陷只在"整模块连跑"的形态下现形，所以按 `-Dsurefire.runOrder=random`
   把 common+core 连跑 9 次（3 + 6 两批）：**7 次 324 + 372 全绿，2 次不是**。执行顺序确实
@@ -254,13 +286,11 @@ All notable changes to z-cache will be documented in this file.
   因此仍走"GET 校验后 DEL"的非原子路径。
 - Stream 不参与 RDB/AOF；只有 String 键的 TTL 进快照（集合键连 `EXPIRE` 都还不支持，
   所以 `RENAME` 也只搬得动 String 的 TTL）。
-- Stream 这一族的**文法**收了，**读侧语义**没收，四条都在 `battery50` 里有实测行：
-  `XREAD STREAMS k 1-1` 现在把 `1-1` 自己也交出去（上游那一位的注释是
+- Stream 这一族的**文法**与 **XADD 的单调性**收了，**读侧语义**没收，三条都在
+  `battery50` 里有实测行：`XREAD STREAMS k 1-1` 把 `1-1` 自己也交出去（上游那一位的注释是
   `/* ID must be greater than this. */`，:1560）；`XREAD … $` 交回整条流而不是"最后一条之后"；
-  `XADD` 仍然接受等于或小于流内最大 ID 的写法（实测连写 `1-2`、`1-1` 之后 `XLEN` 从 3 变 5，
-  同一个 ID 出现两次、顺序也乱），上游为此有专门一句 :1315；
   `XREADGROUP` 带明确 ID 的"读历史"是按条目而非按 PEL 给的。
-  这四处是下一支的内容，本轮没有动，也没有把它们写成"已对齐"。
+  这三处是下一支的内容，本轮没有动，也没有把它们写成"已对齐"。
 - `XADD` 的 arity 与 `MAXLEN` 文案也还没对齐：上游把 MAXLEN 的整数栏和 ID 的文法都排在
   arity 之前（选项扫描 :1255-1279 早于 :1284），且用的是
   `wrong number of arguments for XADD`（:1285）与 `The MAXLEN argument must be >= 0.`（:1269）

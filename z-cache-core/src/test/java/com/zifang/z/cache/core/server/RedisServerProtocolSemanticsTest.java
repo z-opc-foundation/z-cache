@@ -383,8 +383,10 @@ class RedisServerProtocolSemanticsTest {
                     {"1-01", "1-1"},
                     {"18446744073709551615-1", "18446744073709551615-1"}, // uint64 不是 int64
             };
-            for (String[] row : accepted) {
-                send(socket, "XADD", "sem:sid", row[0], "f", "v");
+            for (int row = 0; row < accepted.length; row++) {
+                // 每行一个键：这一支量的是"写法怎么规范化"，不能让上一条的表顶把这一条
+                // 按单调性闸挡下来（+1-1 规范成 1-1，而 05-1 已经写过 5-1）。
+                send(socket, "XADD", "sem:sid" + row, accepted[row][0], "f", "v");
                 wire.add(readReply(in));
             }
             for (int i = 0; i < accepted.length; i++) {
@@ -489,6 +491,97 @@ class RedisServerProtocolSemanticsTest {
                 assertFalse(reply.contains("java.lang"), "客户端不该看到 JVM 类名: " + reply);
                 assertFalse(reply.contains("internal error"), "客户端不该看到 internal error: " + reply);
             }
+        } finally {
+            server.stop();
+            thread.join(DEADLINE_MS);
+        }
+    }
+
+    /**
+     * XADD 的单调性：等于或小于表顶的 ID 一律不写，ID 用尽之后连 {@code *} 也不写。
+     * <p>
+     * 补这一条之前（本机 {@code battery50:27/28} 实测）：往已经有 {@code 1-3} 的流里再写
+     * {@code 1-2}、{@code 1-1} 都成功，于是同一个 ID 在流里出现两次、条目顺序也不升 ——
+     * {@code XRANGE} 交回的就是乱序表，而 {@code XREAD} 那类"按 ID 续读"的用法直接失去意义。
+     * 上游为此有两句不同的话：{@code :1315}（等于或小于表顶）与 {@code :1304}（ID 用尽），
+     * 后者排在前面，所以连显式的小 ID 也回 {@code :1304} 那一句。
+     * <p>
+     * 依据档次与上一支相同：4.0.9 不认 Stream（{@code battery49} 整批
+     * {@code -ERR unknown command 'XADD'}），所以这里钉的是上游源码的判序，不是对拍读数。
+     */
+    @Test
+    void xaddRejectsIdsAtOrBelowTheStreamTop() throws Exception {
+        int port = freePort();
+        RedisServer server = new RedisServer("127.0.0.1", port, 0);
+        Thread thread = startAndWait(server, port);
+        try (Socket socket = connect(port)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+            String atOrBelow = "-ERR The ID specified in XADD is equal or smaller than "
+                    + "the target stream top item";
+            String exhausted = "-ERR The stream has exhausted the last possible ID, "
+                    + "unable to add more items";
+
+            send(socket, "XADD", "sem:mono", "1-1", "a", "1");
+            assertEquals("1-1", readReply(in));
+
+            // 等于表顶、seq 更小、ms 更小 —— 三种"不升"都要拒
+            for (String[] bad : new String[][]{{"1-1", "等于表顶"}, {"1-0", "同 ms 但 seq 更小"},
+                    {"0-5", "ms 更小，尽管 seq 更大"}}) {
+                send(socket, "XADD", "sem:mono", bad[0], "b", "2");
+                assertEquals(atOrBelow, readReply(in), bad[1] + " 的写法不能写进去");
+            }
+            send(socket, "XLEN", "sem:mono");
+            assertEquals(":1", readReply(in), "被拒的三条一条都没写进去");
+            send(socket, "XRANGE", "sem:mono", "-", "+");
+            assertEquals("[[1-1, [a, 1]]]", readReplyDeep(in), "表里仍然是那一条，没有重复 ID");
+
+            // 升序照写；写完之后再回头写小的还是拒
+            send(socket, "XADD", "sem:mono", "1-2", "b", "2");
+            assertEquals("1-2", readReply(in));
+            send(socket, "XADD", "sem:mono", "18446744073709551615-18446744073709551615", "c", "3");
+            assertEquals("18446744073709551615-18446744073709551615", readReply(in),
+                    "uint64 的最大值本身是合法 ID，写进去就把 ID 空间用尽了");
+
+            // 用尽之后的两句判序：:1304 在 :1315 之前，所以小 ID 与 * 都回"用尽"那句
+            send(socket, "XADD", "sem:mono", "1-1", "d", "4");
+            assertEquals(exhausted, readReply(in),
+                    "这一条既小于表顶、又落在 ID 用尽之后 —— 上游先回用尽（:1304 早于 append）");
+            send(socket, "XADD", "sem:mono", "*", "d", "4");
+            assertEquals(exhausted, readReply(in), "自增 ID 也没有位置可给了");
+            send(socket, "XLEN", "sem:mono");
+            assertEquals(":3", readReply(in));
+            send(socket, "XRANGE", "sem:mono", "-", "+");
+            assertEquals("[[1-1, [a, 1]], [1-2, [b, 2]], [18446744073709551615-18446744073709551615, [c, 3]]]",
+                    readReplyDeep(in), "顺序必须还是升的：无符号比较把最大 ID 放到队尾，有符号比较会把它放到队首");
+
+            // 表顶是"迄今写过的最大 ID"，不是"最后一条条目"：删空、裁空都不许把 ID 空间退回来
+            send(socket, "XADD", "sem:persist", "5-5", "f", "v");
+            assertEquals("5-5", readReply(in));
+            send(socket, "XADD", "sem:persist", "5-6", "f", "v");
+            assertEquals("5-6", readReply(in));
+            send(socket, "XDEL", "sem:persist", "5-5", "5-6");
+            assertEquals(":2", readReply(in));
+            send(socket, "XLEN", "sem:persist");
+            assertEquals(":0", readReply(in));
+            send(socket, "XADD", "sem:persist", "5-5", "f", "v");
+            assertEquals(atOrBelow, readReply(in), "流都空了也不能把 5-5 重发一遍");
+            send(socket, "XADD", "sem:persist", "5-6", "f", "v");
+            assertEquals(atOrBelow, readReply(in));
+            send(socket, "XADD", "sem:persist", "5-7", "f", "v");
+            assertEquals("5-7", readReply(in), "比表顶大的照写");
+
+            send(socket, "XTRIM", "sem:persist", "MAXLEN", "0");
+            assertEquals(":1", readReply(in));
+            send(socket, "XADD", "sem:persist", "5-7", "f", "v");
+            assertEquals(atOrBelow, readReply(in), "XTRIM 裁空同样不退表顶");
+
+            // 被拒的 XADD 不得留下键（上游把 0-0 提前挡掉就是为了这件事，:1293 的注释）
+            send(socket, "XADD", "sem:fresh", "abc", "f", "v");
+            assertTrue(readReply(in).startsWith("-ERR Invalid stream ID"));
+            send(socket, "EXISTS", "sem:fresh");
+            assertEquals(":0", readReply(in), "语法错的 XADD 不能先把键建出来");
+            send(socket, "XADD", "sem:fresh2", "1-1", "f", "v");
+            assertEquals("1-1", readReply(in), "键不存在时表顶就是 0-0，任何合法显式 ID 都该照常写");
         } finally {
             server.stop();
             thread.join(DEADLINE_MS);

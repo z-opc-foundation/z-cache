@@ -2426,25 +2426,45 @@ public class CommandHandler {
         }
 
         String id = args[i++];
+        long[] parsedId = null;
         if (i + 1 > args.length || (args.length - i) % 2 != 0) {
             return RespError.of("ERR", "XADD needs at least one field value pair");
         }
         if (!"*".equals(id)) {
             // XADD 走 strict（单独的 "-" / "+" 在这里是非法 ID，上游 :1276），缺 seq 补 0；
             // 交回客户端的写法由数值反推（"05-1" echo 成 "5-1"），和 addReplyStreamID 一致。
-            long[] parsed = StreamIdFormat.parse(id, 0L, true);
-            if (parsed == null) return invalidStreamId();
-            if (parsed[0] == 0L && parsed[1] == 0L) {
+            parsedId = StreamIdFormat.parse(id, 0L, true);
+            if (parsedId == null) return invalidStreamId();
+            if (parsedId[0] == 0L && parsedId[1] == 0L) {
                 // 上游 :1293：提前挡掉 0-0，否则会出现"建了流又插不进去"的空键。
                 return RespError.of("ERR", "The ID specified in XADD must be greater than 0-0");
             }
-            id = StreamIdFormat.format(parsed[0], parsed[1]);
+            id = StreamIdFormat.format(parsedId[0], parsedId[1]);
         }
 
         Map<String, String> fields = new LinkedHashMap<>();
         while (i + 1 < args.length) {
             fields.put(args[i], args[i + 1]);
             i += 2;
+        }
+
+        // 两道单调性闸都排在写入之前（上游 :1304 那句，以及 streamAppendItem 的 EDOM → :1315），
+        // 而且只 peek 不 create：新键的表顶是 0-0，而 0-0 在上面就被挡掉了，所以任何收到的
+        // 显式 ID 都比它大 —— 键不存在时必须让这条 XADD 照常把流建起来。
+        com.zifang.z.cache.core.stream.Stream existing = streams().getStream(currentDb, key);
+        if (existing != null) {
+            long[] top = existing.lastId();
+            if (top[0] == StreamIdFormat.MAX_U64 && top[1] == StreamIdFormat.MAX_U64) {
+                // 这一句排在"等于或小于表顶"之前：上游在 :1304 就 return 了，连显式 ID 的
+                // 比较都轮不到 —— 哪怕客户端写的是 1-1 也回这句。
+                return RespError.of("ERR", "The stream has exhausted the last possible ID, "
+                        + "unable to add more items");
+            }
+            if (parsedId != null
+                    && StreamIdFormat.compare(parsedId[0], parsedId[1], top[0], top[1]) <= 0) {
+                return RespError.of("ERR", "The ID specified in XADD is equal or smaller than "
+                        + "the target stream top item");
+            }
         }
 
         try {
