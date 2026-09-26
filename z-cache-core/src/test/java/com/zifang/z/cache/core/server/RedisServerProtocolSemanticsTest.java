@@ -725,6 +725,58 @@ class RedisServerProtocolSemanticsTest {
     }
 
     /**
+     * {@code $} 与 {@code >} 各只属于一个命令，而"用错了命令"有自己的一句话
+     * （{@code t_stream.c:1519-1525}、{@code :1536-1541}），不是通用的
+     * {@code Invalid stream ID specified as stream command argument}：拿语法错去回答
+     * "用法不对"会把客户端指错方向。两句都在网线上逐字钉住，并且要在<b>整条命令</b>层面生效
+     * ——上游是 {@code goto cleanup}，同一条命令里后面那些合法的位置也一并作废。
+     */
+    @Test
+    void eachSpecialPositionIdBelongsToOneCommand() throws Exception {
+        int port = freePort();
+        RedisServer server = new RedisServer("127.0.0.1", port, 0);
+        Thread thread = startAndWait(server, port);
+        try (Socket socket = connect(port)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+
+            send(socket, "XADD", "sem:sp", "1-1", "a", "1");
+            assertEquals("1-1", readReply(in));
+            send(socket, "XGROUP", "CREATE", "sem:sp", "g", "0-0");
+            assertEquals("+OK", readReply(in));
+
+            // 阳性对照：两个特例在自家命令上都要被收下，否则下面的负判据是空跑
+            send(socket, "XREAD", "STREAMS", "sem:sp", "$");
+            assertEquals("*-1", readReply(in), "$ 在 XREAD 上合法，只是那个位置之后没东西");
+            send(socket, "XREADGROUP", "GROUP", "g", "c1", "STREAMS", "sem:sp", ">");
+            assertEquals("[[sem:sp, [[1-1, [a, 1]]]]]", readReplyDeep(in), "> 在 XREADGROUP 上合法");
+
+            String dollar = "-ERR The $ ID is meaningless in the context of XREADGROUP: "
+                    + "you want to read the history of this consumer by specifying a proper ID, "
+                    + "or use the > ID to get new messages. The $ ID would just return an "
+                    + "empty result set.";
+            String gt = "-ERR The > ID can be specified only when calling XREADGROUP "
+                    + "using the GROUP <group> <consumer> option.";
+
+            send(socket, "XREADGROUP", "GROUP", "g", "c1", "STREAMS", "sem:sp", "$");
+            assertEquals(dollar, readReply(in), "$ 在 XREADGROUP 上要回它自己那句话");
+            send(socket, "XREAD", "STREAMS", "sem:sp", ">");
+            assertEquals(gt, readReply(in), "> 在 XREAD 上要回它自己那句话");
+
+            // 整条命令作废：后面那个位置是合法的，也不许先把结果交出去
+            send(socket, "XREADGROUP", "GROUP", "g", "c2", "STREAMS", "sem:sp", "sem:sp", "$", "0-0");
+            assertEquals(dollar, readReply(in));
+            send(socket, "XREAD", "STREAMS", "sem:sp", "sem:sp", "0-0", ">");
+            assertEquals(gt, readReply(in));
+            send(socket, "XREADGROUP", "GROUP", "g", "c2", "STREAMS", "sem:sp", "0-0");
+            assertEquals("[[sem:sp, [[1-1, [a, 1]]]]]", readReplyDeep(in),
+                    "作废的那两次一条都没消费掉，c2 的历史仍是空的？不——c2 从没领过，这里读的是 PEL 起点 0-0");
+        } finally {
+            server.stop();
+            thread.join(DEADLINE_MS);
+        }
+    }
+
+    /**
      * XPENDING 的汇总形式要给出每个消费者的真实待确认数。
      * <p>
      * 旧实现填的是 {@code consumer.getPendingCount()} —— 那个字段从没自增过，恒为 0。
