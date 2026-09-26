@@ -128,8 +128,70 @@ All notable changes to z-cache will be documented in this file.
   真正改掉的那个键不动。现在 `BITOP` 单独一支，只 bump 目标键 —— 于是 `WATCH` 一个源键、
   别人对它跑 `BITOP`，`EXEC` 照样交出结果（源是只读的），而 `WATCH` 目标键必须中止。
 
+#### Stream ID 的文法：参考实例根本不认这个类型，所以权威换成上游源码的行号
+
+- **先把依据的档次说清楚**：Stream 这一族在钉住的参考实例上量不到。redis-server 4.0.9 早于
+  Stream（那是 5.0 新增的类型），250 实测 `battery49` 整批里每一条
+  `XADD / XRANGE / XREAD / XINFO` 都回 `-ERR unknown command 'XADD'`。所以本节每一行的右边
+  都不是对拍读数，而是上游 `t_stream.c`（redis 5.0.14）那一行<b>说</b>的答案；原文留在
+  `~/.cache/zcache_gauges/t_stream_5014.c`，两张测试表里逐行写了对应行号。
+  凡是只能靠"我以为 C 会这么解析"来定的写法，一条都没收进来。
+- 换掉的头一样东西是拿 `Long.parseLong` 读 ID：`XADD k 1-1-1 f v` 抛出的
+  `NumberFormatException` 被 `handle()` 兜成
+  `-ERR internal error: For input string: "1-1-1"` —— 一个客户端语法错被报成服务器内部错。
+  现在八个入口（XADD / XRANGE / XREVRANGE / XDEL / XACK / XREAD / XREADGROUP / XGROUP CREATE）
+  只认 `StreamIdFormat` 一处，非法一律回上游 :1205 那句原文，端到端那一支把
+  "回复里不得出现 `For input string` / `java.lang` / `internal error`" 钉成了兜底断言。
+- 两段都是 **uint64 而不是 int64**，上游 `string2ull`（:1147）因此先试 `string2ll`、
+  失败才退到 `strtoull`（:1156）。这一退让两族的接受集不对称，三组对照全在表里：
+  `05-1` / `+1-1` / `" 1"` 收（`string2ll` 不吃前导零、正号、空白，`strtoull` 吃），
+  `1 ` 否（:1157 要求把整串吃光）；`18446744073709551615-1` 收、
+  `18446744073709551616-1` 否（ERANGE）；回绕那一对最阴 —— `1--1` 否但 `1- -1` 收成
+  `1-18446744073709551615`：前导那个空白让 `string2ll` 先失败，于是走到 `strtoull`，
+  而 C 的 `strtoull(" -1")` 交回 `2^64-1` 且**不**置 errno。原样保留，没有"顺手修正"。
+- 长度闸与数值闸是两道：`char buf[128]`（:1175-1176）只看字符数。127 个零加一个 `1`
+  要收，同样的数字撑到 128 个字符就否；反过来 `92233720368547758081-0` 长度合法、
+  数值超 uint64 而否。写成 128 个 `1` 那种用例分不出这两道闸，一开始就写错了。
+- `strict` 一位不能合并：`-` / `+` 在 XRANGE / XREVRANGE 这类位置就是最小与最大 ID
+  （:1183-1190），在 XADD（:1276）/ XDEL（:2425）/ XACK（:1985）/ XREAD（:1549）/
+  XGROUP CREATE（:1869）这类位置是非法 ID（:1179-1180）。缺省 seq 还不对称：起点 `1`
+  是 `1-0`，终点 `1` 是 `1-18446744073709551615`（:1356-1357），所以 `XRANGE k 1 1`
+  要给出这一段的全部条目。顺带纠了我自己的一个想当然：`-` 是"最小 ID 本身"而不是
+  "第一条之前"，而 `0-0` 根本存不进来（:1293），于是 `XRANGE k - -` 是空集。
+- 比较必须按无符号：`StreamEntry.compareIds` 原来用有符号 `long` 比，于是
+  `18446744073709551615-…` 这条**最大**的 ID 排在所有条目之前 —— `XRANGE k 1-2 +` 把它
+  放到队尾。同一个符号错在 `Stream.generateId()` 里更硬：显式写过最大 ID 之后，
+  `now > lastTimestamp` 会判"当前时间比上一条新"，自动 ID 于是回退到流内已有序号之前。
+- 本机实测（`battery50`）抓到两条不是文法、而是"根本没判"的缺陷：
+  `XREADGROUP GROUP g c1 STREAMS k abc` 回的是**整段历史**（第 21 行），
+  `XREADGROUP … STREAMS k $` 同样回整段历史（第 20 行）—— 因为这一位以前一个字都不校验，
+  坏 ID 在存储层退化成 `0-0`。`$` 与 `>` 在上游是在数字文法之前单独收下的两个特例
+  （:1518、:1535），而且各自只在一个命令上合法、拒绝它们各有一句专门的话
+  （:1520、:1537）；用语法错去回答"用法不对"会把客户端指错方向，这两句现在照抄原文。
+- `XDEL` 要先把**每个** ID 都判一遍再动手删（:2420-2427 那段 sanity check 的注释写的就是
+  "命令因为中途一个非法 ID 只执行了一半"这种事）：以前 `XDEL k 1-1 not-an-id` 删掉 `1-1`
+  才报错。现在同一支的判据是"回错误且 `XLEN` 一条没少"。
+- 交回客户端的写法由数值反推（上游 `addReplyStreamID` 的形状），所以 `05-1` echo 成 `5-1`、
+  `+1-1` echo 成 `1-1`、`7` echo 成 `7-0`；二次解析落在同一点上，这一条也钉了。
+- 七支具名变异全部点名判红，跑完按字节还原（md5 对账）：
+  摘掉 `strict` 分支 → `parse("-", strict=true) ==> expected: <null> but was: <[J@…>`；
+  摘掉 `strtoull` 退路 → `parse("05-1", 0, false) ==> expected: <5-1> but was: <null>`；
+  比较改回有符号 → `expected: <true> but was: <false>`；
+  摘掉 XADD 的 `0-0` 闸 → `expected: <-ERR The ID specified in XADD must be greater than 0-0> but was: <0-0>`；
+  摘掉 XREADGROUP 的校验 → `expected: <-ERR Invalid stream ID …> but was: <*1>`；
+  XDEL 不预检 → `expected: <-ERR Invalid stream ID …> but was: <:1>`。
+  第七支不是编出来的题：写这一版时我真的把 XREAD 那一处填成了 `true`，
+  于是 `XREAD … $` 回了 XREADGROUP 那句、`XREAD … >` 反倒把整条流交出去 ——
+  最后一支（把 XREAD 的 strict 位填反）抓的就是这个错，红在
+  `">" 只在 XREADGROUP 上合法（:1535-1539）…` ==> expected: <true> but was: <false>`。
+
 ### Added
 - `RedisServer.serverScope()`：只读拿到本台那一份，测试与嵌入式据此判断作用域边界。
+- `StreamIdFormat`（z-cache-common）：stream ID 的唯一文法（uint64 两段、`-` / `+` 两种位置、
+  `missing_seq`、`compare` 无符号、`format` 规范化），八个命令入口共用；
+  `StreamIdFormatTest` 33 行判据（每行标上游行号），
+  `RedisServerProtocolSemanticsTest.streamIdsFollowTheUpstreamGrammarOverTheWire`
+  从协议那一侧再走一遍并兜住"不得漏出 JVM 文本"。
 - `RedisServerProtocolSemanticsTest` 增加 2 条端到端回归（`streamKeyspaceIsScopedToOneServerInstance`
   两头都量：B 读不到 A 的流，同时 A 读得到自己的流；
   `serverWithoutDataDirDoesNotDisableOtherServersPersistence` 先钉"带 dataDir 这台本来能 SAVE"
@@ -176,7 +238,7 @@ All notable changes to z-cache will be documented in this file.
   脚本 `~/.cache/zcache_gauges/zmut_bitop.sh`。
 
 - 计数只认实测（`tally.py` 从 surefire 报告聚合，空运行会硬 FATAL 而不是打"0 例全绿"）：
-  `mvn clean test` 全量 **324 + 372 + 134 + 2 = 832 例全绿，0 skipped**。上一版本节写的
+  `mvn clean test` 全量 **357 + 373 + 134 + 2 = 866 例全绿，0 skipped**（1.3.6 内上一次记录是 832，这一轮加进 stream ID 的 34 条）。上一版本节写的
   "96 + 340 + 133 + 2 = 571" 是位族五支进来之前的旧数，一并订正。
 - 这类跨实例作用域缺陷只在"整模块连跑"的形态下现形，所以按 `-Dsurefire.runOrder=random`
   把 common+core 连跑 9 次（3 + 6 两批）：**7 次 324 + 372 全绿，2 次不是**。执行顺序确实
@@ -192,6 +254,18 @@ All notable changes to z-cache will be documented in this file.
   因此仍走"GET 校验后 DEL"的非原子路径。
 - Stream 不参与 RDB/AOF；只有 String 键的 TTL 进快照（集合键连 `EXPIRE` 都还不支持，
   所以 `RENAME` 也只搬得动 String 的 TTL）。
+- Stream 这一族的**文法**收了，**读侧语义**没收，四条都在 `battery50` 里有实测行：
+  `XREAD STREAMS k 1-1` 现在把 `1-1` 自己也交出去（上游那一位的注释是
+  `/* ID must be greater than this. */`，:1560）；`XREAD … $` 交回整条流而不是"最后一条之后"；
+  `XADD` 仍然接受等于或小于流内最大 ID 的写法（实测连写 `1-2`、`1-1` 之后 `XLEN` 从 3 变 5，
+  同一个 ID 出现两次、顺序也乱），上游为此有专门一句 :1315；
+  `XREADGROUP` 带明确 ID 的"读历史"是按条目而非按 PEL 给的。
+  这四处是下一支的内容，本轮没有动，也没有把它们写成"已对齐"。
+- `XADD` 的 arity 与 `MAXLEN` 文案也还没对齐：上游把 MAXLEN 的整数栏和 ID 的文法都排在
+  arity 之前（选项扫描 :1255-1279 早于 :1284），且用的是
+  `wrong number of arguments for XADD`（:1285）与 `The MAXLEN argument must be >= 0.`（:1269）
+  这两句；我们目前是通用 arity 句 + `MAXLEN requires a non-negative integer`。
+- `XCLAIM` / `XSETID` 依旧没有实现（本机实测 `XCLAIM` 回 `-ERR unknown command 'XCLAIM'`）。
 - `MemoryStore.keyVersions` 只增不减。
 - `MemoryStore.keyTypeMaps` 仍只有 String 写路径维护；`existsDb` / `checkKeyType` 这些读它的
   方法对集合键一律"看不见"。`RENAME` 已经不读它了，但 `MemoryStore.rename()` / `renameDb()`

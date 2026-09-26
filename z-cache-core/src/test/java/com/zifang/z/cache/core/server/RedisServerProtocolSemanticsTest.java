@@ -350,6 +350,152 @@ class RedisServerProtocolSemanticsTest {
     }
 
     /**
+     * Stream ID 的文法从协议这一侧走一遍：客户端写进来的每一个 ID 要么按上游的规矩收下并
+     * 规范化，要么回 {@code Invalid stream ID specified as stream command argument}，
+     * <b>绝不允许</b>把 Java 自己的报错文本（{@code For input string: "…"}）漏到线上。
+     * <p>
+     * 判据来自上游 {@code t_stream.c}（redis 5.0.14）而不是对拍：z-cache 钉的参考实例是
+     * redis-server 4.0.9，Stream 是 5.0 才有的类型，4.0.9 对每条 XADD 都回
+     * {@code -ERR unknown command 'XADD'}（250 实测 battery49 整批）。所以这一支只钉两件事：
+     * <ol>
+     *   <li>文法本身（哪些写法收、收下的怎么写回去、哪些拒）——逐条对上源码行号；</li>
+     *   <li>"语法错不能被报成服务器内部错"——这是 1.3.6 之前的真实故障形态。</li>
+     * </ol>
+     * 旧实现两处都漏：{@code Long.parseLong} 抛出的异常被 {@code handle()} 兜成
+     * {@code -ERR internal error: For input string: "1-1-1"}；而 {@code XREADGROUP} 的 ID 位
+     * 一个字都不判，坏 ID 被当成 {@code 0-0} 于是回了整段历史（battery50:21 实测）。
+     */
+    @Test
+    void streamIdsFollowTheUpstreamGrammarOverTheWire() throws Exception {
+        int port = freePort();
+        RedisServer server = new RedisServer("127.0.0.1", port, 0);
+        Thread thread = startAndWait(server, port);
+        java.util.List<String> wire = new java.util.ArrayList<>();
+        try (Socket socket = connect(port)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+
+            // ---- 收下并且规范化（addReplyStreamID 由数值反推写法，所以 "05-1" echo 成 "5-1"）----
+            String[][] accepted = {
+                    {"05-1", "5-1"},          // strtoull 吃前导零（:1156），string2ll 不吃
+                    {"+1-1", "1-1"},          // 可选正号同理
+                    {"7", "7-0"},             // 没有 '-' 时补 missing_seq=0（:1199）
+                    {" 1", "1-0"},            // 前导空白同理
+                    {"1-01", "1-1"},
+                    {"18446744073709551615-1", "18446744073709551615-1"}, // uint64 不是 int64
+            };
+            for (String[] row : accepted) {
+                send(socket, "XADD", "sem:sid", row[0], "f", "v");
+                wire.add(readReply(in));
+            }
+            for (int i = 0; i < accepted.length; i++) {
+                assertEquals(accepted[i][1], wire.get(i),
+                        "XADD \"" + accepted[i][0] + "\" 要按上游的规范化写法回写");
+            }
+
+            // ---- 拒掉，且拒的那句话逐字是上游 :1205 的原文 ----
+            String[] rejected = {
+                    "abc", "1-1-1", "1-", "1 ", "-1", "1--1",
+                    "18446744073709551616-0", "92233720368547758081-0",
+                    "+", "-",                        // XADD 是 strict 位（:1276）
+            };
+            for (String bad : rejected) {
+                send(socket, "XADD", "sem:sid", bad, "f", "v");
+                wire.add(readReply(in));
+                assertEquals("-ERR " + com.zifang.z.cache.common.protocol.StreamIdFormat.INVALID_ID,
+                        wire.get(wire.size() - 1), "XADD \"" + bad + "\" 必须按上游原文拒");
+            }
+
+            // 0-0 是另一句：上游 :1293 专门提前挡它，否则"建了流又插不进去"会留下空键
+            send(socket, "XADD", "sem:sid", "0-0", "f", "v");
+            wire.add(readReply(in));
+            assertEquals("-ERR The ID specified in XADD must be greater than 0-0",
+                    wire.get(wire.size() - 1));
+            send(socket, "XADD", "sem:sid", "0", "f", "v");
+            wire.add(readReply(in));
+            assertEquals("-ERR The ID specified in XADD must be greater than 0-0",
+                    wire.get(wire.size() - 1), "没有 '-' 时补 seq=0，于是 \"0\" 也是 0-0");
+
+            // ---- 读侧：范围两端都不 strict，但缺省 seq 不对称（:1356-1357）----
+            send(socket, "XADD", "sem:range", "1-1", "f", "a");
+            readReply(in);
+            send(socket, "XADD", "sem:range", "1-2", "f", "b");
+            readReply(in);
+            send(socket, "XADD", "sem:range", "1-18446744073709551615", "f", "c");
+            readReply(in);
+            send(socket, "XADD", "sem:range", "2-0", "f", "d");
+            readReply(in);
+            send(socket, "XRANGE", "sem:range", "1", "1");
+            wire.add(readReplyDeep(in));
+            assertEquals("[[1-1, [f, a]], [1-2, [f, b]], [1-18446744073709551615, [f, c]]]",
+                    wire.get(wire.size() - 1),
+                    "起点 \"1\" 补 seq=0，终点 \"1\" 补 seq=UINT64_MAX —— 两端都缺就是全要");
+            send(socket, "XRANGE", "sem:range", "-", "-");
+            assertEquals("[]", readReplyDeep(in),
+                    "\"-\" 是最小 ID（0-0）本身，不是\"第一条之前\"；而 0-0 存不进来（:1293），所以这一对恒空");
+            send(socket, "XRANGE", "sem:range", "-", "1-1");
+            assertEquals("[[1-1, [f, a]]]", readReplyDeep(in), "把 \"-\" 当起点用才是全量扫描的头");
+            send(socket, "XRANGE", "sem:range", "+", "+");
+            assertEquals("[]", readReplyDeep(in), "\"+\" 同理是最大 ID，不是\"最后一条之后\"");
+            send(socket, "XRANGE", "sem:range", "1-2", "+");
+            assertEquals("[[1-2, [f, b]], [1-18446744073709551615, [f, c]], [2-0, [f, d]]]",
+                    readReplyDeep(in),
+                    "无符号的 UINT64_MAX 那一条必须排在 2-0 之前——有符号比较会把它送到队尾");
+            send(socket, "XRANGE", "sem:range", "abc", "+");
+            wire.add(readReply(in));
+            assertTrue(wire.get(wire.size() - 1).startsWith("-ERR Invalid stream ID"), "范围起点也要判文法");
+
+            // ---- XDEL：先把每个 ID 判一遍再动手（:2420-2427），不能删一半才报错 ----
+            send(socket, "XDEL", "sem:range", "1-1", "not-an-id");
+            wire.add(readReply(in));
+            assertEquals("-ERR " + com.zifang.z.cache.common.protocol.StreamIdFormat.INVALID_ID,
+                    wire.get(wire.size() - 1));
+            send(socket, "XLEN", "sem:range");
+            assertEquals(":4", readReply(in), "ID 有一个非法就一条都不许删");
+
+            // ---- XREAD / XREADGROUP：$ 与 > 各有专属句子，其余一律 strict ----
+            send(socket, "XGROUP", "CREATE", "sem:range", "g", "$");
+            assertEquals("+OK", readReply(in));
+            send(socket, "XGROUP", "CREATE", "sem:range", "g-bad", "not-an-id");
+            wire.add(readReply(in));
+            assertTrue(wire.get(wire.size() - 1).startsWith("-ERR Invalid stream ID"),
+                    "XGROUP CREATE 的 ID 位是 strict（:1869）");
+
+            send(socket, "XREADGROUP", "GROUP", "g", "c1", "STREAMS", "sem:range", "abc");
+            wire.add(readReply(in));
+            assertEquals("-ERR " + com.zifang.z.cache.common.protocol.StreamIdFormat.INVALID_ID,
+                    wire.get(wire.size() - 1),
+                    "以前这一位不判，坏 ID 变成 0-0 于是回了整段历史");
+            send(socket, "XREAD", "STREAMS", "sem:range", "abc");
+            wire.add(readReply(in));
+            assertEquals("-ERR " + com.zifang.z.cache.common.protocol.StreamIdFormat.INVALID_ID,
+                    wire.get(wire.size() - 1));
+            send(socket, "XREAD", "STREAMS", "sem:range", ">");
+            wire.add(readReply(in));
+            assertTrue(wire.get(wire.size() - 1).startsWith("-ERR The > ID can be specified only when calling XREADGROUP"),
+                    "\">\" 只在 XREADGROUP 上合法（:1535-1539），拒绝它要用那句原文而不是语法错");
+            send(socket, "XREADGROUP", "GROUP", "g", "c1", "STREAMS", "sem:range", "$");
+            wire.add(readReply(in));
+            assertTrue(wire.get(wire.size() - 1).startsWith("-ERR The $ ID is meaningless in the context of XREADGROUP"),
+                    "$ 在 XREADGROUP 上是另一句（:1518-1524）");
+            send(socket, "XREADGROUP", "GROUP", "g", "c1", "STREAMS", "sem:range", ">");
+            assertEquals("*-1", readReplyDeep(in),
+                    "\">\" 是合法写法（:1535），而这条组创建于 $ 之后没有新条目 —— 上游在这种情况下"
+                            + "回的正是 nullmultibulk（:1664），不是空数组");
+
+            // ---- 这一支真正的兜底：任何一条回复里都不许出现 JVM 的内部文本 ----
+            for (String reply : wire) {
+                assertFalse(reply.contains("For input string"),
+                        "语法错被报成内部错，正是 1.3.6 之前的形态: " + reply);
+                assertFalse(reply.contains("java.lang"), "客户端不该看到 JVM 类名: " + reply);
+                assertFalse(reply.contains("internal error"), "客户端不该看到 internal error: " + reply);
+            }
+        } finally {
+            server.stop();
+            thread.join(DEADLINE_MS);
+        }
+    }
+
+    /**
      * XPENDING 的汇总形式要给出每个消费者的真实待确认数。
      * <p>
      * 旧实现填的是 {@code consumer.getPendingCount()} —— 那个字段从没自增过，恒为 0。

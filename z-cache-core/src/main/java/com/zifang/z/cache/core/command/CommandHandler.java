@@ -2369,6 +2369,33 @@ public class CommandHandler {
         return RespError.of("ERR", StreamIdFormat.INVALID_ID);
     }
 
+    /**
+     * XREAD / XREADGROUP 的 ID 位：{@code $} 与 {@code >} 在数字文法之前就被单独收下
+     * （上游 t_stream.c:1518、:1535 两个 {@code strcmp} 分支），剩下的一律 strict（:1549）。
+     * 两个特例各自只在一个命令上合法，而"在这个命令上非法"有专门的句子（:1520、:1537），
+     * 不是 {@code Invalid stream ID} —— 拿语法错去回答"用法不对"会把客户端指错方向。
+     *
+     * @param inReadGroup false = XREAD，true = XREADGROUP
+     * @return 需要拒绝时那条回复，否则 null
+     */
+    private static Object rejectStreamIdInRead(String text, boolean inReadGroup) {
+        if ("$".equals(text)) {
+            return inReadGroup
+                    ? RespError.of("ERR", "The $ ID is meaningless in the context of XREADGROUP: "
+                            + "you want to read the history of this consumer by specifying a proper ID, "
+                            + "or use the > ID to get new messages. The $ ID would just return an "
+                            + "empty result set.")
+                    : null;
+        }
+        if (">".equals(text)) {
+            return inReadGroup
+                    ? null
+                    : RespError.of("ERR", "The > ID can be specified only when calling XREADGROUP "
+                            + "using the GROUP <group> <consumer> option.");
+        }
+        return StreamIdFormat.parse(text, 0L, true) == null ? invalidStreamId() : null;
+    }
+
     private Object handleXadd(String[] args) {
         if (streams() == null) return RespError.of("ERR", "Stream not configured");
         if (args.length < 4) return RespError.wrongNumberOfArguments("XADD");
@@ -2557,11 +2584,8 @@ public class CommandHandler {
         for (int k = 0; k < numKeys; k++) {
             keys[k] = args[i + k];
             ids[k] = args[i + numKeys + k];
-            // "$" 在解析之前就被上游单独收下（t_stream.c:1520 那一档），所以这里放过它；
-            // 除此之外一律 strict。
-            if (!"$".equals(ids[k]) && StreamIdFormat.parse(ids[k], 0L, true) == null) {
-                return invalidStreamId();
-            }
+            Object rejected = rejectStreamIdInRead(ids[k], false);
+            if (rejected != null) return rejected;
         }
 
         Object[] result = new Object[numKeys];
@@ -2613,7 +2637,12 @@ public class CommandHandler {
         int numKeys = (args.length - i) / 2;
         Map<String, String> streams = new LinkedHashMap<>();
         for (int k = 0; k < numKeys; k++) {
-            streams.put(args[i + k], args[i + numKeys + k]);
+            String idText = args[i + numKeys + k];
+            // 以前这一位一个字都不判：坏 ID 走到 StreamStore 里被当成 0-0，于是
+            // "XREADGROUP GROUP g c STREAMS k abc" 回了整段历史（实测 battery50:21）。
+            Object rejected = rejectStreamIdInRead(idText, true);
+            if (rejected != null) return rejected;
+            streams.put(args[i + k], idText);
         }
 
         Map<String, List<StreamEntry>> result = streams().xreadgroup(currentDb, group, consumer, streams, count);
