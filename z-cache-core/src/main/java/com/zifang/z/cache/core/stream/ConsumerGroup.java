@@ -143,6 +143,31 @@ public class ConsumerGroup {
     }
 
     /**
+     * 组名 / 消费者名的序。上游两张表都是一棵 rax，{@code XINFO} 的两支（:2568 CONSUMERS、
+     * :2594 GROUPS）都是 {@code raxSeek("^")} + {@code raxNext} 的顺序遍历，交回来的行因此是
+     * <b>按名字升序</b>而不是建组的先后；rax 比的是 SDS 的字节。
+     * <p>
+     * 我们的名字是 UTF-8 解码出来的 String，按 {@link String#compareTo}（UTF-16 码元序）比会在
+     * 辅助平面与字节序错位：U+2B000 的头一个码元是 {@code \uD86C}，比 U+F000 小，而按字节它更大。
+     * 所以这里按<b>码点</b>比 —— 对能原样往返的 UTF-8 来说码点序就是字节序。
+     */
+    public static final java.util.Comparator<String> NAME_ORDER = ConsumerGroup::compareNames;
+
+    private static int compareNames(String a, String b) {
+        int ia = 0;
+        int ib = 0;
+        while (ia < a.length() && ib < b.length()) {
+            int ca = a.codePointAt(ia);
+            int cb = b.codePointAt(ib);
+            if (ca != cb) return Integer.compare(ca, cb);
+            ia += Character.charCount(ca);
+            ib += Character.charCount(cb);
+        }
+        // 一方是另一方的前缀：短的在前（memcmp 走到长度边界时短的那个先结束）
+        return Integer.compare(a.length() - ia, b.length() - ib);
+    }
+
+    /**
      * 每个消费者手上还压着多少条没 ACK，<b>含 0 条的</b>，按名字升序。
      * <p>
      * 数字从 {@link #pendingEntries} 现算，不去信那个自增计数器——两边口径一旦漂移，
@@ -157,7 +182,9 @@ public class ConsumerGroup {
      * 而 :2086 那一跳要有东西可跳才是它被量到的形状。
      */
     public Map<String, Long> perConsumerPending() {
-        Map<String, Long> counts = new java.util.TreeMap<>();
+        // 序按 NAME_ORDER，而不是 TreeMap 的自然序：XPENDING 那一圈交回的消费者行也要跟
+        // 上游的 rax 序对得上（见上面那份注释）。
+        Map<String, Long> counts = new java.util.TreeMap<>(NAME_ORDER);
         for (String consumer : consumers.keySet()) {
             counts.put(consumer, 0L);
         }

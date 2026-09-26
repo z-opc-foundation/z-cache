@@ -1022,6 +1022,163 @@ class RedisServerProtocolSemanticsTest {
     }
 
     /**
+     * XINFO GROUPS 的一行有 <b>8</b> 个元素，第四对是 {@code last-delivered-id}
+     * （上游 t_stream.c:2600-2608，那个值是 :2608 的 {@code addReplyStreamID} 发的 bulk），
+     * 而行的先后由那棵 rax 决定：:2594-2597 是 {@code raxSize} + {@code raxSeek("^")} +
+     * {@code raxNext}，也就是<b>按组名升序</b>，不是建组的先后。
+     * <p>
+     * 两边以前都不对：行只有 6 个元素（组的位置只在 {@code XGROUP CREATE/SETID} 里写进对象、
+     * 从没交出去），而遍历的是 {@code ConcurrentHashMap}。行序这条有实测的现场：建组顺序是
+     * zeta / Alpha / mid，修之前 wire 上第一行是 zeta（{@code battery65.pre} 第 9 行）。
+     */
+    @Test
+    void xinfoGroupsRowsCarryTheGroupPositionAndComeOutInNameOrder() throws Exception {
+        int port = freePort();
+        RedisServer server = new RedisServer("127.0.0.1", port, 0);
+        Thread thread = startAndWait(server, port);
+        try (Socket socket = connect(port)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+
+            send(socket, "XADD", "xi:s", "1-1", "a", "1");
+            assertEquals("1-1", readReply(in));
+            send(socket, "XADD", "xi:s", "1-2", "a", "2");
+            assertEquals("1-2", readReply(in));
+            send(socket, "XADD", "xi:s", "1-3", "a", "3");
+            assertEquals("1-3", readReply(in));
+
+            send(socket, "XGROUP", "CREATE", "xi:s", "zeta", "0-0");
+            assertEquals("+OK", readReply(in));
+            send(socket, "XGROUP", "CREATE", "xi:s", "Alpha", "1-1");
+            assertEquals("+OK", readReply(in));
+            send(socket, "XGROUP", "CREATE", "xi:s", "mid", "0-0");
+            assertEquals("+OK", readReply(in));
+
+            send(socket, "XINFO", "GROUPS", "xi:s");
+            assertEquals("*3", readWireReply(in), ":2594 addReplyMultiBulkLen(c, raxSize(s->cgroups))");
+            assertEquals("[name, Alpha, consumers, :0, pending, :0, last-delivered-id, 1-1]",
+                    readReplyDeep(in), "行序按名字升序：Alpha 在 zeta 前，而建组是 zeta 先；每行 8 个元素");
+            assertEquals("[name, mid, consumers, :0, pending, :0, last-delivered-id, 0-0]",
+                    readReplyDeep(in));
+            assertEquals("[name, zeta, consumers, :0, pending, :0, last-delivered-id, 0-0]",
+                    readReplyDeep(in));
+
+            send(socket, "XADD", "xi:bare", "1-1", "a", "1");
+            assertEquals("1-1", readReply(in));
+            send(socket, "XINFO", "GROUPS", "xi:bare");
+            assertEquals("*0", readWireReply(in), ":2590 一个组都没有时交空数组，不是 null 数组");
+
+            // 投递把组的位置推上去：组起点 0-0，所以 COUNT 2 投的是头两条，不是尾两条
+            send(socket, "XREADGROUP", "GROUP", "mid", "cA", "COUNT", "2", "STREAMS", "xi:s", ">");
+            assertEquals("[[xi:s, [[1-1, [a, 1]], [1-2, [a, 2]]]]]", readReplyDeep(in),
+                    "前置条件: 投出去的是 1-1 与 1-2");
+            send(socket, "XINFO", "GROUPS", "xi:s");
+            assertEquals("*3", readWireReply(in));
+            assertEquals("[name, Alpha, consumers, :0, pending, :0, last-delivered-id, 1-1]",
+                    readReplyDeep(in));
+            assertEquals("[name, mid, consumers, :1, pending, :2, last-delivered-id, 1-2]",
+                    readReplyDeep(in), "last-delivered-id 跟着投递走");
+            assertEquals("[name, zeta, consumers, :0, pending, :0, last-delivered-id, 0-0]",
+                    readReplyDeep(in));
+
+            send(socket, "XGROUP", "SETID", "xi:s", "zeta", "7-7");
+            assertEquals("+OK", readReply(in));
+            send(socket, "XGROUP", "CREATE", "xi:s", "top",
+                    "18446744073709551615-18446744073709551615");
+            assertEquals("+OK", readReply(in));
+            send(socket, "XINFO", "GROUPS", "xi:s");
+            assertEquals("*4", readWireReply(in));
+            assertEquals("[name, Alpha, consumers, :0, pending, :0, last-delivered-id, 1-1]",
+                    readReplyDeep(in));
+            assertEquals("[name, mid, consumers, :1, pending, :2, last-delivered-id, 1-2]",
+                    readReplyDeep(in));
+            // 顶格位置回读必须是**无符号**那串文本：这两个 long 的位模式是 -1L，
+            // 走 String.valueOf 会交回 "-1--1"。top 排在 mid 之后、zeta 之前，也是行序的一格。
+            assertEquals("[name, top, consumers, :0, pending, :0, "
+                    + "last-delivered-id, 18446744073709551615-18446744073709551615]",
+                    readReplyDeep(in), "SETID/CREATE 写进去的位置要看得见，且不带负号");
+            assertEquals("[name, zeta, consumers, :0, pending, :0, last-delivered-id, 7-7]",
+                    readReplyDeep(in), "SETID 改过的那一组要交回 7-7，不是建组时的 0-0");
+
+            // CONSUMERS 那一支吃的是同一条序规则。名字是量出来挑的：c2、c3 由投递顺手建，
+            // c1 后建，而改前那个 jar 在这三个名字上的哈希表遍历序实测是 c3 c1 c2
+            // （battery65 第 35 行 pre 侧），跟升序不同 —— 先拿 cA/cB 试过一对，那两个名字
+            // 天然的表序恰好就是升序，改前改后一个字节都不差，这一格等于没量。
+            send(socket, "XADD", "xi:c", "1-1", "a", "1");
+            assertEquals("1-1", readReply(in));
+            send(socket, "XADD", "xi:c", "1-2", "a", "2");
+            assertEquals("1-2", readReply(in));
+            send(socket, "XGROUP", "CREATE", "xi:c", "og", "0-0");
+            assertEquals("+OK", readReply(in));
+            send(socket, "XREADGROUP", "GROUP", "og", "c2", "COUNT", "1", "STREAMS", "xi:c", ">");
+            assertTrue(readReplyDeep(in).contains("1-1"), "前置条件: c2 领走 1-1");
+            send(socket, "XREADGROUP", "GROUP", "og", "c3", "COUNT", "1", "STREAMS", "xi:c", ">");
+            assertTrue(readReplyDeep(in).contains("1-2"), "前置条件: c3 领走 1-2");
+            send(socket, "XGROUP", "CREATECONSUMER", "xi:c", "og", "c1");
+            assertEquals(":1", readReply(in));
+
+            // 手上没货的 c1 照样列（:2568 遍历整份消费者表），计数是 :2582 的 integer 不是 bulk。
+            String[] consumerRows = {"c1:0", "c2:1", "c3:1"};
+            send(socket, "XINFO", "CONSUMERS", "xi:c", "og");
+            assertEquals("*3", readWireReply(in));
+            for (String row : consumerRows) {
+                assertEquals("*6", readWireReply(in), ":2578 一行 6 个元素");
+                assertEquals("$name", readWireReply(in));
+                assertEquals("$" + row.substring(0, 2), readWireReply(in),
+                        "行序按名字升序，不是哈希表的遍历序，也不是建消费者的先后");
+                assertEquals("$pending", readWireReply(in));
+                assertEquals(":" + row.substring(3), readWireReply(in));
+                assertEquals("$idle", readWireReply(in));
+                readWireReply(in); // idle 是时间量：把这一格读干净，不钉值
+            }
+
+            // 名字比的是**码点**，不是 UTF-16 码元：U+F000 在 U+2B000 之前，
+            // 而 String.compareTo 会因为 U+2B000 的头一个码元是 \uD86C 把它排到前面。
+            // 建组顺序也故意反着来，这样"插入序"与"码元序"都不是正确答案。
+            send(socket, "XADD", "xi:u", "1-1", "a", "1");
+            assertEquals("1-1", readReply(in));
+            send(socket, "XGROUP", "CREATE", "xi:u", "\uD86C\uDC00", "0-0");
+            assertEquals("+OK", readReply(in), "U+2B000 这个名字要能原样进出");
+            send(socket, "XGROUP", "CREATE", "xi:u", "\uF000", "0-0");
+            assertEquals("+OK", readReply(in));
+            send(socket, "XINFO", "GROUPS", "xi:u");
+            assertEquals("*2", readWireReply(in));
+            assertEquals("[name, \uF000, consumers, :0, pending, :0, last-delivered-id, 0-0]",
+                    readReplyDeep(in), "U+F000 要排在 U+2B000 之前（rax 比的是字节）");
+            assertEquals("[name, \uD86C\uDC00, consumers, :0, pending, :0, last-delivered-id, 0-0]",
+                    readReplyDeep(in));
+
+            // 同一条序规则也管着 XPENDING 汇总里的那些消费者行（:2079-2089 遍历的还是那棵
+            // 消费者 rax）。两个消费者都必须手上有货，否则 :2086 那句 continue 会跳过空手的那个，
+            // 这一格就量不到序。
+            send(socket, "XADD", "xi:p", "1-1", "a", "1");
+            assertEquals("1-1", readReply(in));
+            send(socket, "XADD", "xi:p", "1-2", "a", "2");
+            assertEquals("1-2", readReply(in));
+            send(socket, "XGROUP", "CREATE", "xi:p", "g", "0-0");
+            assertEquals("+OK", readReply(in));
+            send(socket, "XREADGROUP", "GROUP", "g", "\uD86C\uDC00", "COUNT", "1", "STREAMS", "xi:p", ">");
+            assertTrue(readReplyDeep(in).contains("1-1"), "先让 U+2B000 领走 1-1");
+            send(socket, "XREADGROUP", "GROUP", "g", "\uF000", "COUNT", "1", "STREAMS", "xi:p", ">");
+            assertTrue(readReplyDeep(in).contains("1-2"), "再让 U+F000 领走 1-2");
+            send(socket, "XPENDING", "xi:p", "g");
+            assertEquals("*4", readWireReply(in));
+            assertEquals(":2", readWireReply(in));
+            assertEquals("$1-1", readWireReply(in));
+            assertEquals("$1-2", readWireReply(in));
+            assertEquals("*2", readWireReply(in));
+            assertEquals("*2", readWireReply(in));
+            assertEquals("$\uF000", readWireReply(in), "汇总里的消费者行也按名字升序，U+F000 在前");
+            assertEquals("$1", readWireReply(in), "计数是 addReplyBulkLongLong");
+            assertEquals("*2", readWireReply(in));
+            assertEquals("$\uD86C\uDC00", readWireReply(in));
+            assertEquals("$1", readWireReply(in));
+        } finally {
+            server.stop();
+            thread.join(DEADLINE_MS);
+        }
+    }
+
+    /**
      * XINFO CONSUMERS 以前在文档注释里有、switch 里没有这个 case，
      * 所以 {@code XINFO CONSUMERS key group} 永远回 {@code -ERR syntax error}。
      */

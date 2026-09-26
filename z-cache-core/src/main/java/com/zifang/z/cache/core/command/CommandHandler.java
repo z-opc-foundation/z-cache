@@ -3168,17 +3168,22 @@ public class CommandHandler {
         switch (sub) {
             case "GROUPS": {
                 java.util.Set<String> names = infoStream.groupNames();
-                Object[] result = new Object[names.size()];
-                int i = 0;
-                for (String name : names) {
+                // :2594-2609：一行 8 个元素，第四对是 last-delivered-id（:2607-2608
+                // addReplyBulkCString + addReplyStreamID，后者发的是 bulk 文本 "ms-seq"）。
+                // 行序是 rax 的升序，不是建组先后 —— 见 ConsumerGroup.NAME_ORDER 那一段。
+                List<Object> rows = new ArrayList<>(names.size());
+                for (String name : sortedNames(names)) {
                     com.zifang.z.cache.core.stream.ConsumerGroup cg = infoStream.getGroup(name);
-                    result[i++] = RespArray.of(
+                    if (cg == null) continue; // 只可能在并发的 XGROUP DESTROY 之间撞上
+                    rows.add(RespArray.of(
                             RespBulkString.of("name"), RespBulkString.of(name),
-                            RespBulkString.of("consumers"), RespInteger.of(cg != null ? cg.getConsumers().size() : 0),
-                            RespBulkString.of("pending"), RespInteger.of(cg != null ? cg.pendingCount() : 0)
-                    );
+                            RespBulkString.of("consumers"), RespInteger.of(cg.getConsumers().size()),
+                            RespBulkString.of("pending"), RespInteger.of(cg.pendingCount()),
+                            RespBulkString.of("last-delivered-id"),
+                            RespBulkString.of(StreamIdFormat.format(
+                                    cg.getLastDeliveredId(), cg.getLastDeliveredSeq()))));
                 }
-                return RespArray.of(result);
+                return RespArray.of(rows);
             }
             case "STREAM": {
                 return RespArray.of(
@@ -3199,13 +3204,17 @@ public class CommandHandler {
                 }
                 Map<String, Long> pendingByConsumer = group.perConsumerPending();
                 List<Object> rows = new ArrayList<>(group.getConsumers().size());
-                for (Map.Entry<String, com.zifang.z.cache.core.stream.ConsumerGroup.Consumer> entry
-                        : group.getConsumers().entrySet()) {
+                // 遍历的仍然是消费者表本身（不是 perConsumerPending 的键集）：上游 :2573 那一圈
+                // 走的是 cg->consumers 这棵 rax，行序由它决定，计数才回头去查 PEL。
+                for (String cname : sortedNames(group.getConsumers().keySet())) {
+                    com.zifang.z.cache.core.stream.ConsumerGroup.Consumer consumer =
+                            group.getConsumers().get(cname);
+                    if (consumer == null) continue;
                     rows.add(RespArray.of(
-                            RespBulkString.of("name"), RespBulkString.of(entry.getKey()),
+                            RespBulkString.of("name"), RespBulkString.of(cname),
                             RespBulkString.of("pending"),
-                            RespInteger.of(pendingByConsumer.getOrDefault(entry.getKey(), 0L).intValue()),
-                            RespBulkString.of("idle"), RespInteger.of((int) entry.getValue().getIdleTimeMs())));
+                            RespInteger.of(pendingByConsumer.getOrDefault(cname, 0L).intValue()),
+                            RespBulkString.of("idle"), RespInteger.of((int) consumer.getIdleTimeMs())));
                 }
                 return RespArray.of(rows.toArray());
             }
@@ -3215,6 +3224,16 @@ public class CommandHandler {
     }
 
     // ==================== 工具 ====================
+
+    /**
+     * 按上游 rax 的那份序（名字升序，判据见 {@code ConsumerGroup.NAME_ORDER}）把一组名字排一遍。
+     * XINFO GROUPS 与 XINFO CONSUMERS 两支都要，因为它们的行序都由那张表决定。
+     */
+    private static List<String> sortedNames(java.util.Set<String> names) {
+        List<String> ordered = new ArrayList<>(names);
+        ordered.sort(com.zifang.z.cache.core.stream.ConsumerGroup.NAME_ORDER);
+        return ordered;
+    }
 
     /**
      * 将写命令追加到 AOF 文件（仅记录写命令）。

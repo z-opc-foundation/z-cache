@@ -802,6 +802,66 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   "端口上答话的不是 RESP"，不再伪装成一条业务断言失败。要让全量在撞车下照样不红，得让 `startAndWait`
   换端口重来，那要动这 3 个类里所有用例的"先建服务器再取端口"结构，本轮没做。
 
+#### XINFO 的两张表：`GROUPS` 少一对字段，而两张表的行序听的是哈希表
+
+- 偏差是量出来的，不是读文档读出来的：`battery65`（36 行）对**改前那个 jar**
+  （`b65_pre.jar`，里面 `CommandHandler.class` 的 md5 是 `8edaa85f`、`ConsumerGroup.class`
+  是 `ba36351d`）与**改后那个 jar**
+  （`b65_post.jar`，`5a32d6b1` / `8717c9b8`）各跑一遍，`zdiff.py` 报的原始账是
+  **真实不一致 8 行 + 顺序不同 1 行**（`A=battery65.pre B=battery65.post 行数=36 顺序不同=1 真实不一致=8`）。
+  那 8 行逐行对比后归两类：`:9 :14 :18 :22 :24 :28` 六行全是 `XINFO GROUPS`，差的就是
+  `last-delivered-id` 那一对与行序（本增量修的）；`:12 :25` 两行除 `idle` 的毫秒数以外逐字节相同
+  —— 那是现量时间不是行为，记为噪声，不当证据。"顺序不同"那一行是 `:35 XINFO CONSUMERS`。
+- `XINFO GROUPS` 的一行是 **8** 个元素，不是 6：`t_stream.c:2600` 写的就是
+  `addReplyMultiBulkLen(c, 8)`，第四对 `last-delivered-id` 在 `:2607-2608`
+  （`addReplyBulkCString` + `addReplyStreamID`，后者发的是 `ms-seq` 的 **bulk 文本**）。
+  改前那一行根本没有这一对 —— 而组位点恰恰是 `XINFO GROUPS` 存在的理由：客户端据此判
+  "这个组读到哪了"，缺了它就只能靠 `XPENDING` 反推。
+- 位点的渲染必须走无符号：顶格那两个 long 的位模式是 `-1L`，`String.valueOf` 会交回
+  `-1--1`，而上游 `addReplyStreamID` 用的是 `%llu`。所以走 `StreamIdFormat.format(…)`，
+  `XGROUP CREATE t 18446744073709551615-18446744073709551615` 之后回读的是同一串十进制
+  （`battery65:28`、测试里 `top` 那一行）。
+- 行序由表决定，不由建立顺序决定：两支都是 `raxSeek("^")` + `raxNext` 的顺序遍历
+  （`:2568` CONSUMERS、`:2594` GROUPS），交回来的是**按名字升序**。改前 GROUPS 走插入序
+  （实测 `zebra, Alpha, mid`），CONSUMERS 走的是 `ConcurrentHashMap` 的遍历序。
+- **一把尺在这一格上撒了谎，是它自己得先修的**：第一版的 CONSUMERS 断言拿 `cA` / `cB` 命名，
+  而这两个名字在哈希表里天然的遍历序**恰好就是升序** —— 改前改后逐字节相同，那一格等于没量
+  （`battery65` 改前那 28 行里，CONSUMERS 只翻了 `idle`，没有一行是序）。做法是先拿
+  `OrderProbe.java` 在 surefire 用的那个 JDK 上实测候选名的遍历序（不猜、也不照抄 python 里
+  模拟的 CHM 哈希，那个模型当场就和实测对不上），再在 `battery65` 第 35 行用真服务器复现：
+  `c2`、`c3` 由投递顺手建、`c1` 后建，改前那个 jar 交回的是 `c3 c1 c2`。测试与电池都换成
+  这一组名字，`zdiff.py` 随即把第 35 行报成"顺序不同"，W4 也从"没读者"变成
+  `expected: <$c1> but was: <$c3>`。**这条赌注是这次测到的，不是结构保证的** —— 换 JDK
+  或换哈希之后 CHM 序有可能又恰好等于升序，那时 W4 会 SURVIVED，已写进下面"已知边界"。
+- 名字比的必须是**码点**，不是 UTF-16 码元：rax 比的是 SDS 的字节，而 U+2B000 的头一个码元是
+  `\uD86C`，按码元它排在 U+F000 之前，按字节它更大。新增 `ConsumerGroup.NAME_ORDER` 逐码点比，
+  XINFO 两支的行序共用它；`perConsumerPending()` 的 `TreeMap` 也从自然序换过来 ——
+  `XPENDING` 摘要第 4 项里的那些消费者行（`:2079-2089` 遍历的还是那棵消费者 rax）走的是同一条序。
+- `XINFO GROUPS` 在没有任何组时交 `*0`，不是 null 数组：`:2590` 那一支在
+  `s->cgroups == NULL` 时发的就是 `addReplyMultiBulkLen(c, 0)`。`RespArray.nullArray()` 发的是
+  `*-1`，客户端把它读成"这个键不存在"。
+- **自证是七支变异，全 KILLED**（`code_mut.py` 新增 W 族，日志 `code_W1.log`…`code_W7.log`，
+  每支跑完都从本次快照按字节还原并 md5 对账，`CommandHandler.java` 回到 `bc555595…`、
+  `ConsumerGroup.java` 回到 `12d8ca22…`）：W1 摘掉 `last-delivered-id` 那一对、
+  W2 把位点按有符号十进制渲染、W3 把 GROUPS 的行序倒过来、W4 让 CONSUMERS 不排序、
+  W5 把 `NAME_ORDER` 换成 `String::compareTo`、W6 让 `perConsumerPending()` 退回自然序、
+  W7 让空组表交 `*-1`。七支红的都是这一条增量钉的东西，没有一支靠"编译不过"归红。
+- **跑 W 族之前先修了尺自己的一处坑，两个受害者都是量出来的**：选取器里点名的
+  `xreadOptionSentencesFollowsTheReference` 在类里根本不存在（真名没有那个 `s`），而
+  surefire 对 `-Dtest=Class#不存在的方法`**不报错，只是那一条不跑**。同一条命令换名
+  A/B 实测：假名那一遍 `RedisServerProtocolSemanticsTest` 的 tally 是 `Tests run: 1`，
+  真名那一遍是 `Tests run: 2`（两侧 `BUILD SUCCESS` —— 它**不报错**，日志
+  `b65_selector_ab.log`）。这个名字我错在两处：既有 `XOPT`（V 族八支的选取器）里一处，
+  本轮新写的 `XINFX` 里另一处，两边各有一遍是在少跑用例的情况下报的 KILLED
+  （W 族第一遍的 tally 是 `Tests run: 6`，改正后 `7`；那一遍的日志被第二遍按同名覆盖，
+  留下的数只有下面 V1 这一遍可回读）。改正后 V1 重跑是 `Tests run: 23`
+  （协议类 2 + `StreamTest` 21），仍 KILLED。
+  并给量具加了一条 `code_mut.py selectors`：
+  把 12 个选取器里点名的每个方法拿测试类源码逐个回读，认不出就 FATAL；这条尺的牙是**注入一个
+  假名**验的（当场报出 4 条 FATAL）。V 族当时的结论不受影响 —— 那八支本来就是 KILLED，
+  多带读者不会把 KILLED 变成 SURVIVED；受影响的是反向情形：少跑的读者会让 SURVIVED 被误读成
+  "变异等价"，而真相只是"覆盖它的测试压根没跑"，那正是 P5 记过的同一个坑。
+
 
 ### Added
 - `RedisServer.serverScope()`：只读拿到本台那一份，测试与嵌入式据此判断作用域边界。
@@ -1048,6 +1108,41 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   这两遍是**含上面那处探针修改**之后跑的。中间那一遍红的（`b64_full2.log`，两例 `HTTP/1.1 400`）
   不是服务器行为退步，已按三条取证 + 注入现场 A/B 归到量具上，见上面那一节 —— 台账里留着它，
   是因为"同一棵树几分钟前全绿、中间只改了注释"这种红，最容易被人直接抹成"环境问题"而不留证据。
+- `ConsumerGroup.NAME_ORDER`（public 的码点序判据）+ `CommandHandler.sortedNames(...)`：
+  XINFO GROUPS / XINFO CONSUMERS 两支的行序、`perConsumerPending()` 的那份 `TreeMap`
+  从此共用一个判据，上游依据行号（:2568 / :2594 / :2079-2089）与"为什么不是
+  `String.compareTo`"都写在那一段注释里。
+- 新协议用例 `RedisServerProtocolSemanticsTest.xinfoGroupsRowsCarryTheGroupPositionAndComeOutInNameOrder`：
+  GROUPS 的 8 元素行逐行断言（含 `top` 那行的顶格无符号文本、`zeta` 那行 SETID 之后的 `7-7`）、
+  无组时 `*0`、CONSUMERS 逐元素（`*6` 一行、`$pending` 后跟 integer、`idle` 只读不钉值）、
+  码点 prey 两处（`xi:u` 的 GROUPS 行序、`xi:p` 的 XPENDING 汇总行序）、以及换名之后的
+  `xi:c` 那三行消费者（`c1:0 / c2:1 / c3:1`，"0 条的也要列"仍在这一格里）。
+- 最新这一轮的电池 `battery65.txt` **36 行**：`:2 :3 :4` 建流、`:5-:9` GROUPS 的插入序 vs 升序、
+  `:10-:15` 两个消费者与投递后的两张表、`:16` XACK、`:17-:18` SETID 之后回读位点、
+  `:19-:26` 一枚只有一个组的流（含 `XREADGROUP` 顺手建消费者那一格）、
+  `:27-:28` 顶格位点、`:29-:36` 换名之后的 CONSUMERS 行序 prey（含 `XPENDING` 汇总的对照）。
+  改前由 `b65_pre.jar` 量得（class 级 md5：`CommandHandler` `8edaa85f…` / `ConsumerGroup`
+  `ba36351d…`，前者与上一轮记在 `battery64` 那一条里的 `99af145` 那枚 class md5 相同）；
+  改后由 `b65_post.jar` 量得（`5a32d6b1…` / `8717c9b8…`，本轮工作树）；两侧各 `wrote=36 lost=none`
+  （`b65_replay_pre_rows36.log` / `b65_replay_post_rows36.log`），先各留了一份 28 行的旧账
+  （`battery65.pre.rows28` / `.post.rows28`）好把"新加的行"与"改动的行"分开算。
+  `zdiff.py` 的原始账是**真实不一致 8 行 + 顺序不同 1 行**；那 8 行里 `:12 :25` 只差 `idle`
+  （按噪声记账），剩下 `:9 :14 :18 :22 :24 :28` 六行加那行"顺序不同"的 `:35` 才是本增量的证据。
+- `code_mut.py` 涨到 **83 支 / 84 个锚点**（新增 W1-W7，`python3 code_mut.py W` 分族跑；
+  族名前缀的判断里加了 `W`）。**7 支全 KILLED**，红的句子逐支不同（见上面那一节的自证清单）。
+  U7 那一支的锚点因为 `entry.getKey()` → `cname` 这一次改名而落空，已同步改掉两处锚串
+  —— 改名会牵动锚点，这是量具该跟着走的形状，不是探针的错。
+- 量具多一道自证：`code_mut.py selectors` 把 12 个选取器里点名的每个测试方法拿测试类源码逐个
+  回读，认不出就 FATAL（surefire 对 `-Dtest=Class#不存在的方法` 不报错，只是那一条不跑）。
+  它的牙是注入一个假名验的：当场 4 条 FATAL 点名到探针。**顺带查出既有 XOPT 里同一个错名**，
+  V 族八支此前每支在那个类里只跑一条用例（换名 A/B 见 `b65_selector_ab.log`：
+  假名 `Tests run: 1`、真名 `Tests run: 2`，两边都 `BUILD SUCCESS`），
+  改正后 V1 重跑是 `Tests run: 23`、仍 KILLED。
+- 全量反应堆：**880 例全绿，连跑两遍**（`358 + 386 + 134 + 2`，四个模块各自 0 失败 0 错 0 跳过，
+  `b65_full2.log` 与 `b65_full3.log` 尾都是 `BUILD SUCCESS` / `full_rc=0`），core 从 385 抬到 386
+  （本轮新增那条协议用例）。跑 W 族之前先把快照换成本轮工作树的 `CommandHandler.java`
+  `bc555595…` / `ConsumerGroup.java` `12d8ca22…` / `StreamStore.java` `3113b87e…`
+  —— 那份 03:39 的旧快照装的是 XINFO 之前的字节，拿它还原会连本轮未提交的改动一起抹掉。
 
 ### 已知边界（这一版没动，说清楚）
 - RESP3 / `HELLO`、`EVAL` / `EVALSHA` / `SCRIPT` 依旧没有服务端实现，客户端 `DistributedLock`
@@ -1148,6 +1243,20 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
       `battery59:30`（键存在）我们回 `:1`，5.0.14 会回 `Unknown subcommand … 'CREATECONSUMER'`。
       另外那一支"消费者已存在该回 `:0`"（6.2 的语义）我们无条件回 `:1`，
       手头的 5.0.14 判不了它对不对，要动这一条得先把权威换成 6.2 的源码。
+  - **CONSUMERS 的行序这一格赌的是哈希表的遍历序，不是结构**（本轮实测：改前那个 jar 在
+    `c2`/`c3`/`c1` 上交回 `c3 c1 c2`，W4 因此红）。换 JDK、换 `Consumer` 的哈希实现、甚至换一组
+    名字都可能让天然遍历序恰好等于升序 —— 那时断言仍绿而变异会 SURVIVED，也就是**这一格的牙会
+    悄悄掉**。要钉死它得让 `ConsumerGroup.consumers` 本身就是一棵有序表（TreeMap + `NAME_ORDER`），
+    那样"不排序"这一支就结构上打不出来，代价是每次 `getOrCreateConsumer` 都走比较器；本轮没动，
+    因为先要的是"改前测得到、改后答得对"这条证据链，不是把口子换成另一种写法。
+  - **`XINFO STREAM` 交回的是 4 个元素（两对：`length` / `groups`，`CommandHandler.java:3188-3193`），
+    上游是 14 个（七对）**：`t_stream.c:2612` 写的是 `addReplyMultiBulkLen(c,14)`，
+    `:2613-2622` 依次是 `length`、`radix-tree-keys`、`radix-tree-nodes`、`groups`、
+    `last-generated-id`，` :2624-2637` 再补 `first-entry`、`last-entry` 那两对
+    （走 `streamReplyWithRange`，表空时要 `addReply(c,shared.nullbulk)` 交 `$-1`）。
+    这一支没在本轮做，因为它要先决定两件事：`radix-tree-keys` / `radix-tree-nodes` 是 rax 的
+    内部量、我们的 `LinkedHashMap` 表示里根本没有对应的数（拿条目数冒充就是假遥测），
+    以及 `first-entry` / `last-entry` 要把整条条目嵌套渲染。这两条都得先定口径，不是补字段名。
   - **`delivery_count` / `delivery_time`**：上游每次经 PEL 重交条目都会抬这两个值
     （:1111-1113），`XPENDING` 的逐条目形式与 `XCLAIM` 都读它。我们的 PEL 只有
     `Map<String, String>`（条目 → 消费者），这两个值没有读者，所以这一支不写；
