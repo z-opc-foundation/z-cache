@@ -3028,6 +3028,9 @@ public class CommandHandler {
      * XPENDING 仍然报每个消费者 0 条。明细形态（IDLE / start end count [consumer]）要按
      * 每条的投递时间过滤，而我们的 PEL 只记 entryId -&gt; consumer，所以现在是明确报错，
      * 不再像以前那样把多余参数丢掉、拿汇总冒充明细。
+     * <p>
+     * 汇总那四项的<b>形状</b>也照上游钉住了（PEL 空时第 4 项是 null 数组；非空时不列手上没货
+     * 的消费者），两条各自落在哪一行、为什么不能共用一份口径，见下面那段注释。
      */
     private Object handleXpending(String[] args) {
         if (streams() == null) return RespError.of("ERR", "Stream not configured");
@@ -3051,20 +3054,41 @@ public class CommandHandler {
         String lowestId = (String) summary[1];
         String highestId = (String) summary[2];
 
-        com.zifang.z.cache.core.stream.Stream stream = streams().getStream(currentDb, args[1]);
-        com.zifang.z.cache.core.stream.ConsumerGroup group = stream == null ? null : stream.getGroup(args[2]);
-        Map<String, Long> perConsumer = group == null
-                ? java.util.Collections.<String, Long>emptyMap() : group.perConsumerPending();
-        List<Object> rows = new ArrayList<>(perConsumer.size());
-        for (Map.Entry<String, Long> entry : perConsumer.entrySet()) {
-            rows.add(RespArray.of(RespBulkString.of(entry.getKey()),
-                    RespBulkString.of(Long.toString(entry.getValue()))));
+        // 上面 summary 非 null 这件事本身就是"键和组都在"的凭据（StreamStore.xpending 只在
+        // 两者都缺时才回 null），所以这里不再走一遍 null 分支：走一遍就等于多一条"组不见了"
+        // 的路径，而那条路径上真正该发生的是报错而不是悄悄回一份空的消费者清单。
+        com.zifang.z.cache.core.stream.ConsumerGroup group =
+                streams().getStream(currentDb, args[1]).getGroup(args[2]);
+        // 第 4 项的两条规矩都在上游，且都是"看着像、其实不是"那一类：
+        // <ul>
+        //   <li>:2059-2062 —— PEL 空时回的是 {@code shared.nullmultibulk}，也就是线上的一行
+        //       {@code *-1}，而<b>不是</b> {@code *0}。RESP 里这是两个不同的值：{@code *0} 说
+        //       "有零个消费者"，{@code *-1} 说"这一项没有"。客户端按 null 分支，收到 *0 会去
+        //       遍历一个空列表、把"零"当成一个真实读数。</li>
+        //   <li>:2086 —— PEL 非空时，{@code if (raxSize(consumer->pel) == 0) continue;}：
+        //       手上已经没货的消费者不出现在这份清单里。</li>
+        // </ul>
+        // 第二条只能做在命令层，不能塞进 {@code perConsumerPending()}：XINFO CONSUMERS 在
+        // :2568 是按 {@code raxSize(cg->consumers)} 整份列出的（含 0 条的）。今天下沉也红不了
+        // ——那一支自己遍历 getConsumers()、计数用 getOrDefault(…, 0L) 兜底，实测等价（探针 U4），
+        // 但把 :2086 写进共用口径，就是让下一个读者替这一跳买单。
+        // 种子行与那道兜底互为备份，两支单独打都不红、一起打才炸（XINFO 的计数拿到 null），
+        // 所以这里既不跟着删种子行、也不把兜底摘掉。
+        Object consumers = RespArray.nullArray();
+        if (pendingCount > 0) {
+            List<Object> rows = new ArrayList<>();
+            for (Map.Entry<String, Long> entry : group.perConsumerPending().entrySet()) {
+                if (entry.getValue() == 0L) continue;
+                rows.add(RespArray.of(RespBulkString.of(entry.getKey()),
+                        RespBulkString.of(Long.toString(entry.getValue()))));
+            }
+            consumers = RespArray.of(rows.toArray());
         }
         return RespArray.of(
                 RespInteger.of((int) pendingCount),
                 lowestId != null ? RespBulkString.of(lowestId) : RespBulkString.nullBulkString(),
                 highestId != null ? RespBulkString.of(highestId) : RespBulkString.nullBulkString(),
-                RespArray.of(rows.toArray())
+                consumers
         );
     }
 

@@ -136,9 +136,18 @@ public class ConsumerGroup {
     }
 
     /**
-     * 每个消费者手上还压着多少条没 ACK（包括 0 条的，Redis 的汇总也列出它们）。
+     * 每个消费者手上还压着多少条没 ACK，<b>含 0 条的</b>，按名字升序。
+     * <p>
      * 数字从 {@link #pendingEntries} 现算，不去信那个自增计数器——两边口径一旦漂移，
      * XPENDING 报的就是一份对不上账的数。
+     * <p>
+     * 列 0 条的是给 XINFO CONSUMERS 用的（上游 t_stream.c:2568 按 {@code raxSize(cg->consumers)}
+     * 整份列出），而 XPENDING 的汇总<b>不</b>列 0 条的（:2086 那句 {@code continue}），那一跳留在
+     * 命令层。两边今天其实互相冗余：XINFO 那一支自己遍历 {@code getConsumers()}，
+     * 计数走 {@code getOrDefault(…, 0L)}，所以把种子行整段摘掉（探针 U4）或把那道兜底换成裸
+     * {@code get(…)}（探针 U7）单独打都不红 —— 等价变异；<b>两支一起打才炸</b>，XINFO 的计数
+     * 拿到 null。留着的理由就落在这对备份上：种子行与兜底删一侧不改行为，同时删才是缺陷，
+     * 而 :2086 那一跳要有东西可跳才是它被量到的形状。
      */
     public Map<String, Long> perConsumerPending() {
         Map<String, Long> counts = new java.util.TreeMap<>();

@@ -692,6 +692,46 @@ All notable changes to z-cache will be documented in this file.
     换成真把 HELP 提到闸之前才红在那句"键必须存在"上。探针池 52→**61 支 / 62 个锚点**。
 
 
+#### XPENDING 摘要的第 4 项：PEL 空时交的是"没有这一项"，不是"零个消费者"
+
+上一轮把这两处形状量出来记在下面的"已知边界"里，这一轮把它闭上。权威仍是 5.0.14 的 `t_stream.c`：
+
+- `:2059-2062` —— PEL 为空时 `start` / `end` 答 `shared.nullbulk`，第 4 项答
+  `shared.nullmultibulk`。RESP 里 `*-1` 与 `*0` 是两个不同的值：`*0` 说"有零个消费者"，
+  `*-1` 说"这一项没有"。按 null 分支的客户端收到 `*0` 会去遍历一个空列表，把"零"当成一个真实读数。
+- `:2086` —— PEL 非空时 `if (raxSize(consumer->pel) == 0) continue;`：手上已经没货的消费者
+  不出现在这份清单里。
+- 改前的三行读数各自打自己的脸（`battery63.pre`，整份 10 行）：`:4`（组刚建、还没人读过）=
+  `:0;$-;$-;*[]` —— 总账 0 条却交一份"零个消费者"的清单，该是 `*-1`；`:7`（c1 手上 1 条，
+  c2 是 `XGROUP CREATECONSUMER` 造的 0 条）= `:1;$"1-1";$"1-1";*[[c1,$"1"],[c2,$"0"]]` ——
+  清单里那条 `c2` 不该出现；`:10`（`XACK` 之后账已清而两个消费者都还在）=
+  `:0;$-;$-;*[[c1,$"0"],[c2,$"0"]]` —— 一行同时违两条规矩，总账说 0 而清单挂着两条各 0。
+- **顺带纠正 1.3.5 记的一句**：下面 `#### XPENDING 有三处对不上账` 写着"账上为 0 的消费者也照常
+  列出（Redis 的汇总就包含它们）"。那句是假的，`:2086` 恰好相反 —— 汇总**不**列 0 条的，列 0 条的
+  是 `XINFO CONSUMERS`（`:2568` 按 `raxSize(cg->consumers)` 整份列出）。历史那节不改写，以本节为准。
+- 修法只做在命令层（`handleXpending`）：那道 `continue` 不能下沉进 `ConsumerGroup.perConsumerPending()`
+  —— 同一份行数同时是 XINFO CONSUMERS 的计数来源，两个读者要两种形状。同一趟去掉两处已经接不上的
+  null 兜底：`summary` 非 null 本身就已经是"键与组都在"的凭据，再走一遍 null 分支等于多造一条
+  "组不见了却悄悄回一份空清单"的路径，而那条路上该发生的是报错。
+- 顺带量出来的一件事：`perConsumerPending()` 里"给每个消费者种一条 0"那三行，与 XINFO 那侧的
+  `getOrDefault(…, 0L)` 兜底**互为备份** —— 探针 U4（删种子行）与 U7（摘兜底）各单打都不红，
+  两支一起打才炸（XINFO 的计数拿到 `null` 再 `intValue()` 就抛，`b63_U4U7_combined.log` 里两条
+  `NullPointerException`）。所以这两处今天是一对冗余保护，而不是我上一轮写进注释的那句"共用一份
+  口径就必有一边说假话" —— 那句被自己的量具当场证伪，三处注释已按实测改写。
+- 新钉的形状（`RedisServerProtocolSemanticsTest.xpendingSummaryShapeFollowsTheReference`，
+  逐元素读线上字节）：`*4`、总数是 integer、`start` / `end` 空时 `$-1`、第 4 项空时 `*-1`、
+  消费者行是 `*2` 而里面的计数是 **bulk 串**（`:2089` 那句 `addReplyBulkLongLong`）。同一个现场
+  还断言 `XINFO CONSUMERS` 必须仍看到 c2，而它那一格 pending 是 **integer**（`:2582` 的
+  `addReplyLongLong`）—— 两个命令对同一个数用两种类型是上游故意的不对称，谁将来"统一"一下就红。
+- 具名变异：`code_mut.py` 的 U 族 7 支（`python3 code_mut.py U`），**5 KILLED / 2 SURVIVED**
+  （存活的那两支正是上面那对备份 U4 / U7，记为等价变异而不是缺口），探针池 61→**68 支 / 69 个锚点**。
+  U1 与 U3 都会让"PEL 空"那一格回 `*0`，但红在不同段落：U1 被第一块钉住（那时还没有任何消费者），
+  U3 只被最后一块钉住（账已清而 c1/c2 还在）—— 后面那一块才是"把判据写成有没有消费者"这种答法的
+  照妖镜。U5 红在两支：新测试那句 `$1`，以及 1.3.5 就写下的 `contains("[c1, 2]")` —— 我原先以为
+  `readReplyDeep` 把类型前缀抹平了，实测证伪：integer 它照样带 `:`，那一句一直对类型敏感。
+  U6 才是改前真没人看过的一格（改前没有任何断言读过"空 PEL 时的 `start` / `end`"）。
+
+
 ### Added
 - `RedisServer.serverScope()`：只读拿到本台那一份，测试与嵌入式据此判断作用域边界。
 - `StreamIdFormat`（z-cache-common）：stream ID 的唯一文法（uint64 两段、`-` / `+` 两种位置、
@@ -860,8 +900,9 @@ All notable changes to z-cache will be documented in this file.
 - `battery61.txt` 13 行是**为了给一个病定年代而写的**：四个组分别起步于 `MAX-MAX` / `2^63-0` /
   `0-0` / `1-MAX`，每个组后面紧跟一次 `>` 读。它在 `jar_setid_pre` 与 `jar_setid_post` 上
   **逐行相同**（`battery61.pre` 与 `battery61.post` diff 为空），因此"顶格位置读起来像流起点"
-  不是 SETID 带进来的；修完才翻 4 行。`battery62.txt` 10 行是下一轮的改前面
-  （XPENDING 摘要那两处形状，见下面的已知边界）。
+  不是 SETID 带进来的；修完才翻 4 行。`battery62.txt` 10 行是 XPENDING 摘要那两处形状的改前面，
+  本轮闭上：那一轮另写 `battery63.txt` 10 行，改前后读数与成因见上面
+  `#### XPENDING 摘要的第 4 项` 那一节。
 - `code_mut.py` 涨到 **61 支 / 62 个锚点**（新增 T1-T9，`python3 code_mut.py T` 分族跑）。
   T 族的选取器必须同时带上新方法与对岸那一侧的 `debugSubcommandGrammarMatchesTheReference`，
   因为 `helpStatusArray` 是两个 HELP 共用的渲染器 —— 只跑 XGROUP 那侧等于没量 DEBUG 那侧的读者。
@@ -871,6 +912,43 @@ All notable changes to z-cache will be documented in this file.
 - 全量反应堆：**877 例全绿，连跑两遍**（`358 + 383 + 134 + 2`，四个模块各自 0 失败 0 错 0 跳过，
   `b60_full.log` 与 `b60_full2.log` 尾都是 `BUILD SUCCESS`），core 从上一轮的 382 抬到 383
   （本轮新增一条协议用例）。第二遍是在测试文件又加了一格（`XGROUP HELP <不在的键>`）之后跑的。
+- 最新这一轮的电池 `battery63.txt` 10 行（`:1` PING、`:2 :3` 建流与组、`:4` 空 PEL 的汇总、
+  `:5` c1 读走一条、`:6` **`XGROUP CREATECONSUMER` 现造一个 0 条的消费者**、`:7` 非空 PEL 的汇总、
+  `:8` XINFO CONSUMERS（同一个现场的反向对照：c2 必须仍在且报 `pending, :0`）、`:9` XACK、
+  `:10` 回到空 PEL）：改前 `battery63.pre` 由按 HEAD 内容重建的 `b63_pre.jar` 量得，改后由工作树
+  重建的 jar 量了三遍（`battery63.post` / `.post2` / `.post3`）。**翻 3 行（`:4 :7 :10`）**，
+  `:8` 只差 `idle`（现量时间不是行为；`post` 与 `post3` 逐行相同、`post2` 与 `post3` 也只差那一格）。
+  两侧各再重放一遍留磁盘证据：`battery63.pre2` 由 `b63_pre.jar` 重放（`b63_replay_pre.log`
+  `wrote=10 lost=none`），`battery63.post3` 由 `b63_post3.jar` 重放（`b63_replay4.log` 同）——
+  同一枚 jar 两遍各自只差 `:8` 的 `idle`（改前侧 `pre` 与 `pre2` 也只有那一行不同），
+  而 `pre2` 与 `post3` 之间翻的正是那 3 行。
+- 一份要写进制度的构建坑：**z-cache 的树搬到 monorepo 之外就编不出能跑的包**。根 pom 的
+  `<parent> com.zifang:z-opc:1.0.0-SNAPSHOT` 带 `<relativePath>../pom.xml</relativePath>`，
+  出了 monorepo 那个父 pom 解析不到、静默退到 m2 里的旧构件，于是 shaded jar 塞的是
+  `z-cache-common:jar:1.3.1`（里面根本没有 `StreamIdFormat` / `RespFrameReader`），服务器起不来、
+  重放只报 `NO PONG`。`git archive HEAD` 的导出树和普通目录拷贝都踩这一条，而且两次都伪装成
+  "被测的东西坏了"。所以改前面那枚 jar 只能在**树内**用 `git show HEAD:` 覆盖那两个文件、
+  建完按 md5 还原（工具 `b63_prestate.sh`，收尾打印两侧 md5 与 `git status`）。
+  重放用的 jar 从此一律过两道新鲜度闸：构建日志含 `Including io.github.yuku123:z-cache-common:jar:1.3.6`、
+  包内有 `com/zifang/z/cache/common/protocol/StreamIdFormat.class`（本轮实测 12 个 common class 条目）。
+- 三枚 jar 的身份（class 级 md5；整包 md5 只作参照）：`b63_pre.jar` CH `26e5ff49…` /
+  CG `be8d543f…`（= HEAD 那棵树）、`b63_post.jar` CH `6b67d9d2…` / CG `56f3d0bb…`、
+  `b63_post3.jar` CH `15bb4380…` / CG `1e66b6d6…`（注释按 U4/U7 的实测改写之后）。
+  三枚的线上读数只差 `idle` —— "行号表让 class md5 漂、行为字节没漂"那条在这里第三次复现。
+- `code_mut.py` 涨到 **68 支 / 69 个锚点**（新增 U1-U7，`python3 code_mut.py U` 分族跑；
+  族名前缀的判断里加了 `U`）。U 族的选取器 `XPEN` 必须连 `xinfoConsumersRepliesWithConsumerRows`
+  与 `streamFamilyHoldsTheSameOneTypeInvariant` 一起带上：U4/U7 打的是 XINFO 那一侧的读数来源，
+  只跑 XPENDING 那两个方法等于没量它。
+  **U7 最初写成了 U4 的逐字节副本**（同文件、同锚点串、同替换），也就是"68 支"里有一支是空跑的 ——
+  把两支的定义串摆在一起才看出来。重写成反方向那一支（摘掉 XINFO 的 `getOrDefault` 兜底）后
+  单独打 SURVIVED（与 U4 同族：种子行保证键必在），再手打一次两支合并确认它会炸
+  （`b63_U4U7_combined.log`：两条 `Cannot invoke "java.lang.Long.intValue()" because … get(…) is null`，
+  4 例红 2 例）。合并那一次是手工改的，收口从 `code_snapshot/*.orig` 用 `cp` 还原并核 md5。
+- 快照换成本轮工作树的 `CommandHandler.java` `6d7574cd…` 与 `ConsumerGroup.java` `8ee71f91…`；
+  U 族 7 支逐支回读，还原行都写着"与副本逐字节同"。
+- 全量反应堆：**878 例全绿**（`358 + 384 + 134 + 2`，四个模块各自 0 失败 0 错 0 跳过，
+  `b63_full.log` / `b63_full2.log` 尾都 `BUILD SUCCESS`），core 从上一轮的 383 抬到 384
+  （本轮新增一条协议用例）。第二遍 `b63_full2.log` 是在注释按 U4/U7 实测改写之后跑的。
 
 ### 已知边界（这一版没动，说清楚）
 - RESP3 / `HELLO`、`EVAL` / `EVALSHA` / `SCRIPT` 依旧没有服务端实现，客户端 `DistributedLock`
@@ -947,15 +1025,14 @@ All notable changes to z-cache will be documented in this file.
     - `XPENDING` 的逐条目形式仍明确拒绝：`battery55:39 :40 :41` 三行都回
       `-ERR XPENDING detail form (IDLE / start / end / count) is not supported`；摘要形式 `:45`
       回 `:1 / "1-1" / "1-1" / [[c55,1]]`。
-    - **`XPENDING` 的摘要形式有两处形状不合，本轮新量出来（`battery62` 10 行，
-      改前即现在的树 `battery62.post`）**：
-      一是 PEL 空的时候第 4 项该是 **null 数组**（:2059-2062 连 `start`/`end` 一起答三个 null，
-      实测 `:0;$-;$-;*0`）；二是 PEL 非空时**手上没东西的消费者要被跳过**
-      （:2086 那句 `if (raxSize(consumer->pel) == 0) continue;`，实测 `:1;"2-2";"2-2";[[c1,"0"],[c2,"1"]]`
-      里那个 `c1` 不该出现）。第二条的成因很清楚也很坑：这份行数是
-      `ConsumerGroup.perConsumerPending()` 给的，它按设计**包括 0 条的消费者**，因为
-      `XINFO CONSUMERS` 要的就是那个形状（`battery` 里早就钉过）—— 两个读者要两种形状，
-      共用一个来源就一定有一侧错。这一处与上面的逐条目形式是同一支的活，另开一轮。
+    - **`XPENDING` 的摘要形式那两处形状不合：本轮已经闭上，留这一行只为把当轮的现场读数与成因
+      纠正对齐**（量出来时记的是 `battery62` 10 行，改前现场 `battery62.post`；修的那一轮另写
+      `battery63.txt` 10 行，读数见上面 `#### XPENDING 摘要的第 4 项` 那一节）：PEL 空时第 4 项交
+      `*-1`（:2059-2062 的 `shared.nullmultibulk`），PEL 非空时手上没货的消费者被跳过（:2086 那句
+      `continue`）。当时那句"两个读者要两种形状，共用一个来源就一定有一侧错"是错的，一并纠正：
+      XINFO 那一支自己遍历 `getConsumers()`、计数用 `getOrDefault(…, 0L)` 兜，与
+      `perConsumerPending()` 的种子行互为备份（两支变异各单打都不红、一起打才炸）。
+      **同一支里仍没做的还剩逐条目形式**（上面那一支）。
     - `XSETID` / `XCLAIM` / `XAUTOCLAIM` 三行（`battery55:36 :37 :38`）都回
       `-ERR unknown command '…'`。
     - **`XGROUP CREATECONSUMER` 没有权威可比**：`battery55:44` 对已存在的消费者回 `:1`。

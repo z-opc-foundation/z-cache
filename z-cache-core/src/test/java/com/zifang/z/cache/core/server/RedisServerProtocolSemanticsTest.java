@@ -802,7 +802,9 @@ class RedisServerProtocolSemanticsTest {
      * XPENDING 的汇总形式要给出每个消费者的真实待确认数。
      * <p>
      * 旧实现填的是 {@code consumer.getPendingCount()} —— 那个字段从没自增过，恒为 0。
-     * 现在按 pending 表算，账上为 0 的消费者也不再被抹掉。
+     * 现在按 pending 表现数。至于"账上为 0 的消费者列不列"是另一问，而且两问答案相反
+     * （汇总不列、XINFO CONSUMERS 列），那一问钉在
+     * {@link #xpendingSummaryShapeFollowsTheReference}。
      */
     @Test
     void xpendingReportsRealPerConsumerCounts() throws Exception {
@@ -842,6 +844,87 @@ class RedisServerProtocolSemanticsTest {
             send(socket, "XPENDING", "sem:pending", "nosuchgroup");
             String missing = readReply(in);
             assertTrue(missing.startsWith("-NOGROUP"), "组不存在要报 NOGROUP: " + missing);
+        } finally {
+            server.stop();
+            thread.join(DEADLINE_MS);
+        }
+    }
+
+    /**
+     * XPENDING 汇总第 4 项的形状，两处都是"看着像、其实不是"：
+     * <ul>
+     *   <li>PEL 空时上游发 {@code shared.nullmultibulk}（t_stream.c:2059-2062），线上一行
+     *       {@code *-1}；我们发的是 {@code *0}。RESP 里这是两个值：{@code *0} 说"有零个消费者"，
+     *       {@code *-1} 说"这一项没有"。按 null 分支的客户端会把前者当成一个真实读数。</li>
+     *   <li>PEL 非空时 :2086 那句 {@code if (raxSize(consumer->pel) == 0) continue;} 跳过
+     *       手上没货的消费者；我们照单全列，于是多出一行 {@code [c2, "0"]}。</li>
+     * </ul>
+     * 两条都只能在命令层修：同一个现场 XINFO CONSUMERS（:2568 按 {@code raxSize(cg->consumers)}
+     * 整份列出）必须仍看到 c2，所以下面把两个读者放在一起断言。一句实话打底：这一句阳性对照
+     * <b>拦不住</b>"把过滤下沉进 {@code perConsumerPending()}"那种改法 —— XINFO 那一支自己遍历
+     * {@code getConsumers()}、计数用 {@code getOrDefault(…, 0L)} 兜，下沉之后两侧都绿（探针 U4
+     * 实测 SURVIVED，等价变异）。它拦的是"0 条这个读数本身有没有人钉"。
+     * 补一支反方向的 U7（把那道兜底换成裸 {@code get(…)}）：单独打同样不红，因为
+     * {@code perConsumerPending()} 的种子行保证了键必在；<b>U4 与 U7 一起打才炸</b>（XINFO 的计数
+     * 拿到 null），所以这两处是一对备份，不是两处各有人读的口径。
+     */
+    @Test
+    void xpendingSummaryShapeFollowsTheReference() throws Exception {
+        int port = freePort();
+        RedisServer server = new RedisServer("127.0.0.1", port, 0);
+        Thread thread = startAndWait(server, port);
+        try (Socket socket = connect(port)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+
+            send(socket, "XADD", "xp:shape", "1-1", "a", "1");
+            assertEquals("1-1", readReply(in));
+            send(socket, "XGROUP", "CREATE", "xp:shape", "g", "0-0");
+            assertEquals("+OK", readReply(in));
+
+            send(socket, "XPENDING", "xp:shape", "g");
+            assertEquals("*4", readWireReply(in), "addReplyMultiBulkLen(c,4)");
+            assertEquals(":0", readWireReply(in));
+            assertEquals("$-1", readWireReply(in), "start 是 nullbulk");
+            assertEquals("$-1", readWireReply(in), "end 是 nullbulk");
+            assertEquals("*-1", readWireReply(in), ":2062 那一支发 nullmultibulk，不是空数组");
+
+            // 领走那一条，PEL 就此非空
+            send(socket, "XREADGROUP", "GROUP", "g", "c1", "COUNT", "1", "STREAMS", "xp:shape", ">");
+            assertTrue(readReplyDeep(in).contains("1-1"), "先确认真的投递过");
+            // 再造一个"存在而手上没货"的消费者。CREATECONSUMER 是 6.2 才有的（本仓提前做了），
+            // 这里只当量具用：不为测它，只为造出 :2086 那句 continue 的现场。
+            send(socket, "XGROUP", "CREATECONSUMER", "xp:shape", "g", "c2");
+            assertEquals(":1", readReply(in));
+
+            send(socket, "XPENDING", "xp:shape", "g");
+            assertEquals("*4", readWireReply(in));
+            assertEquals(":1", readWireReply(in));
+            assertEquals("$1-1", readWireReply(in));
+            assertEquals("$1-1", readWireReply(in));
+            assertEquals("*1", readWireReply(in), ":2086 跳过 PEL 为空的 c2，只剩一项");
+            assertEquals("*2", readWireReply(in));
+            assertEquals("$c1", readWireReply(in));
+            assertEquals("$1", readWireReply(in), "计数是 addReplyBulkLongLong，不是 integer");
+
+            // 阳性对照：同一个现场 XINFO CONSUMERS 必须仍列出 0 条的 c2。顺带能看见两问的
+            // 计数不同形：这里是 :2582 的 addReplyLongLong（integer），而 XPENDING 那一行是
+            // :2089 的 addReplyBulkLongLong（bulk）—— 同名同数，类型是两个命令各自的。
+            send(socket, "XINFO", "CONSUMERS", "xp:shape", "g");
+            String consumers = readReplyDeep(in);
+            assertTrue(consumers.contains("[name, c1, pending, :1"), consumers);
+            assertTrue(consumers.contains("[name, c2, pending, :0"),
+                    "XINFO CONSUMERS 按整份消费者表列，含 0 条的: " + consumers);
+
+            send(socket, "XACK", "xp:shape", "g", "1-1");
+            assertEquals(":1", readReply(in));
+            // 账清了。此刻 c1、c2 两个消费者都还在，所以第 4 项回到 *-1 钉的是"PEL 空"这个判据，
+            // 而不是"有没有消费者"—— 后者会做出一个能过前三行、过不了这一段的答案。
+            send(socket, "XPENDING", "xp:shape", "g");
+            assertEquals("*4", readWireReply(in));
+            assertEquals(":0", readWireReply(in));
+            assertEquals("$-1", readWireReply(in));
+            assertEquals("$-1", readWireReply(in));
+            assertEquals("*-1", readWireReply(in), "消费者还在而 PEL 已空，仍是 null 数组");
         } finally {
             server.stop();
             thread.join(DEADLINE_MS);
