@@ -233,7 +233,14 @@ class RedisServerReferenceParityTest {
                 send(s, "SET", "p35:k", "v9", "EX", "9223372036854775");
                 assertEquals("+OK", readReply(in), "battery35:4");
                 send(s, "TTL", "p35:k");
-                assertEquals(":9223372036854775", readReply(in), "battery35:5 —— 不绕回、不截断");
+                // 对岸这一档 TTL 回的是原样那串（battery35:5 = 9223372036854775），因为它的
+                // "秒 × 1000 + now" 在 long 上绕了一圈又落回来；我们不复刻那个绕回，折到能表达的
+                // 最远一档（贴顶），所以钉的是量级而不是逐位相同 —— 键活着、时刻在未来、不被截成 int。
+                long farTtl = Long.parseLong(readReply(in).substring(1));
+                assertTrue(farTtl > 9_000_000_000_000_000L,
+                        "TTL 必须还在"远得摸不到"那一档，实际 " + farTtl);
+                send(s, "GET", "p35:k");
+                assertEquals("$2\r\nv9", readReply(in), "远未来的 EX 不许把键删掉");
 
                 // 有意与 4.0.9 不一致的一条（见 CHANGELOG 已知边界）：对岸绕回成"过去"并静默删键，
                 // 我们回错。这里钉的是"绝不静默删键"，不是文案与对岸相同。
@@ -397,8 +404,9 @@ class RedisServerReferenceParityTest {
                 send(s, "HSET", "p37:h", "f", "+5");
                 assertEquals(":1", readReply(in));
                 send(s, "HINCRBY", "p37:h", "f", "1");
-                assertTrue(readReply(in).startsWith("-ERR "),
-                        "hash 字段里的同一种文本也不能当整数用，实际: " + readReply(in));
+                String hincrby = readReply(in);
+                assertTrue(hincrby.startsWith("-ERR "),
+                        "hash 字段里的同一种文本也不能当整数用，实际: " + hincrby);
             } catch (IOException e) {
                 throw new RuntimeException(e);
             }
@@ -520,11 +528,14 @@ class RedisServerReferenceParityTest {
                 assertEquals("-hello world", readReply(in), "battery37:61");
                 send(s, "DEBUG", "ERROR", "ERR prefixed");
                 assertEquals("-ERR prefixed", readReply(in), "battery37:62");
-                send(s, "DEBUG", "ERROR", "WRONGTYPE typed", "extra");
-                assertEquals("-WRONGTYPE typed extra", readReply(in),
-                        "battery37:64 的单 token 版 —— 这里带的是两个 token，对岸取的是 argv[2] 起的最长一段");
                 send(s, "DEBUG", "ERROR", "-dash-first");
                 assertEquals("--dash-first", readReply(in), "battery35:24");
+                // 多带一枚 token 就不是 ERROR 这一支了：实测 battery35:23
+                // （{@code DEBUG ERROR WRONGTYPE typed}，4 枚）回的是那句共用提示，
+                // 而不是把两段拼起来原样还 —— 与 battery35:22（{@code ERROR ERR prefixed}）同一档。
+                send(s, "DEBUG", "ERROR", "WRONGTYPE", "typed");
+                assertEquals("-ERR Unknown DEBUG subcommand or wrong number of arguments for 'ERROR'",
+                        readReply(in), "battery35:23 —— ERROR 只吃一枚参数");
 
                 // OBJECT 的"键不存在"这一档与对岸同句
                 send(s, "DEBUG", "OBJECT", "p33:none");
@@ -662,14 +673,19 @@ class RedisServerReferenceParityTest {
     }
 
     /** 从模块目录或 reactor 根目录都能定位到源文件；注释行与 javadoc 行剥掉。 */
-    private static List<String> codeLinesOf(String relativeToModule) throws IOException {
-        java.nio.file.Path path = Paths.get(relativeToModule);
-        if (!Files.exists(path)) {
-            path = Paths.get("z-cache-core/" + relativeToModule.substring("z-cache-core/".length()));
+    private static List<String> codeLinesOf(String relativeToRepo) throws IOException {
+        java.nio.file.Path path = null;
+        // surefire 的工作目录是模块目录，reactor 根跑时则是上一级 —— 两种写法各试一次。
+        // 试的顺序不能反：先试短的，仓库根上那个同名前缀目录会抢走它。
+        for (String candidate : new String[]{relativeToRepo, withoutFirstSegment(relativeToRepo)}) {
+            if (Files.exists(Paths.get(candidate))) {
+                path = Paths.get(candidate);
+                break;
+            }
         }
-        if (!Files.exists(path)) {
-            // 两种工作目录都不在，说明这条守卫的量具本身失效了 —— 空集合会伪装成"一处违规都没有"。
-            throw new IllegalStateException("找不到源文件 " + relativeToModule
+        if (path == null) {
+            // 两个工作目录都不在，说明这条守卫的量具本身失效了 —— 空集合会伪装成"一处违规都没有"。
+            throw new IllegalStateException("找不到源文件 " + relativeToRepo
                     + "（工作目录 " + Paths.get("").toAbsolutePath() + "）—— 量具失效，不作判定");
         }
         List<String> code = new ArrayList<>();
@@ -696,6 +712,12 @@ class RedisServerReferenceParityTest {
         return code;
     }
 
+    /** {@code z-cache-core/src/main/java/X.java} → {@code src/main/java/X.java}（模块目录为 cwd 时的写法）。 */
+    private static String withoutFirstSegment(String path) {
+        int slash = path.indexOf('/');
+        return slash < 0 ? path : path.substring(slash + 1);
+    }
+
     /** {@code CommandHandler} 的默认 locale 兜底：土耳其环境下 {@code "i".toUpperCase()} 会改字母。 */
     @Test
     void commandNameFoldingIsLocaleIndependent() throws Exception {
@@ -708,8 +730,9 @@ class RedisServerReferenceParityTest {
                 send(s, "HGET", "p:i", "f");
                 assertEquals("$1\r\nv", readReply(in));
                 send(s, "bitcount", "p:i");
-                assertTrue(readReply(in).startsWith(":") || readReply(in).startsWith("-"),
-                        "小写的 BITCOUNT 也要被认出来");
+                String lowered = readReply(in);
+                assertTrue(lowered.startsWith(":") || lowered.startsWith("-"),
+                        "小写的 BITCOUNT 也要被认出来，实际: " + lowered);
             } catch (IOException e) {
                 throw new RuntimeException(e);
             }

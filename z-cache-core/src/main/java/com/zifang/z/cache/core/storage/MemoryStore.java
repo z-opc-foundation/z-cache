@@ -227,7 +227,7 @@ public class MemoryStore {
      * （battery37 第 56/57 行）。调用方负责先挡掉"乘一千会溢出"的那一段。
      */
     public boolean setexDb(int db, String key, long seconds, byte[] value) {
-        long expireAt = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(seconds);
+        long expireAt = saturatingExpireAt(TimeUnit.SECONDS.toMillis(seconds));
         putDb(db, key, new ValueWrapper(value == null ? null : value.clone(), expireAt));
         setKeyType(key, DataType.STRING, db);
         return true;
@@ -238,10 +238,24 @@ public class MemoryStore {
     }
 
     public boolean psetexDb(int db, String key, long milliseconds, byte[] value) {
-        long expireAt = System.currentTimeMillis() + milliseconds;
+        long expireAt = saturatingExpireAt(milliseconds);
         putDb(db, key, new ValueWrapper(value == null ? null : value.clone(), expireAt));
         setKeyType(key, DataType.STRING, db);
         return true;
+    }
+
+    /**
+     * 相对量折成绝对时刻，加不出正数就贴顶。
+     * <p>
+     * 绕回在参考实现里是实打实的事故：{@code SET k v EX 9223372036854776} 绕出一个<b>过去</b>
+     * 的时刻，于是"设置一个远未来的过期"这条命令当场把键删了（250 实测 battery35 第 6/7 行：
+     * 回 {@code +OK} 而 TTL 是 0）。命令层已经按 {@code Long.MAX_VALUE/1000} 挡掉了会乘溢出的
+     * 那一档，这里挡的是"乘得出来、加不上现在"的窄缝 —— 贴顶的意思是"永不到期"，
+     * 而不是把一次成功的回复变成一次删除。
+     */
+    private static long saturatingExpireAt(long relativeMillis) {
+        long now = System.currentTimeMillis();
+        return relativeMillis > Long.MAX_VALUE - now ? Long.MAX_VALUE : now + relativeMillis;
     }
 
     public boolean setIfAbsent(String key, byte[] value) {
@@ -469,7 +483,7 @@ public class MemoryStore {
                 }
                 return false;
             }
-            long expireAt = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(seconds);
+            long expireAt = saturatingExpireAt(TimeUnit.SECONDS.toMillis(seconds));
             putDb(db, key, new ValueWrapper(wrapper.data, expireAt));
             return true;
         }
@@ -492,7 +506,7 @@ public class MemoryStore {
                 }
                 return false;
             }
-            long expireAt = System.currentTimeMillis() + milliseconds;
+            long expireAt = saturatingExpireAt(milliseconds);
             putDb(db, key, new ValueWrapper(wrapper.data, expireAt));
             return true;
         }

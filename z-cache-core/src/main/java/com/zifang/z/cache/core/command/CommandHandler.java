@@ -647,21 +647,20 @@ public class CommandHandler {
     }
 
     /**
-     * 把相对过期量（秒或毫秒）折成"还能落成一个真实绝对时刻"的毫秒数；折不动回 null。
+     * 把相对过期量（秒或毫秒）折成毫秒；折不动（秒乘一千会溢出）回 null。
      * <p>
-     * 两道溢出都要挡：乘那一千会绕回，加上当前时刻也会绕回。绕回在参考实现里是实打实的事故
-     * ——{@code SET k v EX 9223372036854776} 绕出一个过去的时刻，于是这条"设置远未来过期"
-     * 的命令变成了删键命令。宁可回错，不要把删键藏在一次成功回复里。
+     * 只管乘法那一道：加不上当前时刻的那一段窄缝由存储层贴顶处理（
+     * {@code MemoryStore#saturatingExpireAt}），因为对岸在那里绕回成了"过去" —— 实测
+     * {@code SET k v EX 9223372036854775} 回 {@code +OK} 且 TTL 就是这串秒数
+     * （battery35 第 4/5 行），而 {@code EX 9223372036854776} 绕回后 TTL 成 0、键当场不见
+     * （第 6/7 行）。把"永不到期"当成能表达的最远一档，才不至于让一次回复变成一次删除。
      */
     private static Long expireMillisOrOverflow(long value, boolean inSeconds) {
-        long ms;
-        if (inSeconds) {
-            if (value > Long.MAX_VALUE / 1000 || value < Long.MIN_VALUE / 1000) return null;
-            ms = value * 1000L;
-        } else {
-            ms = value;
+        if (!inSeconds) {
+            return Long.valueOf(value);
         }
-        return ms > Long.MAX_VALUE - System.currentTimeMillis() ? null : Long.valueOf(ms);
+        if (value > Long.MAX_VALUE / 1000 || value < Long.MIN_VALUE / 1000) return null;
+        return Long.valueOf(value * 1000L);
     }
 
     /**
@@ -816,8 +815,11 @@ public class CommandHandler {
      * syntax error（实测两样都是），所以这里跟着拒 —— 支持它等于对外承诺一种对岸没有的形状。
      */
     private Object handleBitcount(String[] args) {
-        if (args.length < 2 || args.length > 4) return RespError.wrongNumberOfArguments("BITCOUNT");
-        if (args.length == 3) return RespError.syntaxError();
+        // 三种个数三种答案（250 实测 battery33 第 85/86/68 行）：少了是 arity 错，
+        // 3 个参数（只给 start 不给 end）和 5 个以上都算 syntax error —— 多余的尾巴不并入
+        // arity 那一句，否则 {@code BITCOUNT k 0 1 BIT} 会被回成"参数个数不对"。
+        if (args.length < 2) return RespError.wrongNumberOfArguments("BITCOUNT");
+        if (args.length == 3 || args.length > 4) return RespError.syntaxError();
         long start = 0, end = -1;
         if (args.length == 4) {
             Long s = RedisIntegerFormat.parse(args[2]);
