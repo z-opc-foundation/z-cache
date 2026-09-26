@@ -71,6 +71,18 @@ public class MemoryStore {
     @SuppressWarnings("unchecked")
     private final ConcurrentHashMap<String, DataType>[] keyTypeMaps;
 
+    /**
+     * 每个数据库的过期时刻表：键名 -&gt; 绝对毫秒（{@code > 0} 才是真挂上了过期）。
+     * <p>
+     * 这个位置是照上游摆的：过期时刻<b>不在值对象里</b>。挂在值对象里等于把"过期时间"做成
+     * String 这一型的一个属性，六种键型里就只有有一种有地方放它 —— 而上游
+     * {@code expireGenericCommand}（{@code expire.c:415-451}）问的从来不是"这是什么类型"，
+     * 唯一的存在性闸是 {@code :426} 的 {@code lookupKeyWrite}，时刻存在每个库自己的那张
+     * {@code db->expire} 字典里。所以这里也是：键空间的属性，与值是什么类型无关。
+     */
+    @SuppressWarnings("unchecked")
+    private final ConcurrentHashMap<String, Long>[] expirations;
+
     /** 数据库数量 */
     private final int dbCount;
 
@@ -125,6 +137,7 @@ public class MemoryStore {
         this.setStores = new SetStore[dbCount];
         this.sortedSetStores = new SortedSetStore[dbCount];
         this.keyTypeMaps = new ConcurrentHashMap[dbCount];
+        this.expirations = new ConcurrentHashMap[dbCount];
         for (int i = 0; i < dbCount; i++) {
             stringStores[i] = new ConcurrentHashMap<>();
             hashStores[i] = new HashStore();
@@ -132,6 +145,7 @@ public class MemoryStore {
             setStores[i] = new SetStore();
             sortedSetStores[i] = new SortedSetStore();
             keyTypeMaps[i] = new ConcurrentHashMap<>();
+            expirations[i] = new ConcurrentHashMap<>();
         }
     }
 
@@ -144,6 +158,66 @@ public class MemoryStore {
 
     public Map<String, ValueWrapper> getStringStore(int db) { return stringStores[db]; }
 
+    // ==================== 过期时刻表 ====================
+
+    /**
+     * 这条键当前挂着的过期时刻（绝对毫秒）；没挂过期回 {@code -1}。
+     * <p>
+     * 只回答"表里写了什么"，不做"到点没到点"的判断，也不动表 —— 与原来读
+     * {@code ValueWrapper.expireAt} 那一栏一模一样。
+     */
+    public long expireAtDb(int db, String key) {
+        Long expireAt = expirations[db].get(key);
+        return expireAt == null ? -1L : expireAt;
+    }
+
+    /** 这条键是否挂过过期（时刻表里有没有它）。到点没到点不算在这一问里。 */
+    public boolean hasExpirationDb(int db, String key) {
+        return expirations[db].containsKey(key);
+    }
+
+    /**
+     * 这条键的过期时刻是否已经过去了。
+     * <p>
+     * 判过点而<b>不</b>顺手抹记录：调用方删的是整条键（值连同时刻一起没了），
+     * 而不是"只把时刻抹了、键留着"。原来 {@code ValueWrapper.isExpired()} 就是这个口径 ——
+     * 一次判红之后 {@code expireAt} 仍然读得到，靠的正是"没人清它"。
+     */
+    public boolean isExpiredDb(int db, String key) {
+        long expireAt = expireAtDb(db, key);
+        return expireAt > 0 && System.currentTimeMillis() > expireAt;
+    }
+
+    /**
+     * 该库时刻表的快照（键名 -&gt; 绝对毫秒）。返回的是副本，改它不影响存储。
+     * <p>
+     * 已过点却还没人碰过的键仍会出现在这里 —— 惰性删除的口径，判活要配 {@link #isExpiredDb}。
+     */
+    public Map<String, Long> expirationSnapshot(int db) {
+        return new HashMap<>(expirations[db]);
+    }
+
+    /**
+     * 挂上过期：{@code expireAt <= 0} 一律当成"取消"，时刻表里只存真时刻。
+     * <p>
+     * <b>要在 {@code putDb} 之前调用。</b>{@code putDb} 装到上限时会当场淘汰一个键，
+     * 而被淘汰的完全可能就是刚写进去的这一枚 —— 先记后写，{@link #evictOne} 那句
+     * {@code clearExpireAtDb} 才有机会把这一行一起收走；反过来就成了表里的一条无主记录。
+     * 时刻长在值上的年代不会有这个形状（键没了时刻跟着没）。
+     */
+    private void setExpireAtDb(int db, String key, long expireAt) {
+        if (expireAt > 0) {
+            expirations[db].put(key, expireAt);
+        } else {
+            expirations[db].remove(key);
+        }
+    }
+
+    /** 取消过期（或在键整个没掉之后回收它在时刻表里的记录）。 */
+    private void clearExpireAtDb(int db, String key) {
+        expirations[db].remove(key);
+    }
+
     // ==================== 类型管理 ====================
 
     /**
@@ -154,7 +228,7 @@ public class MemoryStore {
         if (type == null) {
             // 检查旧的 string store 兼容
             ValueWrapper wrapper = stringStores[db].get(key);
-            if (wrapper != null && !wrapper.isExpired()) {
+            if (wrapper != null && !isExpiredDb(db, key)) {
                 return DataType.STRING;
             }
             return DataType.NONE;
@@ -180,9 +254,10 @@ public class MemoryStore {
         // 惰性删除过期检查
         if (type == DataType.STRING) {
             ValueWrapper wrapper = stringStores[db].get(key);
-            if (wrapper != null && wrapper.isExpired()) {
+            if (wrapper != null && isExpiredDb(db, key)) {
                 stringStores[db].remove(key);
                 keyTypeMaps[db].remove(key);
+                clearExpireAtDb(db, key);
                 return DataType.NONE;
             }
         }
@@ -207,8 +282,9 @@ public class MemoryStore {
         }
         ValueWrapper wrapper = stringStores[db].get(key);
         if (wrapper != null) {
-            if (wrapper.isExpired()) {
+            if (isExpiredDb(db, key)) {
                 stringStores[db].remove(key);
+                clearExpireAtDb(db, key);
             } else {
                 return DataType.STRING;
             }
@@ -244,8 +320,12 @@ public class MemoryStore {
     }
 
     public boolean setDb(int db, String key, byte[] value) {
-        putDb(db, key, new ValueWrapper(value == null ? null : value.clone(), -1));
+        putDb(db, key, new ValueWrapper(value == null ? null : value.clone()));
         setKeyType(key, DataType.STRING, db);
+        // 整键覆盖要连过期一起清掉 —— 上游 setKey 的第三条就是这句："The expire time of the key
+        // is reset (the key is made persistent)"（db.c:216-224，removeExpire 在 :223）。
+        // 过去这件事是"新 wrapper 带着 -1 顶掉旧 wrapper"顺带做成的，现在时刻不在值上，得写明。
+        clearExpireAtDb(db, key);
         return true;
     }
 
@@ -259,8 +339,8 @@ public class MemoryStore {
      * （battery37 第 56/57 行）。调用方负责先挡掉"乘一千会溢出"的那一段。
      */
     public boolean setexDb(int db, String key, long seconds, byte[] value) {
-        long expireAt = saturatingExpireAt(TimeUnit.SECONDS.toMillis(seconds));
-        putDb(db, key, new ValueWrapper(value == null ? null : value.clone(), expireAt));
+        setExpireAtDb(db, key, saturatingExpireAt(TimeUnit.SECONDS.toMillis(seconds)));
+        putDb(db, key, new ValueWrapper(value == null ? null : value.clone()));
         setKeyType(key, DataType.STRING, db);
         return true;
     }
@@ -270,8 +350,8 @@ public class MemoryStore {
     }
 
     public boolean psetexDb(int db, String key, long milliseconds, byte[] value) {
-        long expireAt = saturatingExpireAt(milliseconds);
-        putDb(db, key, new ValueWrapper(value == null ? null : value.clone(), expireAt));
+        setExpireAtDb(db, key, saturatingExpireAt(milliseconds));
+        putDb(db, key, new ValueWrapper(value == null ? null : value.clone()));
         setKeyType(key, DataType.STRING, db);
         return true;
     }
@@ -300,8 +380,9 @@ public class MemoryStore {
             if (current != null) {
                 return false;
             }
-            putDb(db, key, new ValueWrapper(copy(value), -1));
+            putDb(db, key, new ValueWrapper(copy(value)));
             setKeyType(key, DataType.STRING, db);
+            clearExpireAtDb(db, key);
             return true;
         }
     }
@@ -313,8 +394,9 @@ public class MemoryStore {
     public byte[] getAndSetDb(int db, String key, byte[] value) {
         synchronized (stringStores[db]) {
             ValueWrapper current = getLiveWrapper(db, key);
-            putDb(db, key, new ValueWrapper(copy(value), -1));
+            putDb(db, key, new ValueWrapper(copy(value)));
             setKeyType(key, DataType.STRING, db);
+            clearExpireAtDb(db, key);
             return current == null ? null : copy(current.data);
         }
     }
@@ -342,7 +424,7 @@ public class MemoryStore {
             byte[] value = byteIndex < prefix.length ? prefix.clone() : Arrays.copyOf(prefix, byteIndex + 1);
             if (on) value[byteIndex] |= (byte) mask;
             else value[byteIndex] &= (byte) ~mask;
-            putDb(db, key, new ValueWrapper(value, current == null ? -1 : current.expireAt));
+            putDb(db, key, new ValueWrapper(value));
             setKeyType(key, DataType.STRING, db);
             return previous;
         }
@@ -377,7 +459,7 @@ public class MemoryStore {
             if (suffix != null) {
                 System.arraycopy(suffix, 0, value, prefix.length, suffix.length);
             }
-            putDb(db, key, new ValueWrapper(value, current == null ? -1 : current.expireAt));
+            putDb(db, key, new ValueWrapper(value));
             setKeyType(key, DataType.STRING, db);
             return value.length;
         }
@@ -407,8 +489,7 @@ public class MemoryStore {
             } catch (ArithmeticException e) {
                 throw new IllegalArgumentException("increment or decrement would overflow", e);
             }
-            putDb(db, key, new ValueWrapper(Long.toString(result).getBytes(StandardCharsets.UTF_8),
-                    current == null ? -1 : current.expireAt));
+            putDb(db, key, new ValueWrapper(Long.toString(result).getBytes(StandardCharsets.UTF_8)));
             setKeyType(key, DataType.STRING, db);
             return result;
         }
@@ -453,7 +534,7 @@ public class MemoryStore {
             int end = (int) (offset + suffix.length);
             byte[] out = Arrays.copyOf(existing, Math.max(end, existing.length));
             System.arraycopy(suffix, 0, out, (int) offset, suffix.length);
-            putDb(db, key, new ValueWrapper(out, current == null ? -1 : current.expireAt));
+            putDb(db, key, new ValueWrapper(out));
             setKeyType(key, DataType.STRING, db);
             return out.length;
         }
@@ -478,8 +559,7 @@ public class MemoryStore {
             String base = current == null || current.data == null ? "0"
                     : new String(current.data, StandardCharsets.UTF_8);
             String result = RedisDoubleFormat.plainSum(base, delta);
-            putDb(db, key, new ValueWrapper(result.getBytes(StandardCharsets.UTF_8),
-                    current == null ? -1 : current.expireAt));
+            putDb(db, key, new ValueWrapper(result.getBytes(StandardCharsets.UTF_8)));
             setKeyType(key, DataType.STRING, db);
             return result;
         }
@@ -509,9 +589,10 @@ public class MemoryStore {
             misses.incrementAndGet();
             return null;
         }
-        if (wrapper.isExpired()) {
+        if (isExpiredDb(db, key)) {
             stringStores[db].remove(key, wrapper);
             keyTypeMaps[db].remove(key);
+            clearExpireAtDb(db, key);
             misses.incrementAndGet();
             return null;
         }
@@ -545,8 +626,8 @@ public class MemoryStore {
     /**
      * 与 {@link #pexpireDb} 同一条尺，只是量纲是秒：{@code seconds <= 0} 是"立刻过期"，
      * 实测（battery37 第 28 行）{@code EXPIRE k 0} 回 {@code :1} 而键当场不见 —— 不是回 0，
-     * 也不是把过期时间写成一个非正的时刻（{@code ValueWrapper} 里 {@code expireAt <= 0}
-     * 的含义是"永不过期"，写进去等于反过来把它救活）。键不在时回 0 由 {@code delDb} 自己给。
+     * 也不是把过期时间写成一个非正的时刻（时刻表里 {@code expireAt <= 0} 的口径是"没有过期"，
+     * 写进去等于反过来把它救活）。键不在时回 0 由 {@code delDb} 自己给。
      */
     public boolean expireDb(int db, String key, long seconds) {
         if (seconds <= 0) {
@@ -554,15 +635,16 @@ public class MemoryStore {
         }
         synchronized (stringStores[db]) {
             ValueWrapper wrapper = stringStores[db].get(key);
-            if (wrapper == null || wrapper.isExpired()) {
+            if (wrapper == null || isExpiredDb(db, key)) {
                 if (wrapper != null) {
                     stringStores[db].remove(key, wrapper);
                     keyTypeMaps[db].remove(key);
+                    clearExpireAtDb(db, key);
                 }
                 return false;
             }
-            long expireAt = saturatingExpireAt(TimeUnit.SECONDS.toMillis(seconds));
-            putDb(db, key, new ValueWrapper(wrapper.data, expireAt));
+            setExpireAtDb(db, key, saturatingExpireAt(TimeUnit.SECONDS.toMillis(seconds)));
+            putDb(db, key, new ValueWrapper(wrapper.data));
             return true;
         }
     }
@@ -577,15 +659,16 @@ public class MemoryStore {
         }
         synchronized (stringStores[db]) {
             ValueWrapper wrapper = stringStores[db].get(key);
-            if (wrapper == null || wrapper.isExpired()) {
+            if (wrapper == null || isExpiredDb(db, key)) {
                 if (wrapper != null) {
                     stringStores[db].remove(key, wrapper);
                     keyTypeMaps[db].remove(key);
+                    clearExpireAtDb(db, key);
                 }
                 return false;
             }
-            long expireAt = saturatingExpireAt(milliseconds);
-            putDb(db, key, new ValueWrapper(wrapper.data, expireAt));
+            setExpireAtDb(db, key, saturatingExpireAt(milliseconds));
+            putDb(db, key, new ValueWrapper(wrapper.data));
             return true;
         }
     }
@@ -597,17 +680,19 @@ public class MemoryStore {
     public boolean persistDb(int db, String key) {
         synchronized (stringStores[db]) {
             ValueWrapper wrapper = stringStores[db].get(key);
-            if (wrapper == null || wrapper.isExpired()) {
+            if (wrapper == null || isExpiredDb(db, key)) {
                 if (wrapper != null) {
                     stringStores[db].remove(key, wrapper);
                     keyTypeMaps[db].remove(key);
+                    clearExpireAtDb(db, key);
                 }
                 return false;
             }
-            if (!wrapper.hasExpiration()) {
+            if (!hasExpirationDb(db, key)) {
                 return false;
             }
-            putDb(db, key, new ValueWrapper(wrapper.data, -1));
+            putDb(db, key, new ValueWrapper(wrapper.data));
+            clearExpireAtDb(db, key);
             return true;
         }
     }
@@ -618,18 +703,19 @@ public class MemoryStore {
 
     public long ttlDb(int db, String key) {
         ValueWrapper wrapper = stringStores[db].get(key);
-        if (wrapper == null || wrapper.isExpired()) {
-            if (wrapper != null && wrapper.isExpired()) {
+        if (wrapper == null || isExpiredDb(db, key)) {
+            if (wrapper != null && isExpiredDb(db, key)) {
                 stringStores[db].remove(key);
                 keyTypeMaps[db].remove(key);
+                clearExpireAtDb(db, key);
             }
             return -2;
         }
-        if (!wrapper.hasExpiration()) {
+        if (!hasExpirationDb(db, key)) {
             return -1;
         }
         // 向上取整，与 Redis TTL 一致：EX 1 刚写入时读回 1 而不是整数除法截断成 0。
-        long remaining = wrapper.expireAt - System.currentTimeMillis();
+        long remaining = expireAtDb(db, key) - System.currentTimeMillis();
         return (remaining + 999) / 1000;
     }
 
@@ -639,17 +725,18 @@ public class MemoryStore {
 
     public long pttlDb(int db, String key) {
         ValueWrapper wrapper = stringStores[db].get(key);
-        if (wrapper == null || wrapper.isExpired()) {
+        if (wrapper == null || isExpiredDb(db, key)) {
             if (wrapper != null) {
                 stringStores[db].remove(key, wrapper);
                 keyTypeMaps[db].remove(key);
+                clearExpireAtDb(db, key);
             }
             return -2;
         }
-        if (!wrapper.hasExpiration()) {
+        if (!hasExpirationDb(db, key)) {
             return -1;
         }
-        return Math.max(wrapper.expireAt - System.currentTimeMillis(), 0);
+        return Math.max(expireAtDb(db, key) - System.currentTimeMillis(), 0);
     }
 
     // ==================== 通用键操作 ====================
@@ -665,7 +752,9 @@ public class MemoryStore {
             ValueWrapper wrapper = stringStores[db].get(key);
             if (wrapper != null) {
                 stringStores[db].remove(key, wrapper);
-                return !wrapper.isExpired();
+                boolean alive = !isExpiredDb(db, key);
+                clearExpireAtDb(db, key);
+                return alive;
             }
             return false;
         }
@@ -674,7 +763,9 @@ public class MemoryStore {
                 ValueWrapper wrapper = stringStores[db].get(key);
                 if (wrapper != null) {
                     stringStores[db].remove(key, wrapper);
-                    return !wrapper.isExpired();
+                    boolean alive = !isExpiredDb(db, key);
+                    clearExpireAtDb(db, key);
+                    return alive;
                 }
                 return false;
             case HASH:
@@ -715,8 +806,9 @@ public class MemoryStore {
             if (wrapper == null) {
                 return false;
             }
-            if (wrapper.isExpired()) {
+            if (isExpiredDb(db, key)) {
                 stringStores[db].remove(key);
+                clearExpireAtDb(db, key);
                 return false;
             }
             return true;
@@ -724,7 +816,7 @@ public class MemoryStore {
         switch (type) {
             case STRING:
                 ValueWrapper wrapper = stringStores[db].get(key);
-                return wrapper != null && !wrapper.isExpired();
+                return wrapper != null && !isExpiredDb(db, key);
             case HASH:
                 return hashStores[db].exists(key);
             case LIST:
@@ -752,11 +844,12 @@ public class MemoryStore {
         // 扫描 string store
         for (Map.Entry<String, ValueWrapper> entry : stringStores[db].entrySet()) {
             ValueWrapper wrapper = entry.getValue();
-            if (wrapper != null && !wrapper.isExpired() && entry.getKey().matches(regex)) {
+            if (wrapper != null && !isExpiredDb(db, entry.getKey()) && entry.getKey().matches(regex)) {
                 result.add(entry.getKey());
-            } else if (wrapper != null && wrapper.isExpired()) {
+            } else if (wrapper != null && isExpiredDb(db, entry.getKey())) {
                 stringStores[db].remove(entry.getKey(), wrapper);
                 keyTypeMaps[db].remove(entry.getKey());
+                clearExpireAtDb(db, entry.getKey());
             }
         }
 
@@ -805,7 +898,7 @@ public class MemoryStore {
         // 收集所有有效键
         for (Map.Entry<String, ValueWrapper> entry : stringStores[db].entrySet()) {
             ValueWrapper wrapper = entry.getValue();
-            if (wrapper != null && !wrapper.isExpired()) {
+            if (wrapper != null && !isExpiredDb(db, entry.getKey())) {
                 allKeys.add(entry.getKey());
             }
         }
@@ -860,10 +953,11 @@ public class MemoryStore {
         while (it.hasNext()) {
             String key = it.next();
             ValueWrapper wrapper = stringStores[db].get(key);
-            if (wrapper != null && !wrapper.isExpired()) {
+            if (wrapper != null && !isExpiredDb(db, key)) {
                 count++;
-            } else if (wrapper != null && wrapper.isExpired()) {
+            } else if (wrapper != null && isExpiredDb(db, key)) {
                 it.remove();
+                clearExpireAtDb(db, key);
             }
         }
         count += hashStores[db].dbsize();
@@ -889,6 +983,7 @@ public class MemoryStore {
         setStores[db].flush();
         sortedSetStores[db].flush();
         keyTypeMaps[db].clear();
+        expirations[db].clear();
         // stream 表也在这一问的范围里：DBSIZE / KEYS 现在数得到 stream 键，
         // 那么 FLUSHDB 之后这两个必须归零，否则同一把尺在两句里给出两个数。
         com.zifang.z.cache.core.stream.StreamStore s = streams;
@@ -923,6 +1018,10 @@ public class MemoryStore {
                     stringStores[db].remove(oldKey);
                     keyTypeMaps[db].remove(oldKey);
                     keyTypeMaps[db].put(newKey, DataType.STRING);
+                    // 时刻跟着键走：原来它是 wrapper 的一栏、随对象一起搬，现在得自己换个键名。
+                    long expireAt = expireAtDb(db, oldKey);
+                    clearExpireAtDb(db, oldKey);
+                    setExpireAtDb(db, newKey, expireAt);
                 }
                 break;
             case HASH:
@@ -968,13 +1067,17 @@ public class MemoryStore {
             case STRING: {
                 ValueWrapper wrapper;
                 synchronized (stringStores[fromDb]) {
+                    long expireAt = expireAtDb(fromDb, key);
                     wrapper = stringStores[fromDb].remove(key);
                     keyTypeMaps[fromDb].remove(key);
+                    clearExpireAtDb(fromDb, key);
                     if (wrapper != null) {
                         // 目标库确认没有任何类型挂着这个键名（上面那一道判据），所以直接放，
                         // 不走 putDb —— 那会在两把库锁之间来回，跨库的锁序说不清。
                         stringStores[toDb].put(key, wrapper);
                         keyTypeMaps[toDb].put(key, DataType.STRING);
+                        // 过期时刻跟着键一起搬库（判据见本方法注释第 1 条）。
+                        setExpireAtDb(toDb, key, expireAt);
                     }
                 }
                 return wrapper != null;
@@ -1101,6 +1204,7 @@ public class MemoryStore {
             synchronized (stringStores[db]) {
                 stringStores[db].remove(key);
                 keyTypeMaps[db].remove(key);
+                clearExpireAtDb(db, key);
             }
         }
         if (keep != DataType.HASH) {
@@ -1151,6 +1255,7 @@ public class MemoryStore {
             if (wrapper == null) {
                 stringStores[db].remove(candidate);
                 keyTypeMaps[db].remove(candidate);
+                clearExpireAtDb(db, candidate);
                 evictions.incrementAndGet();
                 return;
             }
@@ -1165,14 +1270,22 @@ public class MemoryStore {
 
         stringStores[db].remove(victim);
         keyTypeMaps[db].remove(victim);
+        clearExpireAtDb(db, victim);
         evictions.incrementAndGet();
     }
 
+    /**
+     * String 那一族"读一条还活着的值"的唯一漏斗：判过点的键在这里就地消失，
+     * 连带它挂在时刻表里的记录一起（原来那条记录长在对象上、随对象没掉）。
+     * 所以 {@code APPEND}/{@code SETBIT}/{@code SETRANGE}/{@code INCR*} 这些原地改写的路
+     * 不必搬运过期时刻 —— 活着的键，记录本来就在表里。
+     */
     private ValueWrapper getLiveWrapper(int db, String key) {
         ValueWrapper wrapper = stringStores[db].get(key);
-        if (wrapper != null && wrapper.isExpired()) {
+        if (wrapper != null && isExpiredDb(db, key)) {
             stringStores[db].remove(key, wrapper);
             keyTypeMaps[db].remove(key);
+            clearExpireAtDb(db, key);
             return null;
         }
         return wrapper;
@@ -1200,11 +1313,14 @@ public class MemoryStore {
     }
 
     /**
-     * 值包装类，包含数据、过期时间和访问时间（用于近似 LRU 淘汰）。
+     * 值包装类：一条 String 的值，外加访问时间（近似 LRU / LFU 淘汰要用）。
+     * <p>
+     * 这里<b>没有</b>过期时间那一栏。它原来长在值上，于是"键能挂过期"这件事结构上就只有
+     * String 一种型做得到 —— 六种键型共用一个 {@code ValueWrapper} 是不成立的，
+     * 五种集合键的 TTL 因此在命令层根本没有地方落（见本类的 {@code expirations}）。
      */
     public static class ValueWrapper {
         public final byte[] data;
-        public final long expireAt; // -1 means no expiration
         /** 最后访问时间（毫秒），用于近似 LRU 淘汰策略 */
         public volatile long lastAccessTime;
         /** 访问次数（用于 LFU 淘汰策略） */
@@ -1212,18 +1328,9 @@ public class MemoryStore {
         /** Morris 计数器值（对数计数，用于 LFU 近似频率） */
         public volatile int lfuCounter;
 
-        public ValueWrapper(byte[] data, long expireAt) {
+        public ValueWrapper(byte[] data) {
             this.data = data;
-            this.expireAt = expireAt;
             this.lastAccessTime = System.currentTimeMillis();
-        }
-
-        public boolean isExpired() {
-            return expireAt > 0 && System.currentTimeMillis() > expireAt;
-        }
-
-        public boolean hasExpiration() {
-            return expireAt > 0;
         }
 
         /** 更新访问时间和 LFU 计数器 */

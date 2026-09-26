@@ -38,7 +38,7 @@ public class MemoryStoreAccessor implements StoreAccessor {
         Map<String, MemoryStore.ValueWrapper> stringStore = store.getStringStore(db);
         for (Map.Entry<String, MemoryStore.ValueWrapper> entry : stringStore.entrySet()) {
             MemoryStore.ValueWrapper wrapper = entry.getValue();
-            if (wrapper != null && !wrapper.isExpired() && wrapper.data != null) {
+            if (wrapper != null && !store.isExpiredDb(db, entry.getKey()) && wrapper.data != null) {
                 result.put(entry.getKey(), wrapper.data.clone());
             }
         }
@@ -104,10 +104,12 @@ public class MemoryStoreAccessor implements StoreAccessor {
     @Override
     public Map<String, Long> getAllExpirationEntries(int db) {
         Map<String, Long> result = new HashMap<>();
-        for (Map.Entry<String, MemoryStore.ValueWrapper> entry : store.getStringStore(db).entrySet()) {
-            MemoryStore.ValueWrapper wrapper = entry.getValue();
-            if (wrapper != null && !wrapper.isExpired() && wrapper.expireAt > 0) {
-                result.put(entry.getKey(), wrapper.expireAt);
+        // 时刻不再长在值上，所以这一问不必遍历 string store：整张时刻表就是答案。
+        // 那一道 isExpiredDb 的闸要留着，它和 getAllStringEntries 是同一把尺：值那一半已经
+        // 不把过点的键交出去了，时刻这一半也不许交，否则两边给出的键集就对不上。
+        for (Map.Entry<String, Long> entry : store.expirationSnapshot(db).entrySet()) {
+            if (!store.isExpiredDb(db, entry.getKey())) {
+                result.put(entry.getKey(), entry.getValue());
             }
         }
         return result;

@@ -1148,6 +1148,59 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   `logs/zpt_final3.log` 都是 `887 / 0 失败 / BUILD SUCCESS / Address already in use 0 命中`。
   这一处从此没有窗口，所以它不需要像上一格那样"靠多跑几遍来赌" —— 9 遍只是不退别的判据。
 
+#### 过期时刻长在值对象上：五种集合键的 TTL 不是"忘了接线"，是结构上没地方挂
+- 现状：`EXPIRE myhash 100` 回 `:0`、`TTL myhash` 回 `-2`，五种集合键全一样。那面 fence
+  （`RedisServerProtocolSemanticsTest:4141-4156`）钉的是现状，并且自己写明了"这一格缺口在
+  list 键上，与 stream 无关"。上游 `expireGenericCommand`（`expire.c:415-451`）问的从来不是
+  "这是什么类型"，唯一的存在性闸是 `:426` 的 `lookupKeyWrite`，时刻存在每个库自己的
+  `db->expire` 字典里。我们这边时刻是 `MemoryStore.ValueWrapper` 的一栏，而这个对象只活在
+  `stringStores` 里 —— 所以 command 层不是"忘了接第五张表"，是**接不上**：集合键没有那个对象可挂。
+- 这一格只做搬迁，**不改任何可观察行为**（判据见下面"量具"那一杠）。
+  - 新增 `expirations[db]`（键名 → 绝对毫秒），时刻从此是键空间的属性，与值是什么类型无关；
+    `ValueWrapper` 去掉 `expireAt` / `isExpired()` / `hasExpiration()`，构造器收成单参。
+    13 处构造点全在本类内；值外面只有两处在读它（`MemoryStoreAccessor:41`、`:109`）。
+  - **谁收记录**：23 处 `clearExpireAtDb`，一条"键没掉"的路都不许漏 —— 惰性删除那八处
+    （`checkKeyType` / `typeOfDb` / `getDb` / `ttlDb` / `pttlDb` / `existsDb` / `keysDb` /
+    `dbsizeDb`，加 `getLiveWrapper`）、`DEL`（两支）、`FLUSHDB`、淘汰（两处）、`dbOverwrite`
+    （`clearOtherTypes` 的 STRING 支）、整键覆盖三处（`SET` / `SETNX` / `GETSET`）。
+    整键覆盖要把过期一起清掉，权威是 `setKey`（`db.c:216-224`，`removeExpire` 在 `:223`：
+    "The expire time of the key is reset (the key is made persistent)"）。
+  - **谁一句都不必写**：`APPEND` / `SETBIT` / `SETRANGE` / `INCR` / `INCRBYFLOAT` 五路原地改写。
+    以前它们靠"新 wrapper 带着旧 `expireAt` 顶掉老 wrapper"来留 TTL —— 那是这个设计里唯一
+    留得住的办法；时刻不在值上之后，什么都不做才是对的，所以这五处反而各删掉了一句。
+  - `getAllExpirationEntries` 改成遍历时刻表（不再遍历 string store）。那道 `isExpiredDb`
+    的闸留着，理由是它与 `getAllStringEntries:41` 是同一把尺 —— 值那一半不把过点的键交出去，
+    时刻这一半也不交，否则两边给出的键集对不上。
+- 搬完才露出来的一个形状，这一格顺手改掉：`putDb` 装到上限时会**当场淘汰一个键**，而被淘汰的
+  完全可能就是刚写进去的这一枚。于是"先写值、后记时刻"会给一枚已经不存在的键留下一行记录；
+  长在值上的年代不会有这个形状（键没了时刻跟着没）。现在四处登记（`setex` / `psetex` /
+  `expire` / `pexpire`）一律排在 `putDb` **之前**，`evictOne` 那句回收才轮得到它。
+- 无主记录今天够不到协议层，也够不到存档 —— `RdbPersistence` 是遍历五张值表、再按 key 去
+  `getOrDefault` 查时刻的（`RdbPersistence.java:463-467`），没人查的行不会被写进 dump。
+  它的代价是内存，以及"下一格把集合键的 TTL 接上之后，这行会凭空挂到下一个用这个键名的键身上"。
+  也正因如此，这一问在上面那几层**看不见**，只能在 store 层量。
+- 量具：`MemoryStoreTest` 加五支（该类 40 → 45 例），全量 `887 → 892`
+  （`358 + 397 + 135 + 2`），提交的字节连跑 2 遍全绿（`logs/ttlfinal1.log`、`logs/ttlfinal2.log`）。
+  五支的写法是"每走一条删除/覆盖/搬移的路，立刻量一次不变式（时刻表里每一行的键名还得是六种
+  类型之一）"，并且中间夹了三处正面对照（挂上过期后表里必须有这一行、时刻必须在未来、
+  `PERSIST` 回 true 才准摘）—— 没有那三处，一把恒空的表就能把前四句全骗过去。
+  四支注入各打一条路（`~/.cache/zcache_gauges/ttl_mut/teeth.py`：注入前先 `cp`、每支还原后按
+  md5 `d4a4425f8f32c67e3a46f0f2053ccb7a` 对账，基线在同一份字节上跑过并且绿）：
+  摘 `evictOne` 的回收 → 红在 `写五十次淘汰四十多次，表里不该有五十行`；
+  摘 `delDb` STRING 支的回收 → `delAndFlush…` 与 `expiryRecord…`（EXPIRE 0 那步）两处红；
+  摘 `setDb` 的覆盖清除 → 红在 `SET 覆盖后不许留着旧时刻`；
+  把 `psetexDb` 的登记挪回 `putDb` 之后 → 红在 `淘汰之后：时刻表里给一个已经不存在的键名留着
+  过期记录 -> k31`（那个号码每遍不同：挑谁是受害者是随机的，别把它当固定期望）。
+- 还没做的三件事，写在这里免得下一格漏：
+  1. **这一格没有让任何一种集合键的 TTL 活起来。** `expireDb` / `ttlDb` 那五支仍然只看
+     `stringStores`，上面那面 fence 原样留着，是下一格要翻的。
+  2. 四个集合 store 自己的 `del`（`CommandHandler.deleteEveryType` 直接调它们）不碰时刻表。
+     今天没有集合键的行可收，所以那一句在这四处是**空转**、也不在任何判据里 —— 记在**未覆盖**。
+     下一格要么让删除统一走一个"六型通删"的口，要么这四处各补一句。
+  3. `GETSET` 仍然把 TTL 抹成永久（`getAndSetDb` 走的是整键覆盖那一条），而上游
+     `getSetCommand` 用的是 `dbOverwrite`（`db.c:189-206`，不清过期）。这一格是**照现状搬**的，
+     没有顺手改 —— 它是一条独立的、还没实测对拍过的缺口，不该混在搬迁这一格里。
+
 ### Added
 - `RedisServer.serverScope()`：只读拿到本台那一份，测试与嵌入式据此判断作用域边界。
 - `StreamIdFormat`（z-cache-common）：stream ID 的唯一文法（uint64 两段、`-` / `+` 两种位置、
@@ -1544,6 +1597,10 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   的 `lookupKeyWrite` 一道闸、没有类型分支，所以它回 `:1` 并真的挂上过期，我们回 `:0`；
   因此 `RENAME` 至今只搬得动 String 的 TTL（**流对象本身现在搬得动了**：表顶、消费组、
   PEL 跟着指针走，见上面《stream 键是键》那一节，缺的只有 TTL 这一栏）。
+  1.3.6 里"时刻搬到键空间上"那一格只做了存储那一半（`MemoryStore.expirations` 已经与类型无关，
+  读口是 `expireAtDb` / `hasExpirationDb` / `isExpiredDb`），**上面这些行为一条都没变**：
+  还缺的是命令层那五支去问 `typeOfDb`、四个集合 store 的 `del` 各补一句回收、以及
+  `getAllExpirationEntries` 之外的逐类型存档路径（现在只有 String 的时刻进得了快照）。
 - Stream 这一族的**文法**、**XADD 的单调性**、**XREAD / XREADGROUP 的位置语义**、
   **取键那一问的类型闸门**、**错误码与 XREADGROUP 的 NOGROUP 那一问**这一版都收了。
   剩下的读侧边界全在**答复层**（文案与形状），下面每一条都标清依据档次：
