@@ -13,6 +13,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -679,6 +680,148 @@ class RedisServerReferenceParityTest {
                 assertEquals(":0", readReply(in));
                 send(s, "TTL", "p44:new");
                 assertEquals(":-1", readReply(in), "battery44:19 —— 建出来的新键没有过期时间");
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        });
+    }
+
+    /**
+     * BITPOS —— 改动前同样是不存在的命令。五档判序、区间只折一半、以及"找 0 且没给 end 时
+     * 回 长度×8"这三件事，全都由 battery39 第 20—25 行、battery40 第 25—36 行、
+     * battery41 第 10—22 行、battery42 第 13—16/29—31 行、battery43 第 10—24/30—40 行钉住；
+     * 空串一律 -1 是 6394 上一次单独实测（{@code BITPOS ""} 的四档都是 -1，包括找 0）。
+     */
+    @Test
+    void bitposMatchesTheMeasuredPrecedenceAndFolding() throws Exception {
+        run(port -> {
+            try (Socket s = connect(port)) {
+                DataInputStream in = new DataInputStream(s.getInputStream());
+                String bitArgErr = "-ERR The bit argument must be 1 or 0.";
+                String intErr = "-ERR value is not an integer or out of range";
+                String wrongType = "-WRONGTYPE Operation against a key holding the wrong kind of value";
+
+                // 第一、二档：bit 的语法与取值都在查键之前，坏键名也不给默认值
+                send(s, "BITPOS", "p45x", "5");
+                assertEquals(bitArgErr, readReply(in), "battery41:10 —— 键不在也先说 bit");
+                send(s, "BITPOS", "p45x", "abc");
+                assertEquals(intErr, readReply(in), "battery39:21 —— 这一档用的是普通整数句");
+                send(s, "BITPOS", "p45x", "+1");
+                assertEquals(intErr, readReply(in), "battery42:29");
+                send(s, "BITPOS", "p45x", "01");
+                assertEquals(intErr, readReply(in), "battery42:30");
+
+                // 第三档：键不在 → 找 1 是 -1、找 0 是 0，而且挡得住后面的语法之争
+                send(s, "BITPOS", "p45x", "1");
+                assertEquals(":-1", readReply(in), "battery39:20");
+                send(s, "BITPOS", "p45x", "0");
+                assertEquals(":0", readReply(in), "battery40:28 —— 串尾右边全是零");
+                send(s, "BITPOS", "p45x", "0", "+0");
+                assertEquals(":0", readReply(in), "battery42:31 —— 坏 start 根本没被解析");
+                send(s, "BITPOS", "p45x", "1", "2", "3", "4");
+                assertEquals(":-1", readReply(in), "battery39:22 —— 多余尾巴也排在查键之后");
+
+                // 第四档：类型
+                send(s, "LPUSH", "p45l", "x");
+                assertEquals(":1", readReply(in));
+                send(s, "BITPOS", "p45l", "5");
+                assertEquals(bitArgErr, readReply(in), "battery41:21 —— bit 仍排在类型之前");
+                send(s, "BITPOS", "p45l", "1", "abc", "def", "BIT");
+                assertEquals(wrongType, readReply(in), "battery41:22 —— 类型排在 syntax error 之前");
+                send(s, "BITPOS", "p45l", "1");
+                assertEquals(wrongType, readReply(in), "battery40:25");
+
+                // 第五档：个数与下标（4.0.9 不认 6.2 的 BYTE|BIT 尾栏）
+                send(s, "SET", "p45s", "hello");
+                assertEquals("+OK", readReply(in));
+                send(s, "BITPOS", "p45s", "1", "2", "3", "4");
+                assertEquals("-ERR syntax error", readReply(in), "battery41:15");
+                send(s, "BITPOS", "p45s", "1", "abc", "def", "BIT");
+                assertEquals("-ERR syntax error", readReply(in), "battery41:14 —— 不是整数那句");
+                send(s, "BITPOS", "p45s", "1", "2", "3", "BIT");
+                assertEquals("-ERR syntax error", readReply(in), "battery40:30");
+                send(s, "BITPOS", "p45s", "1", "2", "3", "byte");
+                assertEquals("-ERR syntax error", readReply(in), "battery40:31 —— 大小写都拒");
+                send(s, "BITPOS", "p45s", "1", "2", "3", "4", "5");
+                assertEquals("-ERR syntax error", readReply(in), "battery40:34");
+                send(s, "BITPOS", "p45s", "1", "abc");
+                assertEquals(intErr, readReply(in), "battery40:33 —— 过了个数这一档才轮到整数");
+                send(s, "BITPOS");
+                assertEquals("-ERR wrong number of arguments for 'bitpos' command", readReply(in),
+                        "battery40:35");
+                send(s, "BITPOS", "p45s");
+                assertEquals("-ERR wrong number of arguments for 'bitpos' command", readReply(in),
+                        "battery40:36");
+
+                // 值：编号按字节内高位起算，"hello" = 68 65 6C 6C 6F
+                String[][] valueRows = {
+                        {":0", "BITPOS", "p45s", "0"},                 // battery41:12
+                        {":1", "BITPOS", "p45s", "1"},                 // battery41:13
+                        {":9", "BITPOS", "p45s", "1", "1", "1"},       // battery41:18
+                        {":-1", "BITPOS", "p45s", "0", "1", "0"},      // battery41:19 start>end
+                        {":17", "BITPOS", "p45s", "1", "2", "2"},      // battery43:14 'l'=0x6C
+                        {":25", "BITPOS", "p45s", "1", "3", "3"},      // battery43:15
+                        {":33", "BITPOS", "p45s", "1", "4", "4"},      // battery43:16
+                        {":33", "BITPOS", "p45s", "1", "4", "99"},     // battery43:17 end 截到串尾
+                        {":32", "BITPOS", "p45s", "0", "4", "4"},      // battery43:18
+                        {":-1", "BITPOS", "p45s", "1", "5", "5"},      // battery43:19 整字节出串
+                        {":-1", "BITPOS", "p45s", "1", "99"},          // battery43:10 start 不往回截
+                        {":-1", "BITPOS", "p45s", "0", "99"},          // battery43:12 —— 也不给 40
+                        {":-1", "BITPOS", "p45s", "1", "99", "1"},     // battery43:13
+                        {":1", "BITPOS", "p45s", "1", "-99"},          // battery43:11 负数折到 0
+                        {":32", "BITPOS", "p45s", "0", "-1", "-1"},    // battery43:20
+                };
+                for (String[] row : valueRows) {
+                    String[] argv = Arrays.copyOfRange(row, 1, row.length);
+                    send(s, argv);
+                    assertEquals(row[0], readReply(in), String.join(" ", argv));
+                }
+
+                // 全是 1 的那一档：没显式给 end 时回"串尾那一位"，给了 end 才回 -1
+                for (String bitIndex : new String[]{"0", "1", "2", "3", "4", "5", "6", "7"}) {
+                    send(s, "SETBIT", "p45o", bitIndex, "1");
+                    assertEquals(":0", readReply(in), "第 " + bitIndex + " 位置 1");
+                }
+                send(s, "GETBIT", "p45o", "7");
+                assertEquals(":1", readReply(in), "battery42:17");
+                send(s, "BITPOS", "p45o", "0");
+                assertEquals(":8", readReply(in), "battery42:13 —— 裸回长度×8");
+                send(s, "BITPOS", "p45o", "0", "-1");
+                assertEquals(":8", readReply(in), "battery42:14 —— 只给 start 也算没给 end");
+                send(s, "BITPOS", "p45o", "0", "0", "0");
+                assertEquals(":-1", readReply(in), "battery42:15 —— 显式 end 才是 -1");
+                send(s, "BITPOS", "p45o", "1", "0", "0");
+                assertEquals(":0", readReply(in), "battery42:16");
+                send(s, "SETRANGE", "p45o", "1", "A");
+                assertEquals(":2", readReply(in));
+                send(s, "BITPOS", "p45o", "0");
+                assertEquals(":8", readReply(in), "battery42:20 —— 第二字节 0x41 的高位就是 0");
+                send(s, "BITPOS", "p45o", "0", "0", "1");
+                assertEquals(":8", readReply(in), "battery42:21");
+
+                // 空串（长度 0）四档全是 -1，包括找 0 —— 不许回"第 0 位"
+                send(s, "SET", "p45e", "");
+                assertEquals("+OK", readReply(in));
+                String[][] emptyRows = {
+                        {"BITPOS", "p45e", "0"},
+                        {"BITPOS", "p45e", "1"},
+                        {"BITPOS", "p45e", "0", "-1"},
+                        {"BITPOS", "p45e", "0", "0", "0"},
+                };
+                for (String[] argv : emptyRows) {
+                    send(s, argv);
+                    assertEquals(":-1", readReply(in), String.join(" ", argv) + " —— 6394 实测");
+                }
+
+                // 撑出来的零字节区间
+                send(s, "SETBIT", "p45g", "40", "1");
+                assertEquals(":0", readReply(in), "battery43:27");
+                send(s, "STRLEN", "p45g");
+                assertEquals(":6", readReply(in), "battery43:28");
+                send(s, "BITPOS", "p45g", "1");
+                assertEquals(":40", readReply(in), "battery43:30");
+                send(s, "BITPOS", "p45g", "0");
+                assertEquals(":0", readReply(in), "battery43:31");
             } catch (IOException e) {
                 throw new RuntimeException(e);
             }

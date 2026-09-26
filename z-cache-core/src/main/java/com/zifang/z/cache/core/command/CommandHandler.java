@@ -327,6 +327,7 @@ public class CommandHandler {
                 case "BITCOUNT": result = handleBitcount(args);   break;
                 case "GETBIT":   result = handleGetbit(args);     break;
                 case "SETBIT":   result = handleSetbit(args);     break;
+                case "BITPOS":   result = handleBitpos(args);     break;
                 case "INCRBYFLOAT": result = handleIncrbyfloat(args); break;
                 case "MSETNX":   result = handleMsetnx(args);     break;
                 case "UNLINK":   result = handleUnlink(args);     break;
@@ -929,6 +930,73 @@ public class CommandHandler {
         RespError conflict = wrongTypeAfterParse(MemoryStore.DataType.STRING, args[1]);
         if (conflict != null) return conflict;
         return RespInteger.of(store.setbitDb(currentDb, args[1], offset.longValue(), "1".equals(args[3])));
+    }
+
+    /**
+     * BITPOS key bit [start [end]] —— 找第一个等于 {@code bit} 的位，编号与 GETBIT 同一套
+     * （字节内从高位数起）。整条判序是量出来的，五档各有反例：
+     * <ol>
+     *   <li>arity 只管"少于 3 个 token"（{@code BITPOS} / {@code BITPOS k} 实测都是 arity 错，
+     *       battery40 第 35/36 行）。</li>
+     *   <li>{@code bit} 那一栏用<b>普通</b>整数句（{@code BITPOS k abc} → value is not an
+     *       integer，battery39:21；{@code +1}、{@code 01} 同样拒，battery42 第 29/30 行），
+     *       合语法但不是 0/1 时换第三句 {@code The bit argument must be 1 or 0.}
+     *       （带句号，battery40:27）。这两档都排在查键与类型<b>之前</b>：
+     *       {@code BITPOS <list 键> 5} 实测回的是"must be 1 or 0"而不是 WRONGTYPE
+     *       （battery41:21）。</li>
+     *   <li>查键：键不在时按"找 1 找不到、找 0 就在第 0 位"答 —— {@code -1} / {@code 0}
+     *       （battery39:20 与 battery40:28），并且<b>先于</b>后面所有语法之争：
+     *       {@code BITPOS <不存在的键> 1 2 3 4} 实测是 {@code -1}，多余的尾巴轮不到说话
+     *       （battery39:22）。空串（长度为 0）另有一档：一律 {@code -1}（6394 上逐档实测）。</li>
+     *   <li>类型：list 键 → WRONGTYPE（battery41:22，即使 start 是坏文本）。</li>
+     *   <li>个数与下标：多于 5 个 token 是 syntax error —— 4.0.9 不认 6.2 的 {@code BYTE|BIT}
+     *       尾栏（battery40 第 30/31/34 行、battery41 第 14/15/30 行），这一档又排在 start/end
+     *       的整数语法之前（{@code BITPOS k 1 abc def BIT} → syntax error，battery41:14）。</li>
+     * </ol>
+     * 区间折叠只折一半：负数加长度、加完还负归 0，{@code end} 超出串尾截到最后一个字节，
+     * 但 {@code start} <b>不</b>往回截 —— 实测 {@code BITPOS "hello" 1 99} 是 {@code -1}
+     * （battery43:10），若把 start 也夹到 4 就会回 33。最后一条是对岸的"串尾右边全是零"：
+     * 找 0 且<b>没有显式给 end</b> 而整段又全是 1 时，回 {@code 长度×8} 而不是 -1
+     * （实测 1 字节的 {@code 0xFF}：裸回 8、给 start 回 8、显式 {@code 0 0} 回 -1，
+     * battery42 第 13/14/15 行）。
+     */
+    private Object handleBitpos(String[] args) {
+        if (args.length < 3) return RespError.wrongNumberOfArguments("BITPOS");
+        Long bit = RedisIntegerFormat.parse(args[2]);
+        if (bit == null) return RespError.notAnInteger();
+        if (bit.longValue() != 0 && bit.longValue() != 1) return RespError.bitArgInvalid();
+        boolean lookingForOne = bit.longValue() == 1;
+        RespError conflict = wrongTypeAfterParse(MemoryStore.DataType.STRING, args[1]);
+        if (conflict != null) return conflict;
+        byte[] v = store.getDb(currentDb, args[1]);
+        if (v == null) return RespInteger.of(lookingForOne ? -1 : 0);
+        if (v.length == 0) return RespInteger.of(-1);
+        if (args.length > 5) return RespError.syntaxError();
+        long start = 0;
+        if (args.length >= 4) {
+            Long s = RedisIntegerFormat.parse(args[3]);
+            if (s == null) return RespError.notAnInteger();
+            start = s;
+        }
+        boolean hasEnd = args.length == 5;
+        long end = v.length - 1L;
+        if (hasEnd) {
+            Long e = RedisIntegerFormat.parse(args[4]);
+            if (e == null) return RespError.notAnInteger();
+            end = e;
+            if (end < 0) end += v.length;
+            if (end < 0) end = 0;
+        }
+        if (start < 0) start += v.length;
+        if (start < 0) start = 0;
+        if (end >= v.length) end = v.length - 1L;
+        if (start > end) return RespInteger.of(-1);
+        for (long i = start; i <= end; i++) {
+            int b = v[(int) i] & 0xFF;
+            int candidate = lookingForOne ? b : (~b) & 0xFF;
+            if (candidate != 0) return RespInteger.of(i * 8 + Integer.numberOfLeadingZeros(candidate) - 24);
+        }
+        return RespInteger.of(!hasEnd && !lookingForOne ? (long) v.length * 8 : -1);
     }
 
     private Object handleSetrange(String[] args) {
