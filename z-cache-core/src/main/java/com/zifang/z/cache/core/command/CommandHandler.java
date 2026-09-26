@@ -2370,6 +2370,24 @@ public class CommandHandler {
     }
 
     /**
+     * 一条 stream 条目在对客回复里的形状：{@code [id, [f1, v1, ...]]}。
+     * <p>
+     * {@code fields == null} 交回 {@code [id, *-1]}：XREADGROUP 读历史时，PEL 里可能还压着
+     * 一条已经被 {@code XDEL} 带走的条目，上游明着交回"这条我给了、内容没了"
+     * （t_stream.c:1101-1109），而不是悄悄少交一条 —— 少一条会让客户端以为那些 ID 从没领过。
+     */
+    private static Object streamEntryReply(String id, Map<String, String> fields) {
+        if (fields == null) return RespArray.of(RespBulkString.of(id), RespArray.nullArray());
+        Object[] rendered = new Object[fields.size() * 2];
+        int i = 0;
+        for (Map.Entry<String, String> field : fields.entrySet()) {
+            rendered[i++] = RespBulkString.of(field.getKey());
+            rendered[i++] = RespBulkString.of(field.getValue());
+        }
+        return RespArray.of(RespBulkString.of(id), RespArray.of(rendered));
+    }
+
+    /**
      * XREAD / XREADGROUP 的 ID 位：{@code $} 与 {@code >} 在数字文法之前就被单独收下
      * （上游 t_stream.c:1518、:1535 两个 {@code strcmp} 分支），剩下的一律 strict（:1549）。
      * 两个特例各自只在一个命令上合法，而"在这个命令上非法"有专门的句子（:1520、:1537），
@@ -2516,13 +2534,7 @@ public class CommandHandler {
         Object[] result = new Object[entries.size()];
         for (int i = 0; i < entries.size(); i++) {
             StreamEntry e = entries.get(i);
-            Object[] fields = new Object[e.getFields().size() * 2];
-            int fi = 0;
-            for (Map.Entry<String, String> fe : e.getFields().entrySet()) {
-                fields[fi++] = RespBulkString.of(fe.getKey());
-                fields[fi++] = RespBulkString.of(fe.getValue());
-            }
-            result[i] = RespArray.of(RespBulkString.of(e.getId()), RespArray.of(fields));
+            result[i] = streamEntryReply(e.getId(), e.getFields());
         }
         return RespArray.of(result);
     }
@@ -2600,32 +2612,36 @@ public class CommandHandler {
 
         int numKeys = (args.length - i) / 2;
         String[] keys = new String[numKeys];
-        String[] ids = new String[numKeys];
+        long[][] positions = new long[numKeys][];
         for (int k = 0; k < numKeys; k++) {
             keys[k] = args[i + k];
-            ids[k] = args[i + numKeys + k];
-            Object rejected = rejectStreamIdInRead(ids[k], false);
+            String text = args[i + numKeys + k];
+            Object rejected = rejectStreamIdInRead(text, false);
             if (rejected != null) return rejected;
+            // `$` 不是"整条流"，是这条流当前的位置：上游 :1527-1533 取的是 s->last_id，
+            // 键不在时才是 0-0。配上下面那一问"严格大于"，它必然交回空。
+            positions[k] = "$".equals(text) ? null : StreamIdFormat.parse(text, 0L, true);
         }
 
         Object[] result = new Object[numKeys];
         int ri = 0;
         for (int k = 0; k < numKeys; k++) {
-            List<StreamEntry> entries = streams().xrange(currentDb, keys[k], ids[k], "+", count);
-            if (!entries.isEmpty()) {
-                Object[] entryArr = new Object[entries.size()];
-                for (int j = 0; j < entries.size(); j++) {
-                    StreamEntry e = entries.get(j);
-                    Object[] fields = new Object[e.getFields().size() * 2];
-                    int fi = 0;
-                    for (Map.Entry<String, String> fe : e.getFields().entrySet()) {
-                        fields[fi++] = RespBulkString.of(fe.getKey());
-                        fields[fi++] = RespBulkString.of(fe.getValue());
-                    }
-                    entryArr[j] = RespArray.of(RespBulkString.of(e.getId()), RespArray.of(fields));
-                }
-                result[ri++] = RespArray.of(RespBulkString.of(keys[k]), RespArray.of(entryArr));
+            com.zifang.z.cache.core.stream.Stream stream = streams().getStream(currentDb, keys[k]);
+            if (stream == null) continue;
+            long[] gt = positions[k] != null ? positions[k] : stream.lastId();
+            // 先问"有没有一条活着的条目比这个位置大"（上游 :1586-1593），没有就这个键整个不点名。
+            // 这一问还顺手挡住了 successor 的回绕：MAX-MAX 的后继是 0-0，不挡就会交出全流。
+            long[] top = stream.lastValidId();
+            if (top == null || StreamIdFormat.compare(top[0], top[1], gt[0], gt[1]) <= 0) continue;
+            long[] from = StreamIdFormat.successor(gt[0], gt[1]);
+            List<StreamEntry> entries = streams().xrange(currentDb, keys[k],
+                    StreamIdFormat.format(from[0], from[1]), "+", count);
+            Object[] rendered = new Object[entries.size()];
+            for (int j = 0; j < entries.size(); j++) {
+                StreamEntry e = entries.get(j);
+                rendered[j] = streamEntryReply(e.getId(), e.getFields());
             }
+            result[ri++] = RespArray.of(RespBulkString.of(keys[k]), RespArray.of(rendered));
         }
         return ri == 0 ? RespArray.nullArray() : RespArray.of(Arrays.copyOf(result, ri));
     }
@@ -2655,33 +2671,49 @@ public class CommandHandler {
         i++;
 
         int numKeys = (args.length - i) / 2;
-        Map<String, String> streams = new LinkedHashMap<>();
+        String[] keys = new String[numKeys];
+        String[] positions = new String[numKeys];
         for (int k = 0; k < numKeys; k++) {
-            String idText = args[i + numKeys + k];
+            keys[k] = args[i + k];
+            positions[k] = args[i + numKeys + k];
             // 以前这一位一个字都不判：坏 ID 走到 StreamStore 里被当成 0-0，于是
             // "XREADGROUP GROUP g c STREAMS k abc" 回了整段历史（实测 battery50:21）。
-            Object rejected = rejectStreamIdInRead(idText, true);
+            Object rejected = rejectStreamIdInRead(positions[k], true);
             if (rejected != null) return rejected;
-            streams.put(args[i + k], idText);
         }
 
-        Map<String, List<StreamEntry>> result = streams().xreadgroup(currentDb, group, consumer, streams, count);
-
-        Object[] streamResults = new Object[result.size()];
+        Object[] streamResults = new Object[numKeys];
         int ri = 0;
-        for (Map.Entry<String, List<StreamEntry>> entry : result.entrySet()) {
-            Object[] entryArr = new Object[entry.getValue().size()];
-            for (int j = 0; j < entry.getValue().size(); j++) {
-                StreamEntry e = entry.getValue().get(j);
-                Object[] fields = new Object[e.getFields().size() * 2];
-                int fi = 0;
-                for (Map.Entry<String, String> fe : e.getFields().entrySet()) {
-                    fields[fi++] = RespBulkString.of(fe.getKey());
-                    fields[fi++] = RespBulkString.of(fe.getValue());
+        for (int k = 0; k < numKeys; k++) {
+            if (">".equals(positions[k])) {
+                List<StreamEntry> fresh =
+                        streams().xreadgroupNew(currentDb, keys[k], group, consumer, count);
+                // 没有新条目时这个键不点名：上游 :1575-1585 只在"比组里最后投递位置还新"的
+                // 条目真存在时才 serve 它。一个键都没点名才是 *-1。
+                if (fresh.isEmpty()) continue;
+                Object[] rendered = new Object[fresh.size()];
+                for (int j = 0; j < fresh.size(); j++) {
+                    StreamEntry e = fresh.get(j);
+                    rendered[j] = streamEntryReply(e.getId(), e.getFields());
                 }
-                entryArr[j] = RespArray.of(RespBulkString.of(e.getId()), RespArray.of(fields));
+                streamResults[ri++] = RespArray.of(RespBulkString.of(keys[k]), RespArray.of(rendered));
+                continue;
             }
-            streamResults[ri++] = RespArray.of(RespBulkString.of(entry.getKey()), RespArray.of(entryArr));
+            // 带明确 ID = 读这个消费者自己的历史：条目从它自己的 PEL 里取，不是从流里扫
+            // （上游 :981-984 在这儿整个换了查询来源，:1083 那一支只认消费者本地的 PEL）。
+            // 与 ">" 相反，**空历史也要点名这个键**（:1596-1598 的 arraylen 无条件自增）。
+            long[] gt = StreamIdFormat.parse(positions[k], 0L, true);
+            long[] from = StreamIdFormat.successor(gt[0], gt[1]);
+            List<String> history = streams().xreadgroupHistory(currentDb, keys[k], group, consumer,
+                    StreamIdFormat.format(from[0], from[1]), count);
+            if (history == null) continue;
+            Object[] rendered = new Object[history.size()];
+            for (int j = 0; j < history.size(); j++) {
+                String id = history.get(j);
+                List<StreamEntry> hit = streams().xrange(currentDb, keys[k], id, id, 1);
+                rendered[j] = streamEntryReply(id, hit.isEmpty() ? null : hit.get(0).getFields());
+            }
+            streamResults[ri++] = RespArray.of(RespBulkString.of(keys[k]), RespArray.of(rendered));
         }
         return ri == 0 ? RespArray.nullArray() : RespArray.of(Arrays.copyOf(streamResults, ri));
     }

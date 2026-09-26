@@ -169,6 +169,22 @@ class StreamIdFormatTest {
         }
     }
 
+    /**
+     * {@code streamIncrID}（:77-89）：序号进位到时间戳，两段都到顶则回绕成 {@code 0-0}。
+     * 回绕这一支在 XREAD 上是看不见的（:1591 那道"流非空且 maxid > gt"的闸先把它挡住了），
+     * 但 XREADGROUP 读历史没有那道闸 —— 所以这一位必须按上游真的会回绕来算，不能钳在顶。
+     */
+    @Test
+    void successorCarriesAndWrapsLikeStreamIncrID() {
+        assertArrayEquals(new long[]{1L, 3L}, StreamIdFormat.successor(1L, 2L));
+        long top = StreamIdFormat.MAX_U64;
+        assertArrayEquals(new long[]{2L, 0L}, StreamIdFormat.successor(1L, top), "seq 到顶进位到 ms");
+        assertArrayEquals(new long[]{0L, 0L}, StreamIdFormat.successor(top, top), "MAX-MAX 之后是 0-0，不是钳顶");
+        assertArrayEquals(new long[]{top, 0L}, StreamIdFormat.successor(top - 1, top),
+                "进位落在无符号最大值上，比较仍要按无符号走");
+        assertTrue(StreamIdFormat.compare(top, top, 0L, 0L) > 0, "回绕点两侧的顺序不能反");
+    }
+
     /** 客户端敲进来的字节什么形状都有：null 进去只能是"非法"，不能是异常。 */
     @Test
     void nullIsRejectedNotThrown() {

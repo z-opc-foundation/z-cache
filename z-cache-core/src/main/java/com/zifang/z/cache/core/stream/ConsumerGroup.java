@@ -1,6 +1,8 @@
 package com.zifang.z.cache.core.stream;
 
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
@@ -115,12 +117,29 @@ public class ConsumerGroup {
     }
 
     /**
+     * 这个消费者手上还没 ACK 的条目 ID，按 ID 升序。
+     * <p>
+     * XREADGROUP 读历史读的就是这一份（上游给每个消费者单独挂了一棵 PEL 基数树，
+     * {@code streamReplyWithRangeFromConsumerPEL} 按它的序遍历，t_stream.c:1083-1120），
+     * 而不是流里的条目 —— 别的消费者领走的条目不该出现在这里。
+     */
+    public List<String> pendingIdsOf(String consumerName) {
+        List<String> ids = new ArrayList<>();
+        for (Map.Entry<String, String> pending : pendingEntries.entrySet()) {
+            if (pending.getValue().equals(consumerName)) {
+                ids.add(pending.getKey());
+            }
+        }
+        Collections.sort(ids, StreamEntry::compareIds);
+        return ids;
+    }
+
+    /**
      * 确认条目（XACK）。
      *
      * @param entryIds 要确认的条目 ID
      * @return 成功确认的数量
-     */
-    public long ack(String... entryIds) {
+     */    public long ack(String... entryIds) {
         long count = 0;
         for (String entryId : entryIds) {
             String consumerName = pendingEntries.remove(entryId);

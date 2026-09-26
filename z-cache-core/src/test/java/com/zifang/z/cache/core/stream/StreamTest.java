@@ -207,14 +207,24 @@ class StreamTest {
 
         assertTrue(store.xgroupCreate(0, "s1", "g1", "0"));
 
-        Map<String, String> streams = Collections.singletonMap("s1", ">");
-        Map<String, List<StreamEntry>> result = store.xreadgroup(0, "g1", "c1", streams, 10);
-        assertEquals(1, result.size());
-        assertEquals(2, result.get("s1").size());
+        List<StreamEntry> delivered = store.xreadgroupNew(0, "s1", "g1", "c1", 10);
+        assertEquals(2, delivered.size());
+        // 投出去的东西不会再投第二遍：组的位置跟着走
+        assertTrue(store.xreadgroupNew(0, "s1", "g1", "c1", 10).isEmpty());
+
+        // 历史按消费者各自的 PEL。fromId 是闭区间起点，命令那一侧传进来的是"所要位置的下一个 ID"。
+        List<String> c1History = store.xreadgroupHistory(0, "s1", "g1", "c1", "0-1", 0);
+        assertEquals(java.util.Arrays.asList("100-0", "200-0"), c1History);
+        // c2 一条都没领过：空历史，但不是 null（null 专指键或组不在）
+        List<String> c2History = store.xreadgroupHistory(0, "s1", "g1", "c2", "0-1", 0);
+        assertEquals(0, c2History.size());
+        assertNull(store.xreadgroupHistory(0, "no-such-key", "g1", "c1", "0-1", 0));
 
         // ACK one
         long acked = store.xack(0, "s1", "g1", "100-0");
         assertEquals(1, acked);
+        assertEquals(java.util.Collections.singletonList("200-0"),
+                store.xreadgroupHistory(0, "s1", "g1", "c1", "0-1", 0));
     }
 
     @Test

@@ -589,6 +589,142 @@ class RedisServerProtocolSemanticsTest {
     }
 
     /**
+     * XREAD / XREADGROUP 的 ID 位是一个"位置"，不是一个"范围起点"。
+     * <p>
+     * 上游 {@code t_stream.c:1560} 在那一行写的就是 "ID must be greater than this."，
+     * 而它交给范围查询的 start 是 {@code streamIncrID} 之后的值（:1602-1603）—— 于是
+     * {@code XREAD STREAMS k 1-1} 交回的是 {@code 1-2} 往后，<b>不含 1-1 自己</b>。
+     * 这一支把三件事钉在一起，它们共用同一个位置概念：
+     * <ol>
+     *   <li>严格大于；"这个位置之后没东西"时<b>整个键不点名</b>（:1586-1593 先问存活条目的最大值），
+     *       一个键都没点名就是 {@code *-1}；</li>
+     *   <li>{@code $} 是"这条流当前的位置"（:1527-1533 取 {@code s->last_id}），不是整条流；</li>
+     *   <li>{@code XREADGROUP} 带明确 ID 读的是<b>这个消费者自己的 PEL</b>（:981-984 整支换掉
+     *       查询来源，:1083 只认本地 PEL），所以别的消费者领走的东西不会出现在这里，
+     *       而且<b>空历史也要点名这个键</b>（:1596-1598 的 arraylen 无条件自增）。</li>
+     * </ol>
+     * 判据来自源码不是对拍：参考实例是 redis-server 4.0.9，它压根没有 stream 命令族。
+     * 改之前这几条实测（battery52 共 17 行答错）：{@code XREAD … 1-1} 把 1-1 自己也交出去、
+     * {@code XREAD … $} 交回整条流、{@code XREADGROUP … <别人的位置>} 把整条流当历史交给
+     * 一个从没领过任何条目的消费者，而被 XDEL 带走的那条在历史里静默消失。
+     */
+    @Test
+    void xreadPositionsAreExclusiveAndHistoryComesFromTheConsumerPel() throws Exception {
+        int port = freePort();
+        RedisServer server = new RedisServer("127.0.0.1", port, 0);
+        Thread thread = startAndWait(server, port);
+        try (Socket socket = connect(port)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+
+            send(socket, "XADD", "sem:pos", "1-1", "a", "1");
+            assertEquals("1-1", readReply(in));
+            send(socket, "XADD", "sem:pos", "1-2", "a", "2");
+            assertEquals("1-2", readReply(in));
+            send(socket, "XADD", "sem:pos", "2-0", "a", "3");
+            assertEquals("2-0", readReply(in));
+
+            // ---- 严格大于 ----
+            send(socket, "XREAD", "STREAMS", "sem:pos", "0-0");
+            assertEquals("[[sem:pos, [[1-1, [a, 1]], [1-2, [a, 2]], [2-0, [a, 3]]]]]",
+                    readReplyDeep(in), "0-0 之后就是全部");
+            send(socket, "XREAD", "STREAMS", "sem:pos", "1-1");
+            assertEquals("[[sem:pos, [[1-2, [a, 2]], [2-0, [a, 3]]]]]",
+                    readReplyDeep(in), "1-1 自己不算——它是客户端已经读走的那一条");
+            send(socket, "XREAD", "STREAMS", "sem:pos", "2-0");
+            assertEquals("*-1", readReplyDeep(in), "没有更大的了就连键名都不该出现，不是空列表");
+            send(socket, "XREAD", "COUNT", "1", "STREAMS", "sem:pos", "1-1");
+            assertEquals("[[sem:pos, [[1-2, [a, 2]]]]]", readReplyDeep(in), "COUNT 是在严格大于之后截");
+            send(socket, "XREAD", "COUNT", "0", "STREAMS", "sem:pos", "1-1");
+            assertEquals("[[sem:pos, [[1-2, [a, 2]], [2-0, [a, 3]]]]]",
+                    readReplyDeep(in), "COUNT 0 在上游是「不限」（:1441 负数折 0，:1063 0 不截断）");
+            send(socket, "XREAD", "STREAMS", "sem:pos", "1-18446744073709551615");
+            assertEquals("[[sem:pos, [[2-0, [a, 3]]]]]",
+                    readReplyDeep(in), "seq 段用尽时后继进到毫秒段（streamIncrID :78-85）");
+            send(socket, "XREAD", "STREAMS", "sem:pos", "18446744073709551615-18446744073709551615");
+            assertEquals("*-1", readReplyDeep(in),
+                    "MAX-MAX 的后继回绕成 0-0，XREAD 靠:1591 那道闸挡住它，不能因此交出全流");
+
+            // ---- $ 是"当前的位置" ----
+            send(socket, "XREAD", "STREAMS", "sem:pos", "$");
+            assertEquals("*-1", readReplyDeep(in), "$ 就是最后一个条目，其后无物");
+            send(socket, "XREAD", "STREAMS", "sem:ghost", "$");
+            assertEquals("*-1", readReplyDeep(in), "键不在时 $ 折成 0-0，但键不在就不 serve");
+            send(socket, "XADD", "sem:pos", "3-0", "a", "4");
+            assertEquals("3-0", readReply(in));
+            send(socket, "XREAD", "STREAMS", "sem:pos", "$");
+            assertEquals("*-1", readReplyDeep(in));
+            send(socket, "XDEL", "sem:pos", "3-0");
+            assertEquals(":1", readReply(in));
+            send(socket, "XREAD", "STREAMS", "sem:pos", "$");
+            assertEquals("*-1", readReplyDeep(in), "表顶不因 XDEL 后退，$ 也就还停在 3-0");
+            send(socket, "XREAD", "STREAMS", "sem:pos", "1-2");
+            assertEquals("[[sem:pos, [[2-0, [a, 3]]]]]",
+                    readReplyDeep(in), "读得到的条目仍然读得到——$ 之外没有别的位置被抬高");
+
+            // ---- XREADGROUP 的历史位：各消费者一份 PEL ----
+            send(socket, "XADD", "sem:grp", "1-1", "a", "1");
+            assertEquals("1-1", readReply(in));
+            send(socket, "XADD", "sem:grp", "2-0", "a", "2");
+            assertEquals("2-0", readReply(in));
+            send(socket, "XGROUP", "CREATE", "sem:grp", "g", "0-0");
+            assertEquals("+OK", readReply(in));
+
+            send(socket, "XREADGROUP", "GROUP", "g", "c1", "STREAMS", "sem:grp", ">");
+            assertEquals("[[sem:grp, [[1-1, [a, 1]], [2-0, [a, 2]]]]]", readReplyDeep(in));
+            send(socket, "XREADGROUP", "GROUP", "g", "c1", "STREAMS", "sem:grp", "0-0");
+            assertEquals("[[sem:grp, [[1-1, [a, 1]], [2-0, [a, 2]]]]]",
+                    readReplyDeep(in), "c1 的历史就是它手上没 ACK 的两条");
+            send(socket, "XREADGROUP", "GROUP", "g", "c2", "STREAMS", "sem:grp", "0-0");
+            assertEquals("[[sem:grp, []]]", readReplyDeep(in),
+                    "c2 一条都没领过：点名这个键、给空列表，而不是把整条流当它的历史");
+            send(socket, "XACK", "sem:grp", "g", "2-0");
+            assertEquals(":1", readReply(in));
+            send(socket, "XREADGROUP", "GROUP", "g", "c1", "STREAMS", "sem:grp", "0-0");
+            assertEquals("[[sem:grp, [[1-1, [a, 1]]]]]", readReplyDeep(in), "ACK 过的那条从历史里退掉");
+            send(socket, "XREADGROUP", "GROUP", "g", "c1", "STREAMS", "sem:grp", "1-0");
+            assertEquals("[[sem:grp, [[1-1, [a, 1]]]]]", readReplyDeep(in),
+                    "1-0 的后继正好是 1-1：位置本身排他，加过一之后那一头是闭区间");
+            send(socket, "XREADGROUP", "GROUP", "g", "c1", "STREAMS", "sem:grp", "2-0");
+            assertEquals("[[sem:grp, []]]", readReplyDeep(in), "2-0 之后的历史是空的，但键仍要点名");
+            send(socket, "XREADGROUP", "GROUP", "g", "c1", "STREAMS", "sem:grp", "2-1");
+            assertEquals("[[sem:grp, []]]", readReplyDeep(in),
+                    "1-1 落在 2-1 之前，不该被当成 2-1 之后的历史交出去");
+            // 同一个键写两遍是两问，不是"后者覆盖前者"：上游那一段是数组，不是查表
+            send(socket, "XREADGROUP", "GROUP", "g", "c1", "STREAMS", "sem:grp", "sem:grp", "0-0", "2-0");
+            assertEquals("[[sem:grp, [[1-1, [a, 1]]]], [sem:grp, []]]", readReplyDeep(in),
+                    "两个位置各答各的，重复的键名不会被并成一个");
+            send(socket, "XREADGROUP", "GROUP", "g", "c1", "STREAMS", "sem:grp",
+                    "18446744073709551615-18446744073709551615");
+            assertEquals("[[sem:grp, [[1-1, [a, 1]]]]]", readReplyDeep(in),
+                    "历史位没有:1591 那道闸，于是看得见 MAX-MAX 后继回绕成 0-0 的效果");
+            send(socket, "XINFO", "CONSUMERS", "sem:grp", "g");
+            String consumers = readReplyDeep(in);
+            assertTrue(consumers.contains("c2, pending, :0"),
+                    "读一份空历史也要把这个消费者登记出来: " + consumers);
+
+            // ---- 历史里被 XDEL 带走的那条：交回 [id, nil]，不是悄悄少一条 ----
+            send(socket, "XADD", "sem:gone", "1-1", "f", "v");
+            assertEquals("1-1", readReply(in));
+            send(socket, "XADD", "sem:gone", "1-2", "f", "w");
+            assertEquals("1-2", readReply(in));
+            send(socket, "XGROUP", "CREATE", "sem:gone", "g", "0-0");
+            assertEquals("+OK", readReply(in));
+            send(socket, "XREADGROUP", "GROUP", "g", "c1", "STREAMS", "sem:gone", ">");
+            assertEquals("[[sem:gone, [[1-1, [f, v]], [1-2, [f, w]]]]]", readReplyDeep(in));
+            send(socket, "XDEL", "sem:gone", "1-1");
+            assertEquals(":1", readReply(in));
+            send(socket, "XREAD", "STREAMS", "sem:gone", "0-0");
+            assertEquals("[[sem:gone, [[1-2, [f, w]]]]]", readReplyDeep(in), "读流：1-1 已经不在");
+            send(socket, "XREADGROUP", "GROUP", "g", "c1", "STREAMS", "sem:gone", "0-0");
+            assertEquals("[[sem:gone, [[1-1, *-1], [1-2, [f, w]]]]]", readReplyDeep(in),
+                    "读 PEL：这条还压在账上，内容没了要明说，否则客户端以为从没领过它");
+        } finally {
+            server.stop();
+            thread.join(DEADLINE_MS);
+        }
+    }
+
+    /**
      * XPENDING 的汇总形式要给出每个消费者的真实待确认数。
      * <p>
      * 旧实现填的是 {@code consumer.getPendingCount()} —— 那个字段从没自增过，恒为 0。

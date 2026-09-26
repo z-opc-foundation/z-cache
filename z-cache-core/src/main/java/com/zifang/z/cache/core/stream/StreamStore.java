@@ -1,7 +1,6 @@
 package com.zifang.z.cache.core.stream;
 
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -144,54 +143,61 @@ public class StreamStore {
     // ==================== XREADGROUP ====================
 
     /**
-     * XREADGROUP 实现：从消费组读取新条目。
+     * XREADGROUP 的 {@code ">"} 位：把组里还没投递过的条目投给这个消费者，逐条记进 PEL。
      *
-     * @param db         数据库索引
-     * @param group      消费组名
-     * @param consumer   消费者名
-     * @param streams    key -> startId 映射（startId = ">" 表示新条目）
-     * @param count      最大返回条数
-     * @param blockMs    阻塞时间（0 = 不阻塞）
-     * @return key -> 条目列表 映射
+     * @param db       数据库索引
+     * @param key      Stream 键
+     * @param group    消费组名
+     * @param consumer 消费者名（不存在则顺手建出来）
+     * @param count    最大条数（{@code <= 0} = 不限）
+     * @return 本次投递的条目；键或组不在、或者没有新条目时为空列表
      */
-    public Map<String, List<StreamEntry>> xreadgroup(int db, String group, String consumer,
-                                                      Map<String, String> streams, int count) {
-        Map<String, List<StreamEntry>> result = new LinkedHashMap<>();
-        for (Map.Entry<String, String> entry : streams.entrySet()) {
-            String key = entry.getKey();
-            String startId = entry.getValue();
-            Stream stream = getStream(db, key);
-            if (stream == null) continue;
+    public List<StreamEntry> xreadgroupNew(int db, String key, String group, String consumer, int count) {
+        List<StreamEntry> newEntries = new ArrayList<>();
+        Stream stream = getStream(db, key);
+        if (stream == null) return newEntries;
+        ConsumerGroup cg = stream.getGroup(group);
+        if (cg == null) return newEntries;
 
-            ConsumerGroup cg = stream.getGroup(group);
-            if (cg == null) continue;
-
-            ConsumerGroup.Consumer c = cg.getOrCreateConsumer(consumer);
-
-            if (">".equals(startId)) {
-                // 读取新条目：entry ID 是 ms-seq 两段，只比毫秒段会把同一毫秒内写入的
-                // 第二条及以后永久卡在组外（XADD 在同一毫秒里连写多条是常态）
-                List<StreamEntry> allEntries = stream.getEntries();
-                List<StreamEntry> newEntries = new ArrayList<>();
-                for (StreamEntry e : allEntries) {
-                    if (cg.isNewerThanLastDelivered(e.getId())) {
-                        newEntries.add(e);
-                        cg.markDelivered(e.getId(), consumer);
-                        if (count > 0 && newEntries.size() >= count) break;
-                    }
-                }
-                if (!newEntries.isEmpty()) {
-                    result.put(key, newEntries);
-                }
-            } else {
-                // 重新投递 pending 条目（指定 ID）
-                List<StreamEntry> pending = stream.range(startId, "+", count);
-                if (!pending.isEmpty()) {
-                    result.put(key, pending);
-                }
-            }
+        cg.getOrCreateConsumer(consumer);
+        // 条目 ID 是 ms-seq 两段，只比毫秒段会把同一毫秒内写入的第二条及以后永久卡在组外
+        // （XADD 在同一毫秒里连写多条是常态）。
+        for (StreamEntry e : stream.getEntries()) {
+            if (!cg.isNewerThanLastDelivered(e.getId())) continue;
+            newEntries.add(e);
+            cg.markDelivered(e.getId(), consumer);
+            if (count > 0 && newEntries.size() >= count) break;
         }
-        return result;
+        return newEntries;
+    }
+
+    /**
+     * XREADGROUP 带明确 ID 的历史位：交回这个消费者 PEL 里不小于 {@code fromId} 的条目 ID。
+     * <p>
+     * 只交 ID，内容要调用方回查 —— 上游也正是分两步：先按 PEL 序取 ID，再拿 ID 去流里找条目，
+     * 找不到就明着交回 {@code [id, nil]}（t_stream.c:1098-1109），而不是悄悄少一条。
+     *
+     * @param fromId 闭区间起点；调用方传进来的已经是"所要位置的下一个 ID"
+     * @return 条目 ID 升序列表；空列表 = 这个消费者手上没东西。<b>null</b> 专指键或组不在，
+     *         这一支今天还不回 NOGROUP（见 CHANGELOG 的已知边界），所以不能和空历史混成一件事
+     */
+    public List<String> xreadgroupHistory(int db, String key, String group, String consumer,
+                                          String fromId, int count) {
+        Stream stream = getStream(db, key);
+        if (stream == null) return null;
+        ConsumerGroup cg = stream.getGroup(group);
+        if (cg == null) return null;
+        // 上游的 streamLookupConsumer(SLC_NONE) 会顺手把消费者建出来（:1745-1757），
+        // 所以"读一份没有的历史"也要让这个消费者出现在 XINFO CONSUMERS 里。
+        cg.getOrCreateConsumer(consumer);
+
+        List<String> ids = new ArrayList<>();
+        for (String id : cg.pendingIdsOf(consumer)) {
+            if (StreamEntry.compareIds(id, fromId) < 0) continue;
+            ids.add(id);
+            if (count > 0 && ids.size() >= count) break;
+        }
+        return ids;
     }
 
     // ==================== XACK ====================

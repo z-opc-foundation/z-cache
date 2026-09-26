@@ -1,5 +1,7 @@
 package com.zifang.z.cache.core.stream;
 
+import com.zifang.z.cache.common.protocol.StreamIdFormat;
+
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -225,5 +227,23 @@ public class Stream {
      */
     public synchronized long[] lastId() {
         return new long[]{lastTimestamp.get(), lastSequence.get()};
+    }
+
+    /**
+     * 现在还留在流里的最大 ID，也就是上游的 {@code streamLastValidID}；一条都不在时返回 null。
+     * <p>
+     * 与 {@link #lastId()} 是两件事：XDEL 掉最大那条之后表顶仍停在原处（XADD 的单调性闸
+     * 要它那样），而 XREAD 要判的是"这个位置之后还有没有条目可交"（上游 :1586-1593，
+     * 那里先 {@code if (s->length)} 再拿存活条目的最大值比大小）。
+     */
+    public long[] lastValidId() {
+        long[] best = null;
+        for (StreamEntry entry : entries) {
+            if (best == null || StreamIdFormat.compare(entry.getTimestamp(), entry.getSequence(),
+                    best[0], best[1]) > 0) {
+                best = new long[]{entry.getTimestamp(), entry.getSequence()};
+            }
+        }
+        return best;
     }
 }
