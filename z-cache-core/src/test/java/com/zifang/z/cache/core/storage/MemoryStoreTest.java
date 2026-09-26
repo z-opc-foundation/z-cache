@@ -582,4 +582,88 @@ class MemoryStoreTest {
         assertEquals(MemoryStore.DataType.NONE, store.typeOfDb(0, "inj:third"));
         assertEquals(0L, store.dbsizeDb(0));
     }
+
+    /**
+     * 六型通删：一个键名不管落在哪几张表里，一次调用要全清，并连时刻表里那一行一起回收。
+     * <p>
+     * 1.3.6 把这一问从协议层（{@code CommandHandler.deleteEveryType} 五行各调一家）搬进 store 层，
+     * 是为了下一格"集合键的 TTL"：只要"删键"还有第二把尺，"顺手摘掉过期记录"就会在某一家
+     * 静默漏掉 —— 而漏掉的行在协议层和 RDB 两头都看不见（上一格已量）。
+     * <p>
+     * 最后那一段是这一支<b>唯一不能被"命中一腿就 return"糊过去</b>的问：同一键名两张表并存
+     * （1.3.4 及之前写出来的数据形状），单腿实现删得掉一张、留下另一张，键还在。
+     */
+    @Test
+    void removeAnyTypeClearsAllSixTablesAndTheExpiryRow() {
+        byte[] v = "v".getBytes(StandardCharsets.UTF_8);
+        store.setDb(0, "rt:str", v);
+        store.getHashStore(0).hset("rt:hash", "f", v);
+        store.getListStore(0).rpush("rt:list", v);
+        store.getSetStore(0).sadd("rt:set", v);
+        store.getSortedSetStore(0).zadd("rt:zset", 1.0, v);
+        com.zifang.z.cache.core.stream.StreamStore streams =
+                new com.zifang.z.cache.core.stream.StreamStore(16);
+        java.util.Map<String, String> fields = new java.util.HashMap<>();
+        fields.put("a", "1");
+        streams.xadd(0, "rt:stream", fields, "1-1", -1);
+        store.bindStreams(streams);
+
+        MemoryStore.DataType[] types = {
+                MemoryStore.DataType.STRING, MemoryStore.DataType.HASH, MemoryStore.DataType.LIST,
+                MemoryStore.DataType.SET, MemoryStore.DataType.ZSET, MemoryStore.DataType.STREAM};
+        String[] names = {"rt:str", "rt:hash", "rt:list", "rt:set", "rt:zset", "rt:stream"};
+        for (int i = 0; i < names.length; i++) {
+            // 正面对照：这枚键真的在那把尺眼里，否则下面两句是空跑
+            assertEquals(types[i], store.typeOfDb(0, names[i]), names[i] + " 没被尺看见，前提不成立");
+            assertTrue(store.removeAnyType(0, names[i]), names[i] + " 删不掉");
+            assertEquals(MemoryStore.DataType.NONE, store.typeOfDb(0, names[i]), names[i] + " 删完还在");
+            assertFalse(store.removeAnyType(0, names[i]), names[i] + " 删第二次还回 true");
+        }
+        assertNull(streams.getStream(0, "rt:stream"), "第六张表也要真的没掉，不是只摘了别名");
+
+        // 时刻那一行跟着键走：这一问今天只能对 String 量（集合键还没有行，正是下一格要接的）
+        store.psetex("rt:ttl", 100000, v);
+        assertTrue(store.hasExpirationDb(0, "rt:ttl"), "前提：行确实挂上了");
+        assertTrue(store.removeAnyType(0, "rt:ttl"));
+        assertEquals(-1L, store.expireAtDb(0, "rt:ttl"));
+        assertRecordsHaveHost(store, 0, "六型通删之后");
+
+        // 两张表并存（绕过闸门直接摆出来，模拟旧数据）：一次调用要两半都没掉
+        store.getStringStore(0).put("rt:both", new MemoryStore.ValueWrapper(v));
+        store.getHashStore(0).hset("rt:both", "f", v);
+        assertNotNull(store.getDb(0, "rt:both"));
+        assertTrue(store.getHashStore(0).exists("rt:both"));
+        assertTrue(store.removeAnyType(0, "rt:both"));
+        assertNull(store.getDb(0, "rt:both"), "命中一腿就 return 的实现会留下 hash 那一半");
+        assertFalse(store.getHashStore(0).exists("rt:both"), "反过来只删 hash、留下 string 也一样");
+        assertEquals(MemoryStore.DataType.NONE, store.typeOfDb(0, "rt:both"));
+    }
+
+    /**
+     * 到点的键，光问一句"这是什么类型"就该把它删掉。上游 {@code lookupKeyRead} 进门先走
+     * {@code expireIfNeeded}，那一问不看类型（{@code expire.c:426} 只有 {@code lookupKeyWrite}
+     * 一道闸、没有类型分支）。
+     * <p>
+     * 这一支<b>只许问 {@code typeOfDb} 这一把尺</b>：别的读路（{@code getDb} / {@code existsDb} /
+     * {@code keysDb} / {@code dbsizeDb} / {@code ttlDb}）各自都带着惰性删除，先碰它们任何一家，
+     * 这里就退化成空跑。实测正是如此 —— 把 {@code typeOfDb} 里那一段摘掉，其余读路全在，
+     * core 那一族 398 例照旧绿（{@code logs/sixtype_M2-no-lazy-purge.log}），
+     * 所以"尺本身会不会删"这件事以前没有主人。
+     */
+    @Test
+    void theTypeQuestionAlonePurgesAnExpiredKey() throws InterruptedException {
+        MemoryStore fresh = new MemoryStore();
+        byte[] v = "v".getBytes(StandardCharsets.UTF_8);
+        fresh.psetex("lp:k", 1, v);
+        assertEquals(MemoryStore.DataType.STRING, fresh.typeOfDb(0, "lp:k"), "前提：还没到点");
+        assertTrue(fresh.hasExpirationDb(0, "lp:k"), "前提：时刻表里有这一行");
+
+        Thread.sleep(30);
+
+        assertEquals(MemoryStore.DataType.NONE, fresh.typeOfDb(0, "lp:k"),
+                "到点了，这一问要回 none —— 而不是「键还在，只是过期了」");
+        assertFalse(fresh.hasExpirationDb(0, "lp:k"), "摘的是整个键，时刻那一行不能留在表里");
+        assertNull(fresh.getStringStore(0).get("lp:k"),
+                "值也要真的没掉（直接摸那张表，绕开所有会顺手清理的读路）");
+    }
 }

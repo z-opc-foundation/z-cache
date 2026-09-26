@@ -623,17 +623,15 @@ public class CommandHandler {
      * DEL 的"删干净"和 RENAME 的"旧值整个消失"是同一条语义，必须共用一把尺。以前五路里第一条
      * 命中就 continue：一个键名下真的并存两种类型时（1.3.4 及之前写出来的，或 {@code RENAME}
      * 造出来的）只删得掉一种，另一份既读不到也删不掉，DBSIZE 还把它多算一个。
-     * 第六路是 stream —— 它不在 {@code MemoryStore} 的数组里，而是这台服务器 scope 上那份
-     * {@link StreamStore}，所以这一格只能在这里接。
+     * 第六路是 stream —— 绑了 scope 时它由 {@code MemoryStore.bindStreams} 认进
+     * {@code removeAnyType}（1.3.6 起五族加时刻表那一行都在 store 层收），但单测直接
+     * {@code new CommandHandler(store)} 走的是进程级 static 兜底那一份，store 从不认识它，
+     * 所以这一路还得在这里问一遍。两份都问是幂等的：第二遍 remove 回 false。
      */
     private boolean deleteEveryType(String k) {
-        boolean removed = false;
-        if (store.delDb(currentDb, k)) removed = true;
-        if (store.getHashStore(currentDb).del(k)) removed = true;
-        if (store.getListStore(currentDb).del(k)) removed = true;
-        if (store.getSetStore(currentDb).del(k)) removed = true;
-        if (store.getSortedSetStore(currentDb).del(k)) removed = true;
-        if (streams() != null && streams().remove(currentDb, k)) removed = true;
+        boolean removed = store.removeAnyType(currentDb, k);
+        StreamStore s = streams();
+        if (s != null && s.remove(currentDb, k)) removed = true;
         return removed;
     }
 

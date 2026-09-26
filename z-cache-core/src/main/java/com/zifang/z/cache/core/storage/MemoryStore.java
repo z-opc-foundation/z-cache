@@ -280,14 +280,18 @@ public class MemoryStore {
         if (key == null) {
             return DataType.NONE;
         }
+        // 惰性删除：时刻表是"按库、按键名"的一张表，六种类型共用这一把尺去问它 —— 与上游
+        // expireIfNeeded 的口径一致（它也不看类型，时刻就挂在 db->expire 里，见 expire.c:415-451
+        // 那一问只有 lookupKeyWrite 一道闸、没有类型分支）。
+        // 今天只有 String 键的行进得来这一支（集合键的 TTL 还没接线），所以对五种集合类型仍是
+        // 一次 containsKey 的空问；接线之后不需要再改这里。
+        if (hasExpirationDb(db, key) && isExpiredDb(db, key)) {
+            removeAnyType(db, key);   // 连键连带时刻那一行一起没，不留"只抹时刻、键留着"
+            return DataType.NONE;
+        }
         ValueWrapper wrapper = stringStores[db].get(key);
         if (wrapper != null) {
-            if (isExpiredDb(db, key)) {
-                stringStores[db].remove(key);
-                clearExpireAtDb(db, key);
-            } else {
-                return DataType.STRING;
-            }
+            return DataType.STRING;
         }
         if (hashStores[db].exists(key)) return DataType.HASH;
         if (listStores[db].exists(key)) return DataType.LIST;
@@ -793,6 +797,30 @@ public class MemoryStore {
             }
         }
         return count;
+    }
+
+    /**
+     * 六型通删：一个键名下六张表全清一遍，连它在时刻表里的那一行一起回收。
+     * 回的是"本来有没有一个还活着的键"。
+     * <p>
+     * 这一问原先长在协议层（{@code CommandHandler.deleteEveryType}），store 只答 String 那一族，
+     * 于是"摘掉过期记录"这件事在四个集合支路里**根本没有对应的动作** —— 不是漏写，是那里
+     * 没有可写的地方。时刻从 {@code ValueWrapper} 搬进每个库的键空间表之后，六型通删才在
+     * store 层有了落点：{@link #typeOfDb} 的惰性删除从此能对六种类型做同一件事。
+     * <p>
+     * 上游的对应动作是 {@code expireIfNeeded} 里的 {@code dbDelete} —— 删的是整个键，
+     * 不存在"只抹时刻、键留着"。
+     */
+    public boolean removeAnyType(int db, String key) {
+        boolean removed = delDb(db, key);
+        if (hashStores[db].del(key)) removed = true;
+        if (listStores[db].del(key)) removed = true;
+        if (setStores[db].del(key)) removed = true;
+        if (sortedSetStores[db].del(key)) removed = true;
+        com.zifang.z.cache.core.stream.StreamStore s = streams;
+        if (s != null && s.remove(db, key)) removed = true;
+        clearExpireAtDb(db, key);
+        return removed;
     }
 
     public boolean exists(String key) {

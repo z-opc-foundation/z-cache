@@ -1197,6 +1197,7 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   2. 四个集合 store 自己的 `del`（`CommandHandler.deleteEveryType` 直接调它们）不碰时刻表。
      今天没有集合键的行可收，所以那一句在这四处是**空转**、也不在任何判据里 —— 记在**未覆盖**。
      下一格要么让删除统一走一个"六型通删"的口，要么这四处各补一句。
+     **（已收：走的就是"六型通删"那一个口，见下面《六型通删》那一节。）**
 - 这一格原先还列了第 3 条"待修缺口"，**那条是我写反的，在此改口并留下证据**。原文：
   "`GETSET` 仍然把 TTL 抹成永久……而上游 `getSetCommand` 用的是 `dbOverwrite`
   （`db.c:189-206`，不清过期）"。对着 5.0.14 源码复核的三点：
@@ -1217,6 +1218,53 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
      （`~/.cache/zcache_gauges/ttl_mut/getset_teeth.py`）。
   把这段错账留在文档里而不只是删掉，理由很直接：一句话读起来像"待修缺口"，下一格就会照着动手，
   动手的结果是把正确的行为改成 bug。
+
+#### 六型通删：惰性删除与"删干净"从此只有一把尺，而且它问得到六种类型
+- `MemoryStore.removeAnyType(db, key)` 新增：一个键名下六张表全清一遍，连它在时刻表里的那一行
+  一起回收，回"本来有没有一个还活着的键"。`CommandHandler.deleteEveryType`（DEL / RENAME /
+  `S*STORE` 那六个入口共用）从五行各调一家收成一句委托。
+- `typeOfDb` 的惰性删除换成了类型无关的：先问时刻表（`hasExpirationDb && isExpiredDb`），
+  命中就 `removeAnyType`。以前那一段只认 `stringStores` 里那一张表。
+- 权威：`expireIfNeeded` 不看类型（`expire.c:415-451`，`:426` 只有 `lookupKeyWrite` 一道闸），
+  它删的是整个键（`dbSyncDelete`），不是"只抹时刻、键留着"。
+- 为什么上一格搬不动、这一格搬得动：上一格把时刻从值对象搬进"按库、按键名"的一张表，
+  六种类型这才可能有共用的"删键"落点；上一格末尾记的那条未覆盖（四个集合 store 的 `del`
+  在这一问上是空转）就是这一格收的。
+- **对外一行行为都没变**：全量 `893 → 895`（`358 + 400 + 135 + 2`，`logs/sixtype_full1.log`，
+  判据字节 md5 `73e9c74a9388f9aad17a2d307bc37195`）。今天没有任何一枚集合键能有时刻行
+  （`expireDb` 那五支还只看 `stringStores`），所以那段通用惰性删除对五种集合类型仍是一次空问 ——
+  它是下一格的承重墙，不是这一格的收益。
+- 一次踩坑又爬出来的记录：第一版把 `deleteEveryType` 整段委托掉，会把 stream 那一路删坏。
+  协议层的 `streams()` 在没有 scope 时退回进程级 static 那一份（`CommandHandler:76` 的
+  `defaultStreamStore`，`setStreamStore` 在 `:116`），而 `MemoryStore` 只认 `bindStreams`
+  进来的那一份（`RedisServer:116`）。生产的两处构造点都绑了 scope（`RedisServer:173-177`
+  连接流水线、`:249-250` AOF 重放），所以那两处是同一份、委托不会漏；而 static 兜底那一份
+  **没有任何生产调用者**（全仓 `setStreamStore` 只有 `CommandHandler:116` 那一条定义，另两处命中
+  都是注释：`RedisServerHandler.java:56`、`RedisServerLifecycleTest.java:24`）。
+  兜底腿因此留在协议层原样问一遍（两份都问是幂等的）。留着它是"不改行为"，
+  **不是"它被量过"**：这条腿今天零测试覆盖（三个裸 `new CommandHandler(store)` 的测试类里
+  XADD 计数为 0）。
+- 判据：`MemoryStoreTest` 45 → 47。两支各钉一条新路，都拿单行变异验过牙
+  （`~/.cache/zcache_gauges/ttl_mut/sixtype_teeth.py`：注入前 `cp`、每支还原后按 md5 对账、
+  基线在同一份字节上绿）：
+  - 把 `removeAnyType` 摘成"命中一腿就 return" → 红在
+    `反过来只删 hash、留下 string 也一样 ==> expected: <false> but was: <true>`
+    （钉的是同一键名两张表并存那一问 —— 逐型删除那六问反而摘不到，因为它们各自只有一张表有键）；
+  - 摘掉 `typeOfDb` 里惰性删除那一段 → 红在
+    `到点了，这一问要回 none —— 而不是「键还在，只是过期了」 ==> expected: <NONE> but was: <STRING>`。
+  **第二支第一遍是 SURVIVED 的**：那一次整套 core（当时 398 例）全绿。原因是
+  `getDb` / `existsDb` / `keysDb` / `dbsizeDb` / `ttlDb` 五家各自还带着自己的惰性删除，
+  任何一家先被碰到，`typeOfDb` 这一问就被掩盖掉了。补的那支因此刻意**只问 `typeOfDb` 一把尺**，
+  并且直接摸 `getStringStore(0)` 那张原始表来验"值真的没掉"，绕开所有会顺手清理的读路。
+  这一段值得留在文档里：多把尺互相兜底的代价不是重复劳动，是**兜底之间互相遮掩** ——
+  坏掉的那一把没人能发现。
+- 还没做的：① `expireDb` / `pexpireDb` / `persistDb` / `ttlDb` / `pttlDb` 五支仍然只看
+  `stringStores`，fence 原样在 `RedisServerProtocolSemanticsTest:4141-4156`（钉的是我们
+  在流键和 list 键上都回 `:0`、上游回 `:1`），翻它是下一格；② `removeAnyType` 里那句
+  `clearExpireAtDb` 对集合键还是保险 —— 今天构造不出"集合键 + 时刻行"，翻完 fence 它才是真腿；
+  ③ dump 那一族只有 String 节写过期栏，四个集合节压根没有这一栏、载入端把 `expireAt` 整个丢掉，
+  补它要把 `ZCHRDB` 的 `RDB_VERSION`（`RdbPersistence.java:65`、`:70`，载入端 `:569` 版本不符直接拒读）
+  抬到 2 并先定旧档怎么办。
 
 ### Added
 - `RedisServer.serverScope()`：只读拿到本台那一份，测试与嵌入式据此判断作用域边界。
