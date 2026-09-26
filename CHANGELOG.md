@@ -2,6 +2,135 @@
 
 All notable changes to z-cache will be documented in this file.
 
+## [1.3.5] - 2026-09-26
+
+### Fixed
+
+#### 类型闸门整个缺席：拿错类型的命令读一个键，会静默给出"不存在"
+- `WRONGTYPE` 在任何路径上都没有被检查过。`SET k v` 之后 `HGET k f` 回 `$-1`——那不是"这个字段
+  没有值"，那是键根本不是 hash，而客户端收到的形状和真的没有该字段时一模一样；`LPUSH k x`
+  更是直接往另一棵存储里写，同一个键名下两种类型并存，`DBSIZE` 只数一个位置、`TYPE` 只报一种。
+- 现在 `MemoryStore.typeOfDb(db, key)` 是唯一的尺（`EXISTS` / `TYPE` / 写侧闸门共用它），
+  命令按自己的键位置逐位校验（`SINGLE` / `ALL` / `ALL_BUT_LAST` / `FIRST_TWO` / `FROM_SECOND`，
+  表里 76 条命令，覆盖 String / Hash / List / Set / ZSet 五族），命中别的类型回 `-WRONGTYPE`。
+- `SET` / `SETEX` / `PSETEX` 刻意不在这张表里：Redis 的 `dbOverwrite` 就是让它们盖掉旧值，
+  旧类型由 `MemoryStore.putDb` 的 `clearOtherTypes` 负责清。
+- `DEL` 同步修掉：它此前只清 `keyTypeMaps` 里记着的那一种，另一种留在原地。闸门让"两种类型并存"
+  不再能被写出来，但 `DBSIZE` 归零这件事得由 `DEL` 自己保证——现在它逐棵存储清键，
+  每个键名只计一次删除数。
+
+#### EXEC 的"随机中止"：上一条事务的 WATCH 从来没被清掉
+- `resetContext()` 的注释写着"保留 WATCH 信息"，Redis 的语义却是 **EXEC 与 DISCARD 都会 flush
+  全部被观察键**。后果是这条连接之后每个 `EXEC` 都可能被一次毫不相干的写入打掉，而肇因来自
+  一条早就结束的事务——看着像事务随机失败。
+
+#### WATCH 的两把尺各量各的：该中止的中止不了，不该中止的反倒中止
+- `watch()` 快照版本用调用方给的 provider，`exec()` 复查却调 `getCurrentVersion()`——它的旧实现
+  `return 0L`，注释说"子类可覆盖"，而没有任何子类覆盖过。于是"WATCH 之后别人改了键"永远测不出
+  来（照常提交），而"WATCH 之前键就写过版本非 0"反倒比出假不一致（无端中止）。方向整个是反的。
+- provider 现在随 `watch()` 存进这条连接自己的 `TransactionManager`，WATCH 与 EXEC 共用同一把尺。
+- 版本号的命名空间必须含库号：以前 `keyVersions` 只按键名记，`WATCH` 落在 3 号库、别人在 0 号库
+  写同名键就能把这条事务打掉。现在 `getKeyVersion(db, key)` / `bumpKeyVersion(db, key)`，
+  且 `WATCH` 把当时的库号快照下来（中途 `SELECT` 到别的库再用同名键比对是另一个库的写入）。
+- `bumpWatchedKeys()` 补齐多键写命令（`RPOPLPUSH` / `LMOVE` / `SMOVE` 的目标键）与 `MSET`
+  的逐键 bump，否则这些命令改了被 WATCH 的键而版本号不动。
+
+#### XREADGROUP 永远投不出去的第二个条目
+- `">"` 的判断只比较条目 ID 的**毫秒段**。同一毫秒内 `XADD` 两条（测试里 `1-1`、`1-2` 就是这么来的，
+  生产中用 `*` 也常常撞上），第二条的毫秒段不"新于"游标，于是**永久**取不到，且没有任何报错——
+  消费组看着像漏消息。现在游标记满两段（`lastDeliveredId` + `lastDeliveredSeq`），
+  `isNewerThanLastDelivered()` 按完整 ID 比较；`XGROUP CREATE` 的起始 ID 同样按两段解析。
+
+#### XPENDING 有三处对不上账
+- 每个消费者的待确认数此前填的是 `consumer.getPendingCount()`，而那个自增计数器从来没有累加过：
+  `XREADGROUP` 领了三条、一条没 ACK，`XPENDING` 仍报 0。现在从 `pendingEntries` 现算，
+  账上为 0 的消费者也照常列出（Redis 的汇总就包含它们）。
+- 汇总数从 `StreamStore.xpending()` 的 `Object[]` 里按 `(Long)` 取，而生产侧放的是 `Integer`
+  ⇒ 走 socket 的 `XPENDING key group` 必回 `-ERR internal error: class java.lang.Integer cannot
+  be cast to class java.lang.Long`。这条路径以前没有任何测试经过，所以一直没现形。
+- 键或消费组不存在时回**空数组**：客户端把它读成"0 条待确认"，即"一切正常"。现在回
+  `-NOGROUP No such key '...' or consumer group '...'`。
+- 未实现的明细形态（`IDLE` / `start end count [consumer]`）明确报错，不再把多余参数丢掉、
+  拿汇总冒充明细。
+
+#### XINFO CONSUMERS 只存在于注释里
+- `handleXinfo` 的 javadoc 写着支持 `CONSUMERS`，`switch` 里却没有这个 case，
+  所以 `XINFO CONSUMERS key group` 永远回 `-ERR syntax error`。现在给出真实消费者行。
+
+#### XADD / XTRIM 的 MAXLEN 参数形状不合 Redis
+- 不认 `MAXLEN ~` / `MAXLEN =`（近似与精确两种前缀都是 Redis 的合法写法），`~` 时直接把
+  `~` 当成数字解析而失败；缺 count 时报错形状也不对。现在两种前缀都收，非整数回
+  `-ERR value is not an integer or out of range`，负数回 `-ERR MAXLEN requires a non-negative integer`。
+- `XTRIM key MAXLEN 0` 此前什么都不清（`entries.size() - 0` 算出的删除数被当成 0），
+  现在如实清空整条流。
+
+#### SLOWLOG 从未接到真实服务器上
+- `SlowLog` 的静态字段只有测试赋过值，真实服务器里恒为 `null`，`handle()` 末尾读它的那几行
+  也就恒不执行 ⇒ `SLOWLOG GET` 永远回 `-ERR SlowLog not configured`，而直接 `new CommandHandler`
+  的单测反倒全绿。`RedisServer.initPersistence()` 现在按 `-Dzcache.slowlog-log-slower-than`
+  （默认 10ms）建一份并接上，`DEBUG SLOWLOG-RESET` 与 `SLOWLOG RESET` 走同一个对象。
+
+#### INFO 报的端口和版本不是这台服务器
+- `tcp_port` 写死 `6379`，而 `--port 0`（compose/测试里真实存在）时监听端口完全是另一个数；
+  `z-cache_version` 写死 `1.0.2`，pom 早已是 1.3.x。现在端口取这条连接实际绑到的那个，
+  版本与 `ZCacheServerMain` 共用 `CommandHandler.serverVersion()`（读 MANIFEST，读不到如实报 `dev`）。
+
+#### CLIENT LIST 只列发起者自己，sub=/psub= 恒 0；CLIENT KILL 是假 +OK
+- `CLIENT LIST` 以前只拼发起者那一行，等于"连接列表"里永远只有一个元素；`sub=0 psub=0` 是写死的
+  字面量，而不是"没量到"——订阅中的连接被 pub/sub 闸门挡住根本执行不了 `CLIENT`，能从 socket
+  看到这些字段的只有旁观者，所以那个 0 永远不会被任何人证伪。现在 LIST 遍历本机连接表，
+  `sub=`/`psub=`/`age=`/`idle=`/`multi=`/`cmd=` 全部取真实状态，并补 `CLIENT INFO`。
+- `CLIENT KILL` 以前"收下参数、回 `+OK`、什么都不做"：调用方据此认为对端已被踢掉，而对端好端端
+  活着。现在支持 `ID <id>` / `LADDR ip:port` / `addr ip:port` / 客户端名四种形式，真的关闭目标
+  连接，找不到才回 `-ERR No such client`。
+
+#### 一台服务器的 pub/sub 与连接表会漏进另一台
+- `pubSubManager` 与连接登记表都是 `CommandHandler` 上的**裸静态字段**，而且每 accept 一条连接，
+  `RedisServerHandler` 的构造函数就覆写一次那个静态量。同一个 JVM 里两台服务器（跑整模块测试正是
+  这个形态）会出现"A 的 SUBSCRIBE 记进一个管理器、B 的 CLIENT LIST 读另一个"，量出
+  `sub=1 psub=0` 这种对不上账的数；跨实例的 `CLIENT KILL` 还能踢掉别人服务器的客户端。
+- 注入探针实测过旧代码：在 B 上 `PUBLISH` 一个只有 A 订阅的频道，返回 **`:1`**（应为 `:0`）——
+  不是显示问题，是一条服务器的订阅者真的会收到另一台服务器上发布消息的通路。
+- 现在每台服务器持有自己的连接登记表与 MONITOR 集合，由 `RedisServer` 经
+  `RedisServerHandler` 注入到该服务器的每条连接（`bindSharedComponents`），静态字段退化为
+  "没人注入过"时的进程级默认值（嵌入式与单测走那条），路径行为不变。
+- `channelContext` 补 `volatile`：`CLIENT LIST` 是旁观者线程直接读**别的连接**的 handler 字段，
+  以前没有任何 happens-before，这正是"整模块连跑才复现、单跑全绿"的那种间歇来源。
+
+### Added
+- 新文件 `RedisServerProtocolSemanticsTest`：16 条走真实 Netty 监听 + RESP 往返的协议语义测试
+  （慢日志接线、INFO 真端口/真版本、`BRPOPLPUSH`、单键单类型、六种类型的 WATCH 中止、
+  库号隔离、`XTRIM`/`XADD` 的 MAXLEN 形状、`XPENDING` 真实计数、`XINFO CONSUMERS`、
+  EXEC/DISCARD 清 WATCH、CLIENT LIST/KILL/INFO、未实现命令如实报错、跨实例隔离）。
+  这一类缺陷单测看不见：直接 `new CommandHandler` 绕过的是真实连接装配，所以判据一律从 socket 拿。
+- 全量 `mvn -B test`：96 + 336 + 133 + 2 = **567 例全绿**（五个模块）。
+
+### 已知边界（本次没修，说清楚）
+- **只有 RESP2**：README 此前第一行写着"RESP2/RESP3 兼容"，实测 `src/main` 里 `HELLO` 零处理
+  （连 `case "HELLO"` 都没有），RESP3 的双推/`Map` 类型回复一概不存在。本轮把那句话改成 RESP2，
+  但协议本身没有升级——需要 RESP3 的客户端请用 `HELLO` 失败的兜底路径（多数驱动默认走 RESP2）。
+- **`EVAL` / `EVALSHA` / `SCRIPT` 从未实现**，而 README 的命令表里标的是 ✅：服务端没有 Lua
+  解释器，`DistributedLock` 因此退化成"先 GET 校验再 DEL"的非原子写法。本轮只把表里那格改成
+  🚧，没有顺手补解释器。
+- **`EXPIRE` / `TTL` / `PERSIST` 只认 String 键**：`MemoryStore.expireDb` 从 `stringStores` 取键，
+  实测（socket 层，本轮量出来的）对一个 `HSET` 出来的 hash 键：`EXPIRE k 100` 回 `:0`、
+  `TTL k` 回 `:-2`、`PERSIST k` 回 `:0`，而同一个键 `TYPE` 回 `+hash`、`EXISTS` 回 `:1`。
+  也就是说集合键**永远不会过期**，而 `TTL` 的 `-2`（"键不存在"）与 `EXISTS` 的 `1` 直接互相打脸。
+  Redis 在这些命令上都回 `:1` 并真的挂上 TTL。修它需要一套逐类型的过期存储，不在本轮范围内；
+  本轮把 `EXISTS` / `TYPE` / 类型闸门统一到 `typeOfDb` 之后，这个分歧从"看不出来"变成"量得出来"。
+- `MemoryStore.keyTypeMaps` 仍是半接线状态（只有 String 写路径维护它）：`typeOfDb()` 已经不读它，
+  但键空间遍历侧还有人在读，所以它没被删。
+- `SlowLog` / `StreamStore` / AOF / RDB 仍是进程级静态：同一 JVM 里两台服务器共用一份。
+  `StreamStore` 尤其明显——A 机 `FLUSHDB` 会把 B 机的 stream 一起清掉。
+- `MONITOR` 的可见范围已随连接表收到"每台服务器一份"，但 `monitorClients` 的默认值仍是进程级
+  集合：未经 `RedisServer` 装配的连接（单测直接 new）会落进那个共享集合里。
+- 未实现的命令一律如实报错而不是冒充：`XREAD`/`XREADGROUP` 没有 `BLOCK`；`XPENDING` 没有明细形态；
+  `CLIENT NO-EVICT`、`DEBUG OBJECT` 明确拒绝。
+- Stream 仍然完全不进持久化（沿 1.3.4 的边界）。
+- `keyVersions` 只增不减：长跑进程里每个被写过的键都留一个条目，没有回收路径。
+- `ConnectionResourceRegistry` 是死代码（主代码零调用方），它的 `getIdleTimeMs()` 复制粘贴错了、
+  返回的是 maxmemory-policy 字符串。本轮没有接线也没有删，避免"顺手改动"混进这版。
+
 ## [1.3.4] - 2026-09-26
 
 ### Fixed

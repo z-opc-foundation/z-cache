@@ -31,6 +31,18 @@ public class PubSubManager {
 
     private static final Logger logger = LogManager.getLogger(PubSubManager.class);
 
+    /** 这条连接当前持有的精确频道订阅数（CLIENT LIST 的 {@code sub=} 用它，不再写死 0）。 */
+    public int channelCount(ChannelHandlerContext ctx) {
+        Set<String> channels = ctx == null ? null : clientChannels.get(ctx);
+        return channels == null ? 0 : channels.size();
+    }
+
+    /** 这条连接当前持有的模式订阅数（CLIENT LIST 的 {@code psub=}）。 */
+    public int patternCount(ChannelHandlerContext ctx) {
+        Set<String> patterns = ctx == null ? null : clientPatterns.get(ctx);
+        return patterns == null ? 0 : patterns.size();
+    }
+
     /**
      * 检查客户端是否有任何订阅（精确频道或模式）。
      *

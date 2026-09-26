@@ -37,21 +37,66 @@ public class CommandHandler {
     private int currentDb = 0;
     private final TransactionManager transactionManager;
     private final TransactionManager.TransactionContext transactionContext;
-    private ChannelHandlerContext channelContext;
+    /**
+     * 这条连接的 channel 上下文。必须 volatile：CLIENT LIST 是"旁观者线程直接读别人的
+     * CommandHandler"（见 {@code handleClient} 的 LIST 分支），没有 volatile 时旁观者
+     * 按规范可以读到过期值，症状就是 sub=/psub= 与真实订阅态对不上，且只在整模块连跑时现形。
+     */
+    private volatile ChannelHandlerContext channelContext;
+    /**
+     * 这条连接真实监听到的端口。bind(0) 时配置里写的 6379 和实际端口不是一回事，
+     * INFO 只能报后者；做成 per-connection 而不是静态量，是因为一个 JVM 里会同时
+     * 起多个端口不同的服务器实例（测试就是这种形态），静态量会互相串。
+     * 未经连接驱动（单测直接 handle()）时保持 0，INFO 就如实报 0。
+     */
+    private volatile int localPort;
 
-    // 共享组件
-    private static PubSubManager pubSubManager;
-    private static SlowLog slowLog;
-    private static AofPersistence aofPersistence;
-    private static RdbPersistence rdbPersistence;
-    private static StreamStore streamStore;
+    // 共享组件。
+    //
+    // pub/sub 管理器与连接登记表以前是裸静态字段，而且每条新连接的 handler 构造函数都会
+    // 覆写一遍 pubSubManager —— 一个 JVM 里同时起两台服务器（整模块连跑就是这个形态）时，
+    // 两条连接完全可能各自读到不同实例：SUBSCRIBE 记进 A、PSUBSCRIBE 记进 B，
+    // CLIENT LIST 再读出 sub=1 psub=0 这种对不上账的数。
+    //
+    // 现在这两样优先用"这条连接所属服务器"注入的那一份（{@link #bindSharedComponents}），
+    // 静态的只当"没人注入过"时的进程级默认值（嵌入式与单测走那条）。
+    //
+    // 剩下四个仍是进程级（SlowLog / AOF / RDB / StreamStore）：加 volatile 只解决可见性，
+    // 同 JVM 多实例仍共用一份，这条边界在 CHANGELOG 里写明，不当已修。
+    private static volatile PubSubManager defaultPubSubManager;
+    private static volatile SlowLog slowLog;
+    private static volatile AofPersistence aofPersistence;
+    private static volatile RdbPersistence rdbPersistence;
+    private static volatile StreamStore streamStore;
 
-    /** MONITOR 模式的客户端集合（共享） */
-    private static final java.util.Set<ChannelHandlerContext> monitorClients =
-            java.util.concurrent.ConcurrentHashMap.newKeySet();
+    /** 进程级默认连接登记表：没有服务器注入时（单测直接 new）用这一份。 */
+    private static final java.util.concurrent.ConcurrentMap<ChannelHandlerContext, CommandHandler> DEFAULT_CONNECTIONS
+            = new java.util.concurrent.ConcurrentHashMap<>();
+    /** 进程级默认 MONITOR 集合，口径同上。 */
+    private static final java.util.Set<ChannelHandlerContext> DEFAULT_MONITOR_CLIENTS
+            = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /** 这条连接实际使用的 pub/sub 管理器；未注入时退回进程级默认值。 */
+    private volatile PubSubManager pubSubManager;
+    /**
+     * 这条连接所属服务器的连接登记表：{@code ctx -> 该连接的 CommandHandler}。
+     * CLIENT LIST 要列出所有连接（以前只列发起者自己那一条，等于没有列表），CLIENT KILL
+     * 要能按地址/id 找到目标并真的关掉它；连接在 {@link #setChannelContext} 里入表、
+     * {@link #onDisconnect} 里出表。范围是"这台服务器"，不是整个 JVM。
+     */
+    private volatile java.util.concurrent.ConcurrentMap<ChannelHandlerContext, CommandHandler> connections
+            = DEFAULT_CONNECTIONS;
+
+    /** MONITOR 客户端集合，作用域与 {@link #connections} 一致。 */
+    private volatile java.util.Set<ChannelHandlerContext> monitorClients = DEFAULT_MONITOR_CLIENTS;
 
     /** 每连接客户端名称（CLIENT SETNAME / GETNAME） */
     private volatile String clientName;
+
+    /** 建连时间与最后一次真正执行命令的时间，CLIENT LIST 的 age=/idle= 由它们算。 */
+    private final long connectedAtMs = System.currentTimeMillis();
+    private volatile long lastCommandMs = System.currentTimeMillis();
+    private volatile String lastCommand = "NULL";
 
     // ======================== 构造 ========================
 
@@ -67,15 +112,72 @@ public class CommandHandler {
         this.transactionContext = new TransactionManager.TransactionContext();
     }
 
-    // ---- 共享组件 setter ----
-    public static void setPubSubManager(PubSubManager m) { pubSubManager = m; }
+    // ---- 共享组件 setter：进程级默认值，未注入过的连接读这一份 ----
+    public static void setPubSubManager(PubSubManager m) { defaultPubSubManager = m; }
     public static void setSlowLog(SlowLog l) { slowLog = l; }
     public static void setAofPersistence(AofPersistence a) { aofPersistence = a; }
     public static void setRdbPersistence(RdbPersistence r) { rdbPersistence = r; }
     public static void setStreamStore(StreamStore ss) { streamStore = ss; }
 
+    /**
+     * 把这条连接接到它所属服务器的那一份共享状态上。由
+     * {@link com.zifang.z.cache.core.server.RedisServerHandler} 在建管道时调用一次。
+     * <p>
+     * 传 null 的那一项退回进程级默认值，所以单测直接 new {@code CommandHandler}、
+     * 或用旧的两/三参 {@code RedisServerHandler} 构造器的路径行为不变。
+     *
+     * @param pubSub    这台服务器的 pub/sub 管理器
+     * @param registry  这台服务器的连接登记表（CLIENT LIST / KILL 的可见范围）
+     * @param monitors  这台服务器的 MONITOR 集合
+     */
+    public void bindSharedComponents(PubSubManager pubSub,
+                                    java.util.concurrent.ConcurrentMap<ChannelHandlerContext, CommandHandler> registry,
+                                    java.util.Set<ChannelHandlerContext> monitors) {
+        this.pubSubManager = pubSub;
+        if (registry != null) {
+            this.connections = registry;
+        }
+        if (monitors != null) {
+            this.monitorClients = monitors;
+        }
+    }
+
+    /** pub/sub 管理器：先用这台连接所属服务器注入的那份，没有再退回进程级默认值。 */
+    private PubSubManager pubSub() {
+        PubSubManager bound = this.pubSubManager;
+        return bound != null ? bound : defaultPubSubManager;
+    }
+
     public static StreamStore getStreamStore() { return streamStore; }
-    public void setChannelContext(ChannelHandlerContext ctx) { this.channelContext = ctx; }
+    public static SlowLog getSlowLog() { return slowLog; }
+
+    /**
+     * 绑定的同时把这条连接实际监听到的端口记下来：INFO 报的是它，不是配置里的默认 6379
+     * （{@code bind(0)} 时两者必然不同）。EmbeddedChannel / 无连接驱动时拿不到
+     * InetSocketAddress，端口保持 0，INFO 就如实报 0。
+     */
+    public void setChannelContext(ChannelHandlerContext ctx) {
+        if (ctx != null) {
+            connections.put(ctx, this);
+            if (ctx.channel().localAddress() instanceof java.net.InetSocketAddress) {
+                this.localPort = ((java.net.InetSocketAddress) ctx.channel().localAddress()).getPort();
+            }
+        } else if (channelContext != null) {
+            connections.remove(channelContext);
+        }
+        this.channelContext = ctx;
+    }
+
+    /**
+     * 对外宣告的产品版本号。与 {@code ZCacheServerMain} 共用这一把尺：读打包进 MANIFEST 的
+     * Implementation-Version，裸 IDE/classes 目录运行时读不到就如实报 dev，
+     * 不再在任何地方硬写一个数字——上一版 INFO 里写着 1.0.2，而 pom 已经是 1.3.x。
+     */
+    public static String serverVersion() {
+        Package p = CommandHandler.class.getPackage();
+        String v = p == null ? null : p.getImplementationVersion();
+        return v == null || v.isEmpty() ? "dev" : v;
+    }
 
     /**
      * 该连接是否正处在 MULTI 的"入队"阶段（EXEC 真正执行时不算）。
@@ -90,11 +192,13 @@ public class CommandHandler {
      * 清理该连接的 PubSub 订阅、事务上下文。
      */
     public void onDisconnect() {
-        if (pubSubManager != null && channelContext != null) {
-            pubSubManager.removeClient(channelContext);
+        PubSubManager pubSub = pubSub();
+        if (pubSub != null && channelContext != null) {
+            pubSub.removeClient(channelContext);
         }
         if (channelContext != null) {
             monitorClients.remove(channelContext);
+            connections.remove(channelContext);
         }
         if (transactionManager != null) {
             transactionManager.cleanup(transactionContext);
@@ -135,10 +239,15 @@ public class CommandHandler {
         logger.debug("Processing command: {} with {} args", cmd, args.length);
 
         long startTime = System.nanoTime();
+        // CLIENT LIST 的 cmd=/idle= 取的是"这条连接最后处理的命令"。放在 pubsub 闸门与
+        // MULTI 入队之前，两条早退路径才不会把它跳过去 —— 一个常年订阅的连接，
+        // idle= 不该停在它刚建立时的那一刻。
+        this.lastCommand = cmd;
+        this.lastCommandMs = System.currentTimeMillis();
 
         // Pub/Sub 模式检查
-        if (pubSubManager != null && channelContext != null
-                && pubSubManager.isSubscribed(channelContext)) {
+        PubSubManager pubSub = pubSub();
+        if (pubSub != null && channelContext != null && pubSub.isSubscribed(channelContext)) {
             switch (cmd) {
                 case "SUBSCRIBE":    return handleSubscribe(args);
                 case "UNSUBSCRIBE":  return handleUnsubscribe(args);
@@ -160,6 +269,9 @@ public class CommandHandler {
             transactionManager.addCommand(transactionContext, args);
             return RespSimpleString.of("QUEUED");
         }
+
+        RespError conflict = typeConflict(args);
+        if (conflict != null) return conflict;
 
         try {
             Object result;
@@ -222,7 +334,7 @@ public class CommandHandler {
                 case "RPOPLPUSH":result = handleRpoplpush(args);  break;
                 case "BLPOP":    result = handleBpop(args, "LEFT");    break;
                 case "BRPOP":    result = handleBpop(args, "RIGHT");   break;
-                case "BRPOPLPUSH": result = handleRpoplpush(args); break;
+                case "BRPOPLPUSH": result = handleBrpoplpush(args); break;
                 case "HRANDFIELD": result = handleHrandfield(args); break;
                 case "SSCAN":    result = handleSscan(args);      break;
                 case "ZSCAN":    result = handleZscan(args);      break;
@@ -369,7 +481,10 @@ public class CommandHandler {
                 default: return RespError.syntaxError();
             }
         }
-        boolean exists = store.existsDb(currentDb, key);
+        // NX/XX 问的是"这个键在不在"，不是"string 命名空间里有没有"：同一份判据 EXISTS /
+        // CLIENT 那边用的是 keyExists。以前只看 existsDb（只看 String），于是对一个
+        // hash 键执行 SET k v NX 会回 OK —— 键明明存在，只是不是 string。
+        boolean exists = keyExists(key);
         if (nx && exists) return RespBulkString.nullBulkString();
         if (xx && !exists) return RespBulkString.nullBulkString();
         byte[] val = value.getBytes(StandardCharsets.UTF_8);
@@ -390,11 +505,16 @@ public class CommandHandler {
         long count = 0;
         for (int i = 1; i < args.length; i++) {
             String k = args[i];
-            if (store.delDb(currentDb, k)) { count++; continue; }
-            if (store.getHashStore(currentDb).del(k)) { count++; continue; }
-            if (store.getListStore(currentDb).del(k)) { count++; continue; }
-            if (store.getSetStore(currentDb).del(k)) { count++; continue; }
-            if (store.getSortedSetStore(currentDb).del(k)) count++;
+            // 每种类型都要清：以前五路里第一条命中就 continue，万一某个键名下真的并存着两种类型
+            // （1.3.4 及之前写出来的、或手工塞进 store 的），DEL 会回 1 让调用方以为删干净了，
+            // 实际另一份数据还在，DBSIZE 也还把它算成一个键。
+            boolean removed = false;
+            if (store.delDb(currentDb, k)) removed = true;
+            if (store.getHashStore(currentDb).del(k)) removed = true;
+            if (store.getListStore(currentDb).del(k)) removed = true;
+            if (store.getSetStore(currentDb).del(k)) removed = true;
+            if (store.getSortedSetStore(currentDb).del(k)) removed = true;
+            if (removed) count++;
         }
         return RespInteger.of(count);
     }
@@ -510,13 +630,8 @@ public class CommandHandler {
 
     private Object handleType(String[] args) {
         if (args.length != 2) return RespError.wrongNumberOfArguments("TYPE");
-        String k = args[1];
-        if (store.existsDb(currentDb, k)) return RespSimpleString.of("string");
-        if (store.getHashStore(currentDb).exists(k)) return RespSimpleString.of("hash");
-        if (store.getListStore(currentDb).exists(k)) return RespSimpleString.of("list");
-        if (store.getSetStore(currentDb).exists(k)) return RespSimpleString.of("set");
-        if (store.getSortedSetStore(currentDb).exists(k)) return RespSimpleString.of("zset");
-        return RespSimpleString.of("none");
+        // 与 EXISTS、类型闸门共用 MemoryStore.typeOfDb 这一把尺，三者不会再互相打脸
+        return RespSimpleString.of(store.typeOfDb(currentDb, args[1]).name().toLowerCase());
     }
 
     private Object handleDbsize() { return RespInteger.of(store.dbsizeDb(currentDb)); }
@@ -880,7 +995,10 @@ public class CommandHandler {
                     for (int i = 0; i < a.length; i++) s[i] = a[i] == null ? null : a[i].toString();
                     return handle(RespArray.of(Arrays.stream(s).map(x -> (Object) RespBulkString.of(x)).toArray()));
                 });
-                return r == null ? RespError.of("ERR", "EXECABORT Transaction discarded because of previous errors.") : r;
+                // exec() 只在一种情况下回 null：WATCH 的键被别的连接改过。Redis 对这种中止
+                // 回的是空多批量 *-1（客户端按"nil = 没提交"判断），不是 -EXECABORT ——
+                // 后者专用于"入队阶段就有语法/参数错误"，而我们根本不记那种错误。
+                return r == null ? RespArray.nullArray() : r;
             } finally {
                 executingTransaction = false;
             }
@@ -891,7 +1009,10 @@ public class CommandHandler {
     private Object handleDiscard() { try { transactionManager.discard(transactionContext); return RespSimpleString.of("OK"); } catch (IllegalStateException e) { return RespError.of("ERR",e.getMessage()); } }
     private Object handleWatch(String[] args) {
         if (args.length < 2) return RespError.wrongNumberOfArguments("WATCH");
-        try { transactionManager.watch(transactionContext, Arrays.copyOfRange(args,1,args.length), store::getKeyVersion); return RespSimpleString.of("OK"); } catch (IllegalStateException e) { return RespError.of("ERR",e.getMessage()); }
+        // 快照 WATCH 当时所在的库：Redis 的 WATCH 键属于当前库，中途 SELECT 到别的库
+        // 再用同名键的当前版本比对，等于拿另一个库的写入中止这个库的事务。
+        final int watchDb = currentDb;
+        try { transactionManager.watch(transactionContext, Arrays.copyOfRange(args,1,args.length), k -> store.getKeyVersion(watchDb, k)); return RespSimpleString.of("OK"); } catch (IllegalStateException e) { return RespError.of("ERR",e.getMessage()); }
     }
     private Object handleUnwatch() { transactionManager.unwatch(transactionContext); return RespSimpleString.of("OK"); }
 
@@ -899,43 +1020,57 @@ public class CommandHandler {
 
     private Object handleSubscribe(String[] args) {
         if (args.length<2) return RespError.wrongNumberOfArguments("SUBSCRIBE");
-        if (pubSubManager==null) return RespError.of("ERR","Pub/Sub not configured");
-        String[] ch = Arrays.copyOfRange(args,1,args.length); pubSubManager.subscribe(channelContext, ch);
-        Object[] r = new Object[ch.length]; for (int i=0;i<ch.length;i++) r[i]=RespArray.of(RespBulkString.of("subscribe"),RespBulkString.of(ch[i]),RespInteger.of(i+1));
+        PubSubManager pubSub = pubSub();
+        if (pubSub==null) return RespError.of("ERR","Pub/Sub not configured");
+        String[] ch = Arrays.copyOfRange(args,1,args.length);
+        int already = pubSub.channelCount(channelContext) + pubSub.patternCount(channelContext);
+        pubSub.subscribe(channelContext, ch);
+        Object[] r = new Object[ch.length]; for (int i=0;i<ch.length;i++) r[i]=RespArray.of(RespBulkString.of("subscribe"),RespBulkString.of(ch[i]),RespInteger.of(already + i + 1));
         return ch.length==1 ? r[0] : RespArray.of(r);
     }
     private Object handleUnsubscribe(String[] args) {
-        if (pubSubManager==null) return RespSimpleString.of("OK");
-        String[] ch = args.length<2 ? new String[0] : Arrays.copyOfRange(args,1,args.length); pubSubManager.unsubscribe(channelContext, ch);
+        PubSubManager pubSub = pubSub();
+        if (pubSub==null) return RespSimpleString.of("OK");
+        String[] ch = args.length<2 ? new String[0] : Arrays.copyOfRange(args,1,args.length);
+        int before = pubSub.channelCount(channelContext) + pubSub.patternCount(channelContext);
+        pubSub.unsubscribe(channelContext, ch);
         if (ch.length==0) return RespArray.empty();
-        Object[] r = new Object[ch.length]; for (int i=0;i<ch.length;i++) r[i]=RespArray.of(RespBulkString.of("unsubscribe"),RespBulkString.of(ch[i]),RespInteger.of(0));
+        Object[] r = new Object[ch.length]; for (int i=0;i<ch.length;i++) r[i]=RespArray.of(RespBulkString.of("unsubscribe"),RespBulkString.of(ch[i]),RespInteger.of(Math.max(0, before - (i + 1))));
         return ch.length==1 ? r[0] : RespArray.of(r);
     }
     private Object handlePsubscribe(String[] args) {
         if (args.length<2) return RespError.wrongNumberOfArguments("PSUBSCRIBE");
-        if (pubSubManager==null) return RespError.of("ERR","Pub/Sub not configured");
-        String[] p = Arrays.copyOfRange(args,1,args.length); pubSubManager.psubscribe(channelContext, p);
-        Object[] r = new Object[p.length]; for (int i=0;i<p.length;i++) r[i]=RespArray.of(RespBulkString.of("psubscribe"),RespBulkString.of(p[i]),RespInteger.of(i+1));
+        PubSubManager pubSub = pubSub();
+        if (pubSub==null) return RespError.of("ERR","Pub/Sub not configured");
+        String[] p = Arrays.copyOfRange(args,1,args.length);
+        int already = pubSub.channelCount(channelContext) + pubSub.patternCount(channelContext);
+        pubSub.psubscribe(channelContext, p);
+        Object[] r = new Object[p.length]; for (int i=0;i<p.length;i++) r[i]=RespArray.of(RespBulkString.of("psubscribe"),RespBulkString.of(p[i]),RespInteger.of(already + i + 1));
         return p.length==1 ? r[0] : RespArray.of(r);
     }
     private Object handlePunsubscribe(String[] args) {
-        if (pubSubManager==null) return RespSimpleString.of("OK");
-        String[] p = args.length<2 ? new String[0] : Arrays.copyOfRange(args,1,args.length); pubSubManager.punsubscribe(channelContext, p);
+        PubSubManager pubSub = pubSub();
+        if (pubSub==null) return RespSimpleString.of("OK");
+        String[] p = args.length<2 ? new String[0] : Arrays.copyOfRange(args,1,args.length);
+        int before = pubSub.channelCount(channelContext) + pubSub.patternCount(channelContext);
+        pubSub.punsubscribe(channelContext, p);
         if (p.length==0) return RespArray.empty();
-        Object[] r = new Object[p.length]; for (int i=0;i<p.length;i++) r[i]=RespArray.of(RespBulkString.of("punsubscribe"),RespBulkString.of(p[i]),RespInteger.of(0));
+        Object[] r = new Object[p.length]; for (int i=0;i<p.length;i++) r[i]=RespArray.of(RespBulkString.of("punsubscribe"),RespBulkString.of(p[i]),RespInteger.of(Math.max(0, before - (i + 1))));
         return p.length==1 ? r[0] : RespArray.of(r);
     }
     private Object handlePublish(String[] args) {
         if (args.length!=3) return RespError.wrongNumberOfArguments("PUBLISH");
-        return RespInteger.of(pubSubManager==null ? 0 : pubSubManager.publish(args[1], args[2]));
+        PubSubManager pubSub = pubSub();
+        return RespInteger.of(pubSub==null ? 0 : pubSub.publish(args[1], args[2]));
     }
     private Object handlePubsub(String[] args) {
         if (args.length<2) return RespError.wrongNumberOfArguments("PUBSUB");
-        if (pubSubManager==null) return RespError.of("ERR","Pub/Sub not configured");
+        PubSubManager pubSub = pubSub();
+        if (pubSub==null) return RespError.of("ERR","Pub/Sub not configured");
         switch (args[1].toUpperCase()) {
-            case "CHANNELS": { String p=args.length>2?args[2]:null; Set<String> c=pubSubManager.getChannels(p); Object[] r=new Object[c.size()]; int i=0; for (String s:c) r[i++]=RespBulkString.of(s); return RespArray.of(r); }
-            case "NUMSUB": { String[] ch=args.length>2?Arrays.copyOfRange(args,2,args.length):new String[0]; Map<String,Integer> n=pubSubManager.getNumSub(ch); List<Object> r=new ArrayList<>(); for (Map.Entry<String,Integer> e:n.entrySet()) { r.add(RespBulkString.of(e.getKey())); r.add(RespInteger.of(e.getValue())); } return RespArray.of(r); }
-            case "NUMPAT": return RespInteger.of(pubSubManager.getNumPat());
+            case "CHANNELS": { String p=args.length>2?args[2]:null; Set<String> c=pubSub.getChannels(p); Object[] r=new Object[c.size()]; int i=0; for (String s:c) r[i++]=RespBulkString.of(s); return RespArray.of(r); }
+            case "NUMSUB": { String[] ch=args.length>2?Arrays.copyOfRange(args,2,args.length):new String[0]; Map<String,Integer> n=pubSub.getNumSub(ch); List<Object> r=new ArrayList<>(); for (Map.Entry<String,Integer> e:n.entrySet()) { r.add(RespBulkString.of(e.getKey())); r.add(RespInteger.of(e.getValue())); } return RespArray.of(r); }
+            case "NUMPAT": return RespInteger.of(pubSub.getNumPat());
             default: return RespError.syntaxError();
         }
     }
@@ -997,12 +1132,12 @@ public class CommandHandler {
         StringBuilder sb = new StringBuilder();
         if (sec == null || "SERVER".equals(sec)) {
             sb.append("# Server\r\n");
-            sb.append("z-cache_version:1.0.2\r\n");
+            sb.append("z-cache_version:").append(serverVersion()).append("\r\n");
             sb.append("redis_compatible:resp2\r\n");
             sb.append("os:").append(System.getProperty("os.name")).append(" ").append(System.getProperty("os.version")).append("\r\n");
             sb.append("java_version:").append(System.getProperty("java.version")).append("\r\n");
             sb.append("uptime_in_seconds:").append((System.currentTimeMillis() - store.getStartTime()) / 1000).append("\r\n");
-            sb.append("tcp_port:6379\r\n");
+            sb.append("tcp_port:").append(localPort).append("\r\n");
             sb.append("\r\n");
         }
         if (sec == null || "CLIENTS".equals(sec)) {
@@ -1062,17 +1197,24 @@ public class CommandHandler {
      */
     private Object handleClient(String[] args) {
         if (args.length < 2) return RespError.wrongNumberOfArguments("CLIENT");
+        if (channelContext == null) {
+            // 没有连接就谈不上"这条连接的信息"；以前会一路走到 channelContext.channel()
+            // 抛 NPE，被 handle() 兜成 -ERR internal error: null。
+            return RespError.of("ERR", "CLIENT is only available on a connected session");
+        }
         switch (args[1].toUpperCase()) {
             case "LIST": {
-                // 输出 Redis 兼容格式的客户端列表
+                // 列出所有活着的连接。以前这里只拼自己一条，等于"连接列表"里永远只有一个元素，
+                // 而且 sub=/psub= 恒为 0 —— 因为订阅中的连接根本走不到 CLIENT（被 pubsub 闸门挡了），
+                // 能从 socket 看到这些字段的只有别的连接。现在由旁观者来读，才真的量得到。
                 StringBuilder sb = new StringBuilder();
-                sb.append("id=").append(channelContext.channel().hashCode() & 0x7FFFFFFF);
-                sb.append(" addr=").append(channelContext.channel().remoteAddress());
-                sb.append(" name=").append(clientName != null ? clientName : "");
-                sb.append(" db=").append(currentDb);
-                sb.append(" sub=0 psub=0");
-                sb.append(" flags=N");
-                sb.append("\r\n");
+                for (java.util.Map.Entry<ChannelHandlerContext, CommandHandler> entry : connections.entrySet()) {
+                    CommandHandler peer = entry.getValue();
+                    if (peer.channelContext != entry.getKey()) {
+                        continue; // 已断开的陈旧条目
+                    }
+                    sb.append(peer.clientListLine());
+                }
                 return RespBulkString.of(sb.toString());
             }
             case "GETNAME": {
@@ -1084,41 +1226,136 @@ public class CommandHandler {
                 return RespSimpleString.of("OK");
             }
             case "ID": {
-                return RespInteger.of(channelContext.channel().hashCode() & 0x7FFFFFFF);
+                return RespInteger.of(clientId(channelContext));
             }
             case "KILL": {
-                // CLIENT KILL 需要 addr 参数，简化实现：关闭当前连接
+                // 以前的实现是"收下参数、回一个 +OK、什么都不做"：客户端据此认为对端连接已被切断，
+                // 而那条连接好端端地活着。有了 connections 登记表之后才是真杀。
                 if (args.length < 3) return RespError.wrongNumberOfArguments("CLIENT KILL");
-                // 在 Redis 中 CLIENT KILL 需要匹配地址，这里简化为返回 OK
+                ChannelHandlerContext target = findClientForKill(args);
+                if (target == null) return RespError.of("ERR", "No such client");
+                target.close();
                 return RespSimpleString.of("OK");
             }
             case "INFO": {
-                return handleClientInfo();
+                return RespBulkString.of(clientListLine());
             }
             case "NO-EVICT": {
-                // CLIENT NO-EVICT ON/OFF — 简化实现，仅返回 OK
-                return RespSimpleString.of("OK");
+                // 参数照常校验，但语义不认：我们没有"这条连接豁免淘汰"这条通道。
+                if (args.length < 3 || !("ON".equalsIgnoreCase(args[2]) || "OFF".equalsIgnoreCase(args[2]))) {
+                    return RespError.syntaxError();
+                }
+                return RespError.of("ERR", "CLIENT NO-EVICT is not supported by z-cache");
             }
             default:
                 return RespError.syntaxError();
         }
     }
 
+    /** 一条 CLIENT LIST 记录：Redis 的字段顺序，值全部来自这条连接自己的真实状态。 */
+    private String clientListLine() {
+        long now = System.currentTimeMillis();
+        StringBuilder sb = new StringBuilder(clientIdentityFields());
+        sb.append(" age=").append(Math.max(0L, (now - connectedAtMs) / 1000L));
+        sb.append(" idle=").append(Math.max(0L, (now - lastCommandMs) / 1000L));
+        sb.append(" flags=N");
+        sb.append(" multi=").append(transactionContext.isInTransaction()
+                ? transactionContext.getCommands().size() : -1);
+        sb.append(" cmd=").append(lastCommand.toLowerCase());
+        return sb.append("\r\n").toString();
+    }
+
     /**
-     * CLIENT INFO 子命令：返回当前连接的详细信息。
+     * CLIENT LIST / CLIENT INFO 共用的那几列：订阅数取真值，不再固定写 {@code sub=0 psub=0}；
+     * 连接已经没了就如实返回空串，而不是抛 NPE 被兜成 {@code internal error: null}。
      */
-    private Object handleClientInfo() {
+    private String clientIdentityFields() {
+        ChannelHandlerContext ctx = this.channelContext;
+        if (ctx == null) {
+            return "";
+        }
+        PubSubManager pubSub = pubSub();
+        int sub = pubSub == null ? 0 : pubSub.channelCount(ctx);
+        int psub = pubSub == null ? 0 : pubSub.patternCount(ctx);
         StringBuilder sb = new StringBuilder();
-        sb.append("id=").append(channelContext.channel().hashCode() & 0x7FFFFFFF);
-        sb.append(" addr=").append(channelContext.channel().remoteAddress());
+        sb.append("id=").append(clientId(ctx));
+        sb.append(" addr=").append(ctx.channel().remoteAddress());
+        sb.append(" laddr=").append(ctx.channel().localAddress());
         sb.append(" name=").append(clientName != null ? clientName : "");
         sb.append(" db=").append(currentDb);
-        sb.append(" sub=0 psub=0");
-        sb.append(" multi=-1");
-        sb.append(" flags=N");
-        sb.append(" cmd=client");
-        sb.append("\r\n");
-        return RespBulkString.of(sb.toString());
+        sb.append(" sub=").append(sub);
+        sb.append(" psub=").append(psub);
+        return sb.toString();
+    }
+
+    /** CLIENT ID / CLIENT KILL ID 用的连接标识。 */
+    private static long clientId(ChannelHandlerContext ctx) {
+        return ctx.channel().hashCode() & 0x7FFFFFFFL;
+    }
+
+    /**
+     * 按 {@code CLIENT KILL} 的参数找出目标连接：支持 {@code ID <id>}、{@code LADDR ip:port}、
+     * {@code ip:port}（对端地址）与 {@code <name>}（CLIENT SETNAME 起的名字）四种形式。
+     *
+     * @return 目标连接的 ctx；找不到返回 null，由调用方如实报错
+     */
+    private ChannelHandlerContext findClientForKill(String[] args) {
+        if ("ID".equalsIgnoreCase(args[2])) {
+            if (args.length < 4) return null;
+            long id;
+            try {
+                id = Long.parseLong(args[3]);
+            } catch (NumberFormatException e) {
+                return null;
+            }
+            for (java.util.Map.Entry<ChannelHandlerContext, CommandHandler> entry : connections.entrySet()) {
+                if (entry.getValue().channelContext == entry.getKey() && clientId(entry.getKey()) == id) {
+                    return entry.getKey();
+                }
+            }
+            return null;
+        }
+        final String needle;
+        if ("LADDR".equalsIgnoreCase(args[2]) || "ADDR".equalsIgnoreCase(args[2])) {
+            if (args.length < 4) return null;
+            needle = args[3];
+        } else if (args.length == 3) {
+            needle = args[2];   // 旧式：ip:port 或对端地址
+        } else {
+            return null;
+        }
+        ChannelHandlerContext matched = null;
+        for (java.util.Map.Entry<ChannelHandlerContext, CommandHandler> entry : connections.entrySet()) {
+            CommandHandler peer = entry.getValue();
+            if (peer.channelContext != entry.getKey()) {
+                continue;
+            }
+            String name = peer.clientName;
+            if (needle.equals(addressForm(entry.getKey().channel().remoteAddress()))
+                    || needle.equals(addressForm(entry.getKey().channel().localAddress()))
+                    || (name != null && name.equals(needle))) {
+                matched = entry.getKey();
+                break;
+            }
+        }
+        return matched;
+    }
+
+    /**
+     * 连接地址的两种写法都认：客户端敲的是 {@code 127.0.0.1:6379}，而
+     * {@code InetSocketAddress#toString} 给的是 {@code /127.0.0.1:6379}，只比后者会杀不到人。
+     */
+    private static String addressForm(java.net.SocketAddress address) {
+        if (address == null) {
+            return "null";
+        }
+        if (address instanceof java.net.InetSocketAddress) {
+            java.net.InetSocketAddress inet = (java.net.InetSocketAddress) address;
+            return inet.getAddress() == null
+                    ? inet.getHostString() + ":" + inet.getPort()
+                    : inet.getAddress().getHostAddress() + ":" + inet.getPort();
+        }
+        return address.toString();
     }
 
     /**
@@ -1142,18 +1379,17 @@ public class CommandHandler {
                 }
             }
             case "OBJECT": {
-                // DEBUG OBJECT key — 返回简化的对象信息
-                if (args.length < 3) return RespError.wrongNumberOfArguments("DEBUG OBJECT");
-                String key = args[2];
-                if (!keyExists(key)) {
-                    return RespBulkString.nullBulkString();
-                }
-                return RespBulkString.of("Value at:0x" + Integer.toHexString(key.hashCode())
-                        + " refcount:1 encoding:raw serializedlength:0 lru:0 lru_seconds_idle:0");
+                // 以前回的是 "Value at:0x<key.hashCode()> refcount:1 ... serializedlength:0 lru:0"：
+                // 地址是哈希值假扮的、refcount/lru 是常量、serializedlength 恒为 0，
+                // 四个字段没有一个是量出来的。Redis 自己也已经把这条废弃掉了。
+                return RespError.of("ERR", "DEBUG OBJECT is not supported: refcount / lru / serializedlength"
+                        + " cannot be measured from the JVM, and reporting constants would be worse than an error");
             }
             case "SLOWLOG-RESET": {
-                if (slowLog != null) slowLog.reset();
-                return RespInteger.of(1);
+                if (slowLog == null) return RespError.of("ERR", "SlowLog not configured");
+                slowLog.reset();
+                // Redis 回 +OK；回 :1 会让按 Redis 协议写的客户端把整型当成解析失败。
+                return RespSimpleString.of("OK");
             }
             case "ERROR": {
                 // DEBUG ERROR — 返回错误（用于测试客户端错误处理）
@@ -1234,12 +1470,25 @@ public class CommandHandler {
         long maxLen = 0;
         int i = 2;
 
-        // 解析 MAXLEN ~ count
+        // 解析 MAXLEN [~|=] count —— 与 XTRIM 同一套形状。以前只认 "MAXLEN 5" 和 "MAXLEN ~ 5"，
+        // 于是 Redis 合法的 "MAXLEN = 5" 抛出未捕获的 NumberFormatException，
+        // 客户端拿到的是 "-ERR internal error: For input string: \"=\""；"MAXLEN" 少了 count
+        // 更是直接越界取 args[i]。
         if ("MAXLEN".equalsIgnoreCase(args[i])) {
+            if (i + 1 >= args.length) return RespError.wrongNumberOfArguments("XADD");
             i++;
-            if ("~".equals(args[i])) i++; // 跳过近似标记
-            maxLen = Long.parseLong(args[i]);
+            if ("~".equals(args[i]) || "=".equals(args[i])) {
+                if (i + 1 >= args.length) return RespError.wrongNumberOfArguments("XADD");
+                i++;
+            }
+            try {
+                maxLen = Long.parseLong(args[i]);
+            } catch (NumberFormatException e) {
+                return RespError.of("ERR", "value is not an integer or out of range");
+            }
+            if (maxLen < 0) return RespError.of("ERR", "MAXLEN requires a non-negative integer");
             i++;
+            if (i >= args.length) return RespError.wrongNumberOfArguments("XADD");
         }
 
         String id = args[i++];
@@ -1317,12 +1566,30 @@ public class CommandHandler {
     }
 
     /**
-     * XTRIM key MAXLEN [~] count
+     * XTRIM key MAXLEN [~ | =] count
+     * <p>
+     * 以前是 {@code Long.parseLong(args[3])}：标准写法 {@code XTRIM s MAXLEN ~ 3} 会去解析
+     * "~"，抛出的异常被 {@code handle()} 兜成 {@code -ERR internal error}；反过来缺了 MAXLEN
+     * 的 {@code XTRIM s 3} 却被接受。合法与非法正好判反对。
+     * <p>
+     * "~"（近似）与 "="（精确）在这里是同一件事——我们的 Stream 只有精确裁剪一种实现——
+     * 但语法必须收下，不能让客户端因为写了官方形式就拿回一个 internal error。
      */
     private Object handleXtrim(String[] args) {
         if (streamStore == null) return RespError.of("ERR", "Stream not configured");
         if (args.length < 4) return RespError.wrongNumberOfArguments("XTRIM");
-        long maxLen = Long.parseLong(args[3]);
+        if (!"MAXLEN".equalsIgnoreCase(args[2])) {
+            return RespError.of("ERR", "unsupported XTRIM strategy '" + args[2] + "', only MAXLEN is implemented");
+        }
+        int idx = "~".equals(args[3]) || "=".equals(args[3]) ? 4 : 3;
+        if (idx != args.length - 1) return RespError.syntaxError();
+        long maxLen;
+        try {
+            maxLen = Long.parseLong(args[idx]);
+        } catch (NumberFormatException e) {
+            return RespError.of("ERR", "value is not an integer or out of range");
+        }
+        if (maxLen < 0) return RespError.of("ERR", "MAXLEN requires a non-negative integer");
         return RespInteger.of((int) streamStore.xtrim(currentDb, args[1], maxLen));
     }
 
@@ -1342,9 +1609,10 @@ public class CommandHandler {
             i += 2;
         }
 
-        // 跳过 BLOCK（非阻塞实现）
-        if ("BLOCK".equalsIgnoreCase(args[i]) && i + 1 < args.length) {
-            i += 2;
+        // BLOCK 不能"跳过"：收下它等于对客户端谎称会阻塞，客户端于是把一个立即返回的
+        // 空结果当成"没有新数据"，拿着它做轮询就成了忙等。要么真阻塞，要么明确拒绝。
+        if ("BLOCK".equalsIgnoreCase(args[i])) {
+            return RespError.of("ERR", "XREAD BLOCK is not supported: this server never blocks on a stream");
         }
 
         if (!"STREAMS".equalsIgnoreCase(args[i])) {
@@ -1400,8 +1668,8 @@ public class CommandHandler {
             count = Integer.parseInt(args[i + 1]);
             i += 2;
         }
-        if ("BLOCK".equalsIgnoreCase(args[i]) && i + 1 < args.length) {
-            i += 2; // 跳过 BLOCK
+        if ("BLOCK".equalsIgnoreCase(args[i])) {
+            return RespError.of("ERR", "XREADGROUP BLOCK is not supported: this server never blocks on a stream");
         }
         if (!"STREAMS".equalsIgnoreCase(args[i])) return RespError.syntaxError();
         i++;
@@ -1485,29 +1753,44 @@ public class CommandHandler {
     }
 
     /**
-     * XPENDING key group [IDLE min-idle-time] [START end] [END end] [COUNT count] [consumer]
+     * XPENDING key group —— 只实现汇总形态。
+     * <p>
+     * 每个消费者手上压着几条以前是硬写的 {@code "0"}：XREADGROUP 领了三条、一条没 ACK，
+     * XPENDING 仍然报每个消费者 0 条。明细形态（IDLE / start end count [consumer]）要按
+     * 每条的投递时间过滤，而我们的 PEL 只记 entryId -&gt; consumer，所以现在是明确报错，
+     * 不再像以前那样把多余参数丢掉、拿汇总冒充明细。
      */
     private Object handleXpending(String[] args) {
         if (streamStore == null) return RespError.of("ERR", "Stream not configured");
         if (args.length < 3) return RespError.wrongNumberOfArguments("XPENDING");
+        if (args.length > 3) {
+            return RespError.of("ERR", "XPENDING detail form (IDLE / start / end / count) is not supported");
+        }
 
         Object[] summary = streamStore.xpending(currentDb, args[1], args[2]);
-        if (summary == null) return RespArray.nullArray();
+        if (summary == null) {
+            return RespError.of("NOGROUP",
+                    "No such key '" + args[1] + "' or consumer group '" + args[2] + "'");
+        }
 
         long pendingCount = (Long) summary[0];
         String lowestId = (String) summary[1];
         String highestId = (String) summary[2];
-        String[] consumers = (String[]) summary[3];
 
-        Object[] result = new Object[consumers.length];
-        for (int i = 0; i < consumers.length; i++) {
-            result[i] = RespArray.of(RespBulkString.of(consumers[i]), RespBulkString.of("0"));
+        com.zifang.z.cache.core.stream.Stream stream = streamStore.getStream(currentDb, args[1]);
+        com.zifang.z.cache.core.stream.ConsumerGroup group = stream == null ? null : stream.getGroup(args[2]);
+        Map<String, Long> perConsumer = group == null
+                ? java.util.Collections.<String, Long>emptyMap() : group.perConsumerPending();
+        List<Object> rows = new ArrayList<>(perConsumer.size());
+        for (Map.Entry<String, Long> entry : perConsumer.entrySet()) {
+            rows.add(RespArray.of(RespBulkString.of(entry.getKey()),
+                    RespBulkString.of(Long.toString(entry.getValue()))));
         }
         return RespArray.of(
                 RespInteger.of((int) pendingCount),
                 lowestId != null ? RespBulkString.of(lowestId) : RespBulkString.nullBulkString(),
                 highestId != null ? RespBulkString.of(highestId) : RespBulkString.nullBulkString(),
-                RespArray.of(result)
+                RespArray.of(rows.toArray())
         );
     }
 
@@ -1542,6 +1825,29 @@ public class CommandHandler {
                         RespBulkString.of("length"), RespInteger.of((int) stream.length()),
                         RespBulkString.of("groups"), RespInteger.of(stream.groupNames().size())
                 );
+            }
+            case "CONSUMERS": {
+                // 文档注释里一直写着这条，但 switch 从来没有这个 case：
+                // XINFO CONSUMERS 拿回去的永远是 -ERR syntax error。
+                if (args.length < 4) return RespError.wrongNumberOfArguments("XINFO CONSUMERS");
+                com.zifang.z.cache.core.stream.Stream target = streamStore.getStream(currentDb, args[2]);
+                com.zifang.z.cache.core.stream.ConsumerGroup group =
+                        target == null ? null : target.getGroup(args[3]);
+                if (group == null) {
+                    return RespError.of("ERR", "NOGROUP No such consumer group '" + args[3]
+                            + "' for key name '" + args[2] + "'");
+                }
+                Map<String, Long> pendingByConsumer = group.perConsumerPending();
+                List<Object> rows = new ArrayList<>(group.getConsumers().size());
+                for (Map.Entry<String, com.zifang.z.cache.core.stream.ConsumerGroup.Consumer> entry
+                        : group.getConsumers().entrySet()) {
+                    rows.add(RespArray.of(
+                            RespBulkString.of("name"), RespBulkString.of(entry.getKey()),
+                            RespBulkString.of("pending"),
+                            RespInteger.of(pendingByConsumer.getOrDefault(entry.getKey(), 0L).intValue()),
+                            RespBulkString.of("idle"), RespInteger.of((int) entry.getValue().getIdleTimeMs())));
+                }
+                return RespArray.of(rows.toArray());
             }
             default:
                 return RespError.syntaxError();
@@ -1609,6 +1915,10 @@ public class CommandHandler {
             return;
         }
 
+        // 键空间变了 —— WATCH 的复查就吃这一记。放在 AOF 分支之前：没配 --data-dir 时
+        // aofPersistence 是 null，而事务照样得能中止。
+        bumpWatchedKeys(record);
+
         if (rdbPersistence != null) {
             rdbPersistence.onWrite();
         }
@@ -1631,6 +1941,144 @@ public class CommandHandler {
             aofPersistence.appendCommand(new String[]{"SELECT", Integer.toString(currentDb)});
         }
         aofPersistence.appendCommand(record);
+    }
+
+    /** 一条命令同时改动两个键的操作（源与目标都要让 WATCH 看见）。 */
+    private static final java.util.Set<String> TWO_KEY_WRITE_COMMANDS =
+            new java.util.HashSet<>(java.util.Arrays.asList(
+                    "RENAME", "RENAMENX", "RPOPLPUSH", "BRPOPLPUSH", "LMOVE", "SMOVE"));
+
+    /** 一条命令里"键"参数占据的下标形状。 */
+    private enum KeyPos { SINGLE, ALL, ALL_BUT_LAST, FIRST_TWO, FROM_SECOND }
+
+    private static final class TypeSpec {
+        final MemoryStore.DataType family;
+        final KeyPos pos;
+
+        TypeSpec(MemoryStore.DataType family, KeyPos pos) {
+            this.family = family;
+            this.pos = pos;
+        }
+    }
+
+    private static final java.util.Map<String, TypeSpec> TYPED_COMMANDS = new java.util.HashMap<>();
+
+    private static void typed(String cmd, MemoryStore.DataType family, KeyPos pos) {
+        TYPED_COMMANDS.put(cmd, new TypeSpec(family, pos));
+    }
+
+    static {
+        MemoryStore.DataType string = MemoryStore.DataType.STRING;
+        MemoryStore.DataType hash = MemoryStore.DataType.HASH;
+        MemoryStore.DataType list = MemoryStore.DataType.LIST;
+        MemoryStore.DataType set = MemoryStore.DataType.SET;
+        MemoryStore.DataType zset = MemoryStore.DataType.ZSET;
+
+        for (String c : new String[]{"GET", "SETNX", "GETSET", "APPEND", "STRLEN",
+                "INCR", "DECR", "INCRBY", "DECRBY"}) {
+            typed(c, string, KeyPos.SINGLE);
+        }
+        typed("MGET", string, KeyPos.ALL);
+
+        for (String c : new String[]{"HSET", "HGET", "HDEL", "HEXISTS", "HGETALL", "HKEYS", "HVALS",
+                "HMGET", "HMSET", "HLEN", "HSETNX", "HSCAN", "HRANDFIELD", "HINCRBY", "HINCRBYFLOAT"}) {
+            typed(c, hash, KeyPos.SINGLE);
+        }
+
+        for (String c : new String[]{"LPUSH", "RPUSH", "LPOP", "RPOP", "LLEN", "LRANGE", "LINDEX",
+                "LSET", "LINSERT", "LREM", "LTRIM"}) {
+            typed(c, list, KeyPos.SINGLE);
+        }
+        typed("RPOPLPUSH", list, KeyPos.FIRST_TWO);
+        typed("BRPOPLPUSH", list, KeyPos.FIRST_TWO);
+        typed("LMOVE", list, KeyPos.FIRST_TWO);
+        typed("BLPOP", list, KeyPos.ALL_BUT_LAST);
+        typed("BRPOP", list, KeyPos.ALL_BUT_LAST);
+
+        for (String c : new String[]{"SADD", "SREM", "SMEMBERS", "SISMEMBER", "SCARD",
+                "SRANDMEMBER", "SPOP", "SSCAN"}) {
+            typed(c, set, KeyPos.SINGLE);
+        }
+        typed("SINTER", set, KeyPos.ALL);
+        typed("SUNION", set, KeyPos.ALL);
+        typed("SDIFF", set, KeyPos.ALL);
+        typed("SMOVE", set, KeyPos.FIRST_TWO);
+        // SINTERSTORE/SUNIONSTORE/SDIFFSTORE：目标键是被覆盖的，不检查；源键必须都是 set
+        typed("SINTERSTORE", set, KeyPos.FROM_SECOND);
+        typed("SUNIONSTORE", set, KeyPos.FROM_SECOND);
+        typed("SDIFFSTORE", set, KeyPos.FROM_SECOND);
+
+        for (String c : new String[]{"ZADD", "ZREM", "ZSCORE", "ZRANK", "ZREVRANK", "ZCARD", "ZCOUNT",
+                "ZRANGE", "ZREVRANGE", "ZRANGEBYSCORE", "ZREVRANGEBYSCORE", "ZINCRBY", "ZLEXCOUNT",
+                "ZRANGEBYLEX", "ZREVRANGEBYLEX", "ZREMRANGEBYLEX", "ZREMRANGEBYRANK",
+                "ZREMRANGEBYSCORE", "ZRANDMEMBER", "ZSCAN"}) {
+            typed(c, zset, KeyPos.SINGLE);
+        }
+    }
+
+    /**
+     * 类型闸门：键已经属于另一种数据类型时，按 Redis 回 WRONGTYPE，而不是给一个看着像
+     * "没有这个键"的答案。
+     * <p>
+     * 修之前整个 {@code CommandHandler} 里 {@code WRONGTYPE} 一次都没出现过（grep 计数为 0）：
+     * {@code HGET} 一个 string 键回 nil（与"域不存在"分不出来），{@code LPUSH} 一个 hash 键
+     * 还会成功 —— 于是同一个键名下并存着 hash 和 list 两份数据，{@code TYPE} 只报其中一种，
+     * {@code DBSIZE} 把它算成两个键。
+     * <p>
+     * {@code SET}/{@code SETEX}/{@code PSETEX} 有意不在表里：Redis 让它们覆盖任意类型的旧值
+     * （dbOverwrite），这条语义由 {@code MemoryStore.putDb} 的 {@code clearOtherTypes} 兑现。
+     */
+    private RespError typeConflict(String[] args) {
+        TypeSpec spec = TYPED_COMMANDS.get(args[0].toUpperCase());
+        if (spec == null) {
+            return null;
+        }
+        int from = 1;
+        int to = args.length - 1;
+        switch (spec.pos) {
+            case SINGLE: to = 1; break;
+            case FIRST_TWO: to = Math.min(2, args.length - 1); break;
+            case ALL_BUT_LAST: to = args.length - 2; break;
+            case FROM_SECOND: from = 2; break;
+            default: break;
+        }
+        // 参数不够长的（ arity 错的）留给各自的 handler 报错，这里不越界取参数
+        to = Math.min(to, args.length - 1);
+        for (int i = from; i <= to; i++) {
+            MemoryStore.DataType actual = store.typeOfDb(currentDb, args[i]);
+            if (actual != MemoryStore.DataType.NONE && actual != spec.family) {
+                return RespError.wrongType("Operation against a key holding the wrong kind of value");
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 记一次"这些键变过了"，供 {@code WATCH} 在 EXEC 前复查。
+     * <p>
+     * 以 AOF 记录为准，是因为它已经把这几种情况折对了：阻塞弹空返回 null（什么都没改，
+     * 不该记）、{@code BLPOP a b} 落的是真正命中的那个键、{@code BRPOPLPUSH} 落的是
+     * {@code RPOPLPUSH src dst}。
+     * <p>
+     * 以前只有 {@code MemoryStore.putDb} 里那一记，等于"只有 String 写会让事务中止"：
+     * {@code WATCH h} 之后别人 {@code HSET h f v}，EXEC 照样提交。
+     * FLUSHDB / FLUSHALL 不在这里记（它们改的是整库，逐键 bump 要反过来枚举 watch 表）。
+     */
+    private void bumpWatchedKeys(String[] record) {
+        if (record.length < 2 || record[1] == null) {
+            return;
+        }
+        String cmd = record[0].toUpperCase();
+        if ("MSET".equals(cmd)) {
+            for (int i = 1; i + 1 < record.length; i += 2) {
+                store.bumpKeyVersion(currentDb, record[i]);
+            }
+            return;
+        }
+        store.bumpKeyVersion(currentDb, record[1]);
+        if (record.length > 2 && TWO_KEY_WRITE_COMMANDS.contains(cmd)) {
+            store.bumpKeyVersion(currentDb, record[2]);
+        }
     }
 
     /**
@@ -1660,7 +2108,7 @@ public class CommandHandler {
         return new String[]{"BLPOP".equals(cmd) ? "LPOP" : "RPOP", poppedKey};
     }
 
-    private boolean keyExists(String k) { return store.existsDb(currentDb, k)||store.getHashStore(currentDb).exists(k)||store.getListStore(currentDb).exists(k)||store.getSetStore(currentDb).exists(k)||store.getSortedSetStore(currentDb).exists(k); }
+    private boolean keyExists(String k) { return store.typeOfDb(currentDb, k) != MemoryStore.DataType.NONE; }
     private double hitRate() { long h=store.getHits(),m=store.getMisses(); return h+m==0?0.0:(double)h/(h+m); }
 
     private static RespArray toRespArray(List<byte[]> l) { Object[] r=new Object[l.size()]; for(int i=0;i<l.size();i++) r[i]=l.get(i)==null?RespBulkString.nullBulkString():RespBulkString.of(l.get(i)); return RespArray.of(r); }
@@ -1802,6 +2250,31 @@ public class CommandHandler {
         // 判断超时，收到 *0 会当成"取到了一个空结果"。
         if (result == null) return RespArray.nullArray();
         return RespArray.of(RespBulkString.of(result.get(0)), RespBulkString.of(result.get(1)));
+    }
+
+    /**
+     * BRPOPLPUSH src dst timeout —— 尾弹出 src、头插入 dst，返回弹出的值；超时回 nil bulk。
+     * <p>
+     * 以前这条命令直接转给 {@link #handleRpoplpush}，而那个处理器要求 {@code args.length == 3}，
+     * 带 timeout 的四参数形态必然回 {@code -ERR wrong number of arguments for 'BRPOPLPUSH'}：
+     * 也就是说它从分发那一刻起就没有可用过，连"退化成非阻塞"都算不上。
+     * <p>
+     * 弹出与推送分两步走（而不是复用 {@code rpoplpush}）：{@code bpop} 已经把元素从 src 摘掉了，
+     * 再走一次 rpoplpush 会连 dst 的写入一起做第二遍弹出。
+     */
+    private Object handleBrpoplpush(String[] args) {
+        if (args.length != 4) return RespError.wrongNumberOfArguments("BRPOPLPUSH");
+        int timeout;
+        try { timeout = Integer.parseInt(args[3]); }
+        catch (NumberFormatException e) { return RespError.of("ERR", "timeout is not an integer or out of range"); }
+        if (timeout < 0) return RespError.of("ERR", "timeout is negative");
+
+        List<byte[]> popped = store.getListStore(currentDb)
+                .bpop("RIGHT", java.util.Collections.singletonList(args[1]), timeout);
+        if (popped == null) return RespBulkString.nullBulkString();
+        byte[] value = popped.get(1);
+        store.getListStore(currentDb).lpush(args[2], value);
+        return RespBulkString.of(value);
     }
 
     // ==================== HRANDFIELD ====================

@@ -1,6 +1,7 @@
 package com.zifang.z.cache.core.server;
 
 import com.zifang.z.cache.core.command.CommandHandler;
+import com.zifang.z.cache.core.logging.SlowLog;
 import com.zifang.z.cache.core.persistence.AofPersistence;
 import com.zifang.z.cache.core.persistence.MemoryStoreAccessor;
 import com.zifang.z.cache.core.persistence.RdbPersistence;
@@ -40,6 +41,18 @@ public class RedisServer {
 
     // PubSub 管理器
     private final PubSubManager pubSubManager = new PubSubManager();
+
+    /**
+     * 这台服务器自己的连接登记表与 MONITOR 集合。
+     * <p>它们以前是 {@code CommandHandler} 的静态字段，于是"这台服务器上有几条连接"其实是
+     * "这个 JVM 里有过几条连接"：CLIENT LIST 会列出别台服务器的客户端，CLIENT KILL 能踢掉
+     * 别人的连接，MONITOR 也收得到别台的命令。范围收成一台服务器一份。
+     */
+    private final java.util.concurrent.ConcurrentMap<io.netty.channel.ChannelHandlerContext,
+            com.zifang.z.cache.core.command.CommandHandler> connections =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.Set<io.netty.channel.ChannelHandlerContext> monitorClients =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     // 持久化管理器
     private RdbPersistence rdbPersistence;
@@ -148,7 +161,8 @@ public class RedisServer {
                                 // 挤在承载几十个连接的 I/O EventLoop 上；阻塞命令再单独挪到
                                 // blockingGroup，见该字段注释。
                                 p.addLast(businessGroup, "handler", new RedisServerHandler(
-                                        commandHandler, pubSubManager, store, blockingGroup));
+                                        commandHandler, pubSubManager, store, blockingGroup,
+                                        connections, monitorClients));
                             }
                         });
 
@@ -182,6 +196,17 @@ public class RedisServer {
         if (CommandHandler.getStreamStore() == null) {
             CommandHandler.setStreamStore(new StreamStore(16));
             logger.info("Stream store initialized");
+        }
+
+        // SlowLog 和 StreamStore 是同一类接线：它的静态字段以前只有测试在赋值，
+        // 真实服务器里一直是 null，于是 SLOWLOG GET 永远回 -ERR SlowLog not configured，
+        // 分发末尾那段计时代码也从来没执行过——README 却写着 redis-cli SLOWLOG GET 10。
+        if (CommandHandler.getSlowLog() == null) {
+            SlowLog slowLog = new SlowLog();
+            int slowlogMs = intProperty("zcache.slowlog-log-slower-than", 10, 0);
+            slowLog.setSlowLogThresholdNanos(java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(slowlogMs));
+            CommandHandler.setSlowLog(slowLog);
+            logger.info("Slow log initialized (threshold: {} ms)", slowlogMs);
         }
 
         if (dataDir == null || dataDir.isEmpty()) {

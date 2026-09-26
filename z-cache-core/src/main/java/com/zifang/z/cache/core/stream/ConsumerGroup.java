@@ -22,8 +22,15 @@ public class ConsumerGroup {
     /** 组名 */
     private final String name;
 
-    /** 最后投递的条目 ID（用于 XREADGROUP 的 ">" 查询） */
+    /**
+     * 最后投递的条目 ID 的毫秒段（用于 XREADGROUP 的 "&gt;" 查询）。
+     * <p>与 {@link #lastDeliveredSeq} 合起来才是一个完整的 entry ID：只看毫秒段时，
+     * 同一毫秒内写入的第二条永远投不出去（第一条投递后 ms 被抬到当前值，第二条就不再"更大"了）。
+     */
     private volatile long lastDeliveredId;
+
+    /** 最后投递的条目 ID 的序号段 */
+    private volatile long lastDeliveredSeq;
 
     /** 消费者名称 -> 消费者 */
     private final ConcurrentHashMap<String, Consumer> consumers;
@@ -32,14 +39,28 @@ public class ConsumerGroup {
     private final ConcurrentHashMap<String, String> pendingEntries;
 
     public ConsumerGroup(String name, long lastDeliveredId) {
+        this(name, lastDeliveredId, 0L);
+    }
+
+    public ConsumerGroup(String name, long lastDeliveredId, long lastDeliveredSeq) {
         this.name = name;
         this.lastDeliveredId = lastDeliveredId;
+        this.lastDeliveredSeq = lastDeliveredSeq;
         this.consumers = new ConcurrentHashMap<>();
         this.pendingEntries = new ConcurrentHashMap<>();
     }
 
     public String getName() { return name; }
     public long getLastDeliveredId() { return lastDeliveredId; }
+    public long getLastDeliveredSeq() { return lastDeliveredSeq; }
+
+    /**
+     * 这条 entry ID 是否比组里"最后投递"的位置更新。entry ID 是 {@code ms-seq} 二元组，
+     * 必须两段一起比。
+     */
+    public boolean isNewerThanLastDelivered(String entryId) {
+        return StreamEntry.compareIds(entryId, lastDeliveredId + "-" + lastDeliveredSeq) > 0;
+    }
 
     /**
      * 获取或创建消费者。
@@ -66,12 +87,31 @@ public class ConsumerGroup {
      */
     public void markDelivered(String entryId, String consumerName) {
         pendingEntries.put(entryId, consumerName);
-        long[] parsed = StreamEntry.parseId(entryId);
-        if (parsed[0] > lastDeliveredId) {
+        // 两段一起推进：只抬毫秒段会让同一毫秒内的后几条永远投不出去
+        if (isNewerThanLastDelivered(entryId)) {
+            long[] parsed = StreamEntry.parseId(entryId);
             lastDeliveredId = parsed[0];
+            lastDeliveredSeq = parsed[1];
         }
         Consumer consumer = getOrCreateConsumer(consumerName);
         consumer.incrementPendingCount();
+        consumer.touch();
+    }
+
+    /**
+     * 每个消费者手上还压着多少条没 ACK（包括 0 条的，Redis 的汇总也列出它们）。
+     * 数字从 {@link #pendingEntries} 现算，不去信那个自增计数器——两边口径一旦漂移，
+     * XPENDING 报的就是一份对不上账的数。
+     */
+    public Map<String, Long> perConsumerPending() {
+        Map<String, Long> counts = new java.util.TreeMap<>();
+        for (String consumer : consumers.keySet()) {
+            counts.put(consumer, 0L);
+        }
+        for (String consumer : pendingEntries.values()) {
+            counts.merge(consumer, 1L, Long::sum);
+        }
+        return counts;
     }
 
     /**
@@ -122,7 +162,11 @@ public class ConsumerGroup {
     public static class Consumer {
         private final String name;
         private final AtomicLong pendingCount = new AtomicLong(0);
-        private volatile long idleTimeMs = 0;
+        /**
+         * 最近一次"投递给这个消费者"或被创建的时刻。XINFO CONSUMERS 的 idle 由它算：
+         * 以前这里是 {@code setIdleTimeMs} 一个调用方都没有的常量 0，等于每次都报"空闲 0 毫秒"。
+         */
+        private volatile long lastActivityMs = System.currentTimeMillis();
 
         public Consumer(String name) {
             this.name = name;
@@ -130,8 +174,8 @@ public class ConsumerGroup {
 
         public String getName() { return name; }
         public long getPendingCount() { return pendingCount.get(); }
-        public long getIdleTimeMs() { return idleTimeMs; }
-        public void setIdleTimeMs(long ms) { this.idleTimeMs = ms; }
+        public long getIdleTimeMs() { return Math.max(0L, System.currentTimeMillis() - lastActivityMs); }
+        public void touch() { this.lastActivityMs = System.currentTimeMillis(); }
         public void incrementPendingCount() { pendingCount.incrementAndGet(); }
         public void decrementPendingCount() { pendingCount.decrementAndGet(); }
     }

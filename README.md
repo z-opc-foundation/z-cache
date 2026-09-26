@@ -1,10 +1,12 @@
 # z-cache
 
-> **Redis 协议 (RESP2/RESP3) 兼容的分布式内存数据库** — Java 11+ · Netty 4.1 · Spring Boot 2.7
+> **Redis 协议 (RESP2) 兼容的分布式内存数据库** — Java 11+ · Netty 4.1 · Spring Boot 2.7
 > 1.3.0 新增：分布式锁 · Pub/Sub 模式匹配 · Stream 消费组 · RDB+AOF 持久化 · 集群模式规划
 > 1.3.4：RDB 快照补齐 16 个库与 TTL · SAVE/BGSAVE/LASTSAVE 真正落盘 · AOF 启动时重放（含库号与阻塞命令翻译）
+> 1.3.5：错类型读写如实回 `WRONGTYPE` · WATCH/EXEC 的中止判据修对（含库号隔离）· Stream 消费组补全
+> · `CLIENT LIST/KILL/INFO` 从假回复变成真实现 · 同 JVM 多实例不再互串订阅态
 
-[![Maven Central](https://img.shields.io/badge/Maven%20Central-1.3.4-blue?logo=apache-maven)](https://central.sonatype.com/search?q=g:io.github.yuku123+a:z-cache*)
+[![Maven Central](https://img.shields.io/badge/Maven%20Central-1.3.5-blue?logo=apache-maven)](https://central.sonatype.com/search?q=g:io.github.yuku123+a:z-cache*)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 [![Java](https://img.shields.io/badge/Java-11%2B-orange)](https://openjdk.org)
 [![Docker](https://img.shields.io/badge/Docker-multi--stage-2496ED)](https://hub.docker.com/)
@@ -193,20 +195,20 @@ redis-cli -h localhost -p 16379 SLOWLOG GET 10
 
 | 类别 | 命令 | 状态 |
 |---|---|---|
-| **Key** | SET / GET / DEL / EXISTS / KEYS / EXPIRE / TTL / PERSIST | ✅ |
-| **String** | SETNX / SETEX / GETSET / APPEND / STRLEN / INCR / DECR | ✅ |
+| **Key** | SET / GET / DEL / EXISTS / KEYS / TYPE / EXPIRE / TTL / PERSIST | ✅ 但 `EXPIRE`/`TTL`/`PERSIST` **只对 String 键生效**：集合键上实测 `EXPIRE k 100`→`:0`、`TTL k`→`:-2`，而同一个键 `TYPE`→`hash`、`EXISTS`→`:1`（Redis 会真的挂上 TTL） |
+| **String** | SETNX / SETEX / GETSET / APPEND / STRLEN / INCR / DECR | ✅ 用错类型读写一律 `-WRONGTYPE`（1.3.5 起，此前静默回 nil/0） |
 | **Hash** | HSET / HGET / HDEL / HMSET / HMGET / HGETALL / HEXISTS | ✅ |
-| **List** | LPUSH / RPUSH / LPOP / RPOP / LRANGE / LLEN / LSET / LTRIM | ✅ |
+| **List** | LPUSH / RPUSH / LPOP / RPOP / LRANGE / LLEN / LSET / LTRIM / LMOVE / RPOPLPUSH / BRPOPLPUSH | ✅ 1.3.5 补 `BRPOPLPUSH` |
 | **Set** | SADD / SREM / SMEMBERS / SISMEMBER / SINTER / SUNION / SDIFF | ✅ |
 | **ZSet** | ZADD / ZRANGE / ZRANGEBYSCORE / ZRANK / ZINCRBY | ✅ |
 | **🔒 分布式锁** | SET NX PX ✅ / EVAL·EVALSHA 🚧 未实现 | 服务端没有 Lua 解释器；客户端 `DistributedLock` 会降级成"先 GET 校验再 DEL"，**不是原子的**（跨进程竞争下可能误删别人的锁） |
-| **📡 Pub/Sub** | PUBLISH / SUBSCRIBE / UNSUBSCRIBE / PSUBSCRIBE / PUNSUBSCRIBE / PUBSUB | ✅ 1.3.0 新增 PSUBSCRIBE |
-| **📋 Stream** | XADD / XREAD / XREADGROUP / XACK / XPENDING / XGROUP / XINFO | ✅ XCLAIM 🚧 未实现（表里有，命令会回 ERR unknown command） |
+| **📡 Pub/Sub** | PUBLISH / SUBSCRIBE / UNSUBSCRIBE / PSUBSCRIBE / PUNSUBSCRIBE / PUBSUB | ✅ 确认包的第 3 个数从 1.3.5 起是"这条连接的频道数+模式数"（此前每条命令各自从 1 数，客户端据此记账会错位） |
+| **📋 Stream** | XADD / XREAD / XREADGROUP / XACK / XPENDING / XGROUP / XINFO | ✅ `XINFO CONSUMERS` 1.3.5 起才有实现（此前只有注释里没有 case）；XCLAIM 🚧 未实现；`XPENDING` 只有汇总形态，明细形式（`IDLE`/`start end count`）明确报错 |
 | **💾 持久化** | SAVE / BGSAVE / LASTSAVE | ✅ 1.3.4 起才真正落盘（此前三条命令只回一个写死的成功回复）；BGREWRITEAOF 🚧 未实现 |
-| **📊 运维** | INFO / MONITOR / DEBUG / CLIENT / SLOWLOG | ✅ 1.3.0 新增 |
-| **事务** | MULTI / EXEC / DISCARD / WATCH / UNWATCH | ✅ |
+| **📊 运维** | INFO / MONITOR / DEBUG / CLIENT / SLOWLOG | ✅ `CLIENT LIST` 从 1.3.5 起列出本机全部连接且 `sub=`/`psub=` 是真值（此前只有发起者一行、两个数写死 0）、`CLIENT KILL` 真关连接、新增 `CLIENT INFO`；SLOWLOG 1.3.5 才接上真实服务器（此前恒回 not configured） |
+| **事务** | MULTI / EXEC / DISCARD / WATCH / UNWATCH | ✅ 1.3.5 修掉 WATCH 的两处失效：复查用的版本尺恒返回 0（该中止的中止不了），且 EXEC/DISCARD 不清 WATCH（上一条事务的观察键会永久挂着，把后来的事务无端打掉） |
 | **Pipeline** | 客户端 SDK 自动支持 | ✅ |
-| **Lua** | EVAL / EVALSHA / SCRIPT | ✅ |
+| **Lua** | EVAL / EVALSHA / SCRIPT | 🚧 **未实现**（`src/main` 里三条命令零处理，回 `ERR unknown command`；本表此前标的是 ✅） |
 
 > 注：完整命令清单（含参数说明）见 [_doc/001_arch/01-module-structure.md §2.1](_doc/001_arch/01-module-structure.md)。
 

@@ -132,10 +132,11 @@ public class Stream {
      */
     public long trim(long maxLen) {
         this.maxLen = maxLen;
-        if (maxLen <= 0 || entries.size() <= maxLen) {
+        // maxLen==0 是"清空"，不是"不动"：Redis 的 XTRIM key MAXLEN 0 会删光全部条目。
+        long toRemove = maxLen < 0 ? 0 : entries.size() - maxLen;
+        if (toRemove <= 0) {
             return 0;
         }
-        long toRemove = entries.size() - maxLen;
         for (long i = 0; i < toRemove; i++) {
             entries.remove(0);
         }
@@ -155,14 +156,10 @@ public class Stream {
         if (groups.containsKey(groupName)) {
             return false;
         }
-        long lastDeliveredId;
-        if ("$".equals(startId)) {
-            lastDeliveredId = entries.isEmpty() ? 0 :
-                    StreamEntry.parseId(entries.get(entries.size() - 1).getId())[0];
-        } else {
-            lastDeliveredId = StreamEntry.parseId(startId)[0];
-        }
-        groups.put(groupName, new ConsumerGroup(groupName, lastDeliveredId));
+        long[] start = StreamEntry.parseId("$".equals(startId)
+                ? (entries.isEmpty() ? "0-0" : entries.get(entries.size() - 1).getId())
+                : startId);
+        groups.put(groupName, new ConsumerGroup(groupName, start[0], start[1]));
         return true;
     }
 

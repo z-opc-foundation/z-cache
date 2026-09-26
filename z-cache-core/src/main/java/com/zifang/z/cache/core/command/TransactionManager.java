@@ -32,6 +32,12 @@ public class TransactionManager {
     private static final Logger logger = LogManager.getLogger(TransactionManager.class);
 
     /**
+     * WATCH 时调用方给进来的版本提供者，exec 复查时用同一把尺。
+     * 每个连接持有独立的 TransactionManager 实例，因此这个字段是 per-connection 的。
+     */
+    private volatile Function<String, Long> versionProvider;
+
+    /**
      * 事务上下文，每个连接持有独立实例。
      */
     public static class TransactionContext {
@@ -172,6 +178,10 @@ public class TransactionManager {
             ctx.watchedKeys.add(key);
             ctx.watchedKeyVersions.put(key, versionProvider.apply(key));
         }
+        // exec 复查时必须用 WATCH 当时那把尺：以前 getCurrentVersion() 恒返回 0，
+        // 于是"WATCH 之后别人改了键"永远测不出来（不中止），而"WATCH 之前键就写过"
+        // 反而快照非 0 vs 当前 0 ⇒ 假中止。方向整个是反的。
+        this.versionProvider = versionProvider;
         logger.debug("Watching keys: {}", (Object) keys);
     }
 
@@ -226,11 +236,18 @@ public class TransactionManager {
     }
 
     /**
-     * 重置事务上下文为初始状态（保留 WATCH 信息）。
+     * 重置事务上下文：退出事务、清空命令队列，并**清掉 WATCH 记录**。
+     * <p>
+     * Redis 的语义就是 EXEC 与 DISCARD 都会 flush 所有被观察的键。以前这里刻意保留，
+     * 于是上一条事务里 WATCH 过的键会永久挂在这条连接上：只要它后来被任何人写过一次，
+     * 这条连接之后每一个 EXEC 都比出不一致而中止 —— 事务看着像是"随机失败"，
+     * 而失败原因来自一条早就结束的事务。
      */
     private void resetContext(TransactionContext ctx) {
         ctx.inTransaction = false;
         ctx.commands.clear();
+        ctx.watchedKeys.clear();
+        ctx.watchedKeyVersions.clear();
     }
 
     /**
@@ -241,6 +258,7 @@ public class TransactionManager {
      * @return 当前版本号
      */
     protected long getCurrentVersion(String key) {
-        return 0L;
+        Function<String, Long> provider = this.versionProvider;
+        return provider == null ? 0L : provider.apply(key);
     }
 }

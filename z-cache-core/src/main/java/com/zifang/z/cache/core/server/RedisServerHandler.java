@@ -31,7 +31,7 @@ public class RedisServerHandler extends SimpleChannelInboundHandler<Object> {
 
     /** 会睡到"真的有值"为止的命令。它们不能占普通命令线程。 */
     private static final Set<String> BLOCKING_COMMANDS =
-            new HashSet<>(Arrays.asList("BLPOP", "BRPOP"));
+            new HashSet<>(Arrays.asList("BLPOP", "BRPOP", "BRPOPLPUSH"));
 
     private final CommandHandler commandHandler;
     private final MemoryStore store;
@@ -51,12 +51,26 @@ public class RedisServerHandler extends SimpleChannelInboundHandler<Object> {
 
     public RedisServerHandler(CommandHandler commandHandler, PubSubManager pubSubManager,
                               MemoryStore store, EventExecutorGroup blockingGroup) {
+        this(commandHandler, pubSubManager, store, blockingGroup, null, null);
+    }
+
+    /**
+     * @param serverConnections 这台服务器的连接登记表；null 时退回进程级默认值
+     * @param serverMonitors    这台服务器的 MONITOR 集合；null 时退回进程级默认值
+     */
+    public RedisServerHandler(CommandHandler commandHandler, PubSubManager pubSubManager,
+                              MemoryStore store, EventExecutorGroup blockingGroup,
+                              java.util.concurrent.ConcurrentMap<ChannelHandlerContext, CommandHandler> serverConnections,
+                              java.util.Set<ChannelHandlerContext> serverMonitors) {
         this.commandHandler = commandHandler;
         this.store = store;
         this.blockingGroup = blockingGroup;
         this.commandHandler.setChannelContext(null); // 会在 channelActive 中设置
-        if (pubSubManager != null) {
-            this.commandHandler.setPubSubManager(pubSubManager);
+        // 这条连接用自己服务器的那份 pub/sub 管理器与连接登记表。以前这里是
+        // CommandHandler.setPubSubManager(...)（写静态字段）：每 accept 一条连接就全局覆写一次，
+        // 一个 JVM 里两台服务器会互相串订阅态，CLIENT LIST 也变成"列整个 JVM 的连接"。
+        if (pubSubManager != null || serverConnections != null || serverMonitors != null) {
+            this.commandHandler.bindSharedComponents(pubSubManager, serverConnections, serverMonitors);
         }
     }
 

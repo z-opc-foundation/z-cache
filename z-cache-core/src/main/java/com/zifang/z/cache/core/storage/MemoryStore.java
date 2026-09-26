@@ -176,6 +176,32 @@ public class MemoryStore {
         return type;
     }
 
+    /**
+     * 这个键当前真正是哪一种类型 —— 以五个 store 里有没有它为准。
+     * <p>
+     * 不读 {@code keyTypeMaps}：那张表只有 String 写入路径（{@code setKeyType}）维护过，
+     * 集合类型从来没登记，所以它对"这是个 hash"永远说 NONE。EXISTS / TYPE / 类型闸门
+     * 现在共用这一把尺，三者不可能再互相打脸。
+     */
+    public DataType typeOfDb(int db, String key) {
+        if (key == null) {
+            return DataType.NONE;
+        }
+        ValueWrapper wrapper = stringStores[db].get(key);
+        if (wrapper != null) {
+            if (wrapper.isExpired()) {
+                stringStores[db].remove(key);
+            } else {
+                return DataType.STRING;
+            }
+        }
+        if (hashStores[db].exists(key)) return DataType.HASH;
+        if (listStores[db].exists(key)) return DataType.LIST;
+        if (setStores[db].exists(key)) return DataType.SET;
+        if (sortedSetStores[db].exists(key)) return DataType.ZSET;
+        return DataType.NONE;
+    }
+
     // ==================== String 操作 (保持向后兼容) ====================
 
     public boolean set(String key, byte[] value) {
@@ -738,13 +764,22 @@ public class MemoryStore {
 
     private final ConcurrentHashMap<String, AtomicLong> keyVersions = new ConcurrentHashMap<>();
 
-    public long getKeyVersion(String key) {
-        AtomicLong version = keyVersions.get(key);
+    /**
+     * 某个库里键的事务版本号。必须带 db：版本号只在同一个库内可比，
+     * 只按 key 记的话 DB 1 上写 {@code k} 会把 DB 0 上 {@code WATCH k} 的连接一起中止掉。
+     */
+    public long getKeyVersion(int db, String key) {
+        AtomicLong version = keyVersions.get(versionKey(db, key));
         return version == null ? 0L : version.get();
     }
 
-    public void bumpKeyVersion(String key) {
-        keyVersions.computeIfAbsent(key, k -> new AtomicLong(0)).incrementAndGet();
+    public void bumpKeyVersion(int db, String key) {
+        keyVersions.computeIfAbsent(versionKey(db, key), k -> new AtomicLong(0)).incrementAndGet();
+    }
+
+    /** 0x00 分隔：键名里不可能带它，而 "db:key" 形式会把 {@code "1:2"} 与 db=1/key="2" 撞在一起。 */
+    private static String versionKey(int db, String key) {
+        return db + "\u0000" + key;
     }
 
     // ==================== 统计信息 ====================
@@ -771,13 +806,29 @@ public class MemoryStore {
 
     private void putDb(int db, String key, ValueWrapper value) {
         synchronized (stringStores[db]) {
+            // 一个键只能挂一个值：写成 String 前要把同名 key 上的 hash/list/set/zset 清掉
+            // （Redis 的 dbOverwrite 就是这一步）。不清的话 GET 和 HGETALL 会各自答一份，
+            // DBSIZE 还会把同一个键数两遍，DEL 要按两次才删干净。
+            clearOtherTypes(db, key);
             stringStores[db].put(key, value);
-            bumpKeyVersion(key);
+            // 版本号不在这里记：CommandHandler 才是"客户端写了一次"的唯一漏斗，
+            // 在那儿记才能覆盖五种类型（也只有命令层知道一条命令改了哪几个键）。
             if (maxEntries <= 0 || stringStores[db].size() + getTotalEntries(db) <= maxEntries) {
                 return;
             }
             evictOne(db);
         }
+    }
+
+    /**
+     * 抹掉同一键上其它数据类型的残留。四个集合存储都是叶子（不回指 MemoryStore），
+     * 所以这里在 string 的监视器内调用不会和它们形成反向锁序。
+     */
+    private void clearOtherTypes(int db, String key) {
+        hashStores[db].del(key);
+        listStores[db].del(key);
+        setStores[db].del(key);
+        sortedSetStores[db].del(key);
     }
 
     private long getTotalEntries(int db) {

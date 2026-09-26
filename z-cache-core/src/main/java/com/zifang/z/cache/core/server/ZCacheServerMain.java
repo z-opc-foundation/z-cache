@@ -133,10 +133,9 @@ public class ZCacheServerMain {
         logger.info("z-cache server stopped");
     }
 
-    /** 取打包进 MANIFEST 的实现版本；裸 IDE 运行时读不到就如实报 dev，不再硬写一个假版本号。 */
+    /** 取打包进 MANIFEST 的实现版本；与 INFO 共用同一把尺，裸 IDE 运行时读不到就如实报 dev。 */
     private static String implementationVersion() {
-        String v = ZCacheServerMain.class.getPackage().getImplementationVersion();
-        return v == null || v.isEmpty() ? "dev" : v;
+        return com.zifang.z.cache.core.command.CommandHandler.serverVersion();
     }
 
     private static void fail(String message) {
@@ -156,6 +155,7 @@ public class ZCacheServerMain {
         System.out.println("  -p, --port <port>    Listen port (default: 6379)");
         System.out.println("  --max-entries <n>    Maximum keys, 0 means unlimited");
         System.out.println("  --data-dir <dir>     Enable RDB/AOF persistence and snapshots in <dir>");
+        System.out.println("  -h, --help           Show this help message");
         System.out.println();
         System.out.println("Persistence tuning (system properties, only with --data-dir):");
         System.out.println("  -Dzcache.save-seconds <n>   RDB snapshot check interval, default 300; 0 disables periodic snapshots");
@@ -163,7 +163,6 @@ public class ZCacheServerMain {
         System.out.println("  -Dzcache.appendfsync <p>    always | everysec (default) | no");
         System.out.println("  Recovery order matches Redis: a non-empty appendonly.aof is replayed and");
         System.out.println("  dump.rdb is then ignored, so the two are never applied on top of each other.");
-        System.out.println("  -h, --help           Show this help message");
         System.out.println();
         System.out.println("Examples:");
         System.out.println("  java -jar z-cache-core.jar");

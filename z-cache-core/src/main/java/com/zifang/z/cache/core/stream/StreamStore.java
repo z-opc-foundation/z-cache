@@ -169,11 +169,12 @@ public class StreamStore {
             ConsumerGroup.Consumer c = cg.getOrCreateConsumer(consumer);
 
             if (">".equals(startId)) {
-                // 读取新条目（大于 lastDeliveredId）
+                // 读取新条目：entry ID 是 ms-seq 两段，只比毫秒段会把同一毫秒内写入的
+                // 第二条及以后永久卡在组外（XADD 在同一毫秒里连写多条是常态）
                 List<StreamEntry> allEntries = stream.getEntries();
                 List<StreamEntry> newEntries = new ArrayList<>();
                 for (StreamEntry e : allEntries) {
-                    if (e.getTimestamp() > cg.getLastDeliveredId()) {
+                    if (cg.isNewerThanLastDelivered(e.getId())) {
                         newEntries.add(e);
                         cg.markDelivered(e.getId(), consumer);
                         if (count > 0 && newEntries.size() >= count) break;
@@ -207,8 +208,11 @@ public class StreamStore {
 
     /**
      * XPENDING 实现：获取消费组的待确认消息摘要。
+     * <p>
+     * 计数一律是 {@code long}：调用方按 {@code (Long)} 取值，这里塞 {@code int}
+     * 会在运行时抛 ClassCastException，而这条路径单测摸不到，只有走 socket 才炸。
      *
-     * @return [pendingCount, lowestId, highestId, consumers[]]
+     * @return [pendingCount(long), lowestId, highestId, consumers[]]
      */
     public Object[] xpending(int db, String key, String group) {
         Stream stream = getStream(db, key);
@@ -218,7 +222,7 @@ public class StreamStore {
 
         Map<String, String> pending = cg.getPendingEntries();
         if (pending.isEmpty()) {
-            return new Object[]{0, null, null, new String[0]};
+            return new Object[]{0L, null, null, new String[0]};
         }
 
         String lowestId = null;
@@ -228,6 +232,6 @@ public class StreamStore {
             if (highestId == null || StreamEntry.compareIds(id, highestId) > 0) highestId = id;
         }
 
-        return new Object[]{pending.size(), lowestId, highestId, cg.getConsumers().keySet().toArray(new String[0])};
+        return new Object[]{(long) pending.size(), lowestId, highestId, cg.getConsumers().keySet().toArray(new String[0])};
     }
 }
