@@ -32,6 +32,17 @@ public class TransactionManager {
     private static final Logger logger = LogManager.getLogger(TransactionManager.class);
 
     /**
+     * EXEC / DISCARD 在事务之外被调用、或命令在不该出现的时刻入队。
+     * <p>
+     * 抛出的消息一律不带 {@code "ERR "} 前缀：调用点用 {@code RespError.of("ERR", msg)} 统一加
+     * 一次，两边都加就是 1.3.6 在岸实测到的 {@code -ERR ERR no transaction in progress}。文案照
+     * 参考实例逐字抄：{@code EXEC} 回 {@code -ERR EXEC without MULTI}、{@code DISCARD} 回
+     * {@code -ERR DISCARD without MULTI}、嵌套 {@code MULTI} 回
+     * {@code -ERR MULTI calls can not be nested}（redis-server 4.0.9，250 一次性实例）。
+     */
+
+
+    /**
      * WATCH 时调用方给进来的版本提供者，exec 复查时用同一把尺。
      * 每个连接持有独立的 TransactionManager 实例，因此这个字段是 per-connection 的。
      */
@@ -95,7 +106,7 @@ public class TransactionManager {
      */
     public void multi(TransactionContext ctx) {
         if (ctx.inTransaction) {
-            throw new IllegalStateException("ERR MULTI already started");
+            throw new IllegalStateException("MULTI calls can not be nested");
         }
         ctx.inTransaction = true;
         ctx.commands.clear();
@@ -114,7 +125,7 @@ public class TransactionManager {
      */
     public Object exec(TransactionContext ctx, Function<Object[], Object> executor) {
         if (!ctx.inTransaction) {
-            throw new IllegalStateException("ERR no transaction in progress");
+            throw new IllegalStateException("EXEC without MULTI");
         }
 
         // 检查 WATCH 版本号是否发生变化
@@ -156,7 +167,7 @@ public class TransactionManager {
      */
     public void discard(TransactionContext ctx) {
         if (!ctx.inTransaction) {
-            throw new IllegalStateException("ERR no transaction in progress");
+            throw new IllegalStateException("DISCARD without MULTI");
         }
         resetContext(ctx);
         logger.debug("Transaction discarded");
@@ -172,7 +183,7 @@ public class TransactionManager {
      */
     public void watch(TransactionContext ctx, String[] keys, Function<String, Long> versionProvider) {
         if (ctx.inTransaction) {
-            throw new IllegalStateException("ERR WATCH inside MULTI is not allowed");
+            throw new IllegalStateException("WATCH inside MULTI is not allowed");
         }
         for (String key : keys) {
             ctx.watchedKeys.add(key);
@@ -205,7 +216,7 @@ public class TransactionManager {
      */
     public void addCommand(TransactionContext ctx, Object[] command) {
         if (!ctx.inTransaction) {
-            throw new IllegalStateException("ERR no transaction in progress");
+            throw new IllegalStateException("no transaction in progress");
         }
         ctx.commands.add(command);
     }

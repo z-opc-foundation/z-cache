@@ -39,6 +39,55 @@ All notable changes to z-cache will be documented in this file.
 - `DEL` 与 `RENAME` 现在共用 `deleteEveryType`：一个键名底下五张表全清，`DBSIZE` 不会再
   把一个跨类型残留多算一个键。
 
+#### 浮点文本的读与写：一把 Java 文法通吃两族，边界和写法都错位
+- 参考实现有**两族**浮点，不是一把 double。分数那一族（`ZSCORE` / `ZINCRBY` / `ZADD` 的分数位 /
+  `*RANGE … WITHSCORES`）是 `strtod` 进、`%.17g` 出；人读那一族（`INCRBYFLOAT` / `HINCRBYFLOAT`）
+  是 `strtold` 进（x87 的 80 位 long double）、`%.17Lf` 去尾零出。1.3.5 之前两处都写
+  `Double.parseDouble` + `Double.toString`，两族就都不是参考实例那串：分数族要 17 位有效数字，
+  `Double.toString(0.1)` 交 `0.1` 而实例打 `0.10000000000000001`；人读族永不用科学计数，
+  `Double.toString(1e-7)` 交 `1.0E-7` 而实例打 `0.0000001`，`1e17` 实例打 `100000000000000000`；
+  而 `0.33333333333333333333` 只要经由 double 就只剩 16 个 3，实例回 17 个。
+- 现在这一族由 `RedisDoubleFormat` 单独承载，两族各有各的入口：`format` / `parse` 是 double 那一族，
+  `plainSum` / `plainSumAllowingNonFinite` / `requirePlain` 是 long double 那一族（用 `BigDecimal`
+  精确落格，不走 double，否则 `0x1p+5000` 这种参考实例交得出 1506 位的写法会先被压成无穷）。
+- **下溢在这一侧是错误，不是 0**：`strtod` / `strtold` 把非零文本舍到 0 时置 `ERANGE`，
+  Redis 的 `string2d` / `string2ld` 见 `errno != 0` 就回 `value is not a valid float`。
+  于是界限落在"量级"上而不是某个十进制指数上：long double 一族 `1e-4951` 拒、`1.9e-4951` 收
+  （收的那一侧只是印成 `0`）；double 一族 `1e-324` 拒、`1e-320` 与 `4.9e-324`（最小次正规）收。
+  以前两条都朝反方向偏：long double 把下溢当 0 收下，double 把 `1e-400` 安静地解析成 0。
+- **溢出同理**：`1e4000`、`0x1p+16384` 这些写法 Java 交出无穷而不报错，参考实现当场拒；
+  long double 的上界是 `(2-2^-63)×2^16383`（十进制 4932 位那一档），不是 double 的 `1.8e308`。
+- **C99 十六进制浮点**是参考实例认、Java 那两条文法都不认的一类：`0x10` 就是 16（指数可省，
+  `Double.parseDouble` 强制要 `p`）、`0x.8p0` 就是 0.5、`0X1.8P+1` 大小写混着也算，
+  而可表示范围是**目标格式**的范围——`0x1p+5000` 在 long double 一族收、`0x1p+1024` 在 double 一族拒。
+- **无穷的词汇表两边都不照抄**：`strtod` 认 `inf` 与 `infinity` 两个词干（大小写随意、可带一个符号），
+  实测 `Infinity` / `+Infinity` / `INFINITY` / `-Infinity` 全收并印回 `inf`；Java 的 `parseDouble`
+  恰好相反——`Infinity` 收、`inf` 不收。`nan` 家族则死在解析阶段（`NAN` / `-nan` / `nan(1)` 都拒），
+  而 `inf` 一路活到结果检查（`INCRBYFLOAT k inf` 回 `increment would produce NaN or Infinity`，
+  `HINCRBYFLOAT h f Infinity` 根本没有这道闸，`inf` 就写进字段、下次再加还是 `inf`）。
+- **Java 比 C 宽出的那几类写法一律拒**：类型后缀（`1d` `1D` `1F` `1.5d` `0x1p3f`）、
+  Java 7 起的下划线分隔（`1_0`）、以及前后空白（空格与制表符同命，四个位置——分数位、增量位、
+  原值位、`HINCRBYFLOAT` 的原值位——全拒）。`Double.parseDouble` 对本机 JDK 25 的 `" 1"` 与
+  `"1\t"` 都交 1.0，所以拒它的不是 Java，是 `RedisDoubleFormat` 里那台自己写的 C99 文法机。
+- 自己写出去的串必须自己读得回来：`COPY`、持久化回读、`HINCRBYFLOAT` 读旧值都是拿本类打出的那串
+  再解析的，以前 `inf` 是"自己写、自己拒"。`whatWeWriteWeCanReadBack` 把这一条钉成 15 例往返。
+
+#### RESP 帧被 TCP 切一刀，服务端多吐元素、客户端静默交错值
+- 服务端与客户端的解码器曾经是两份逐字雷同的 `ReplayingDecoder` 子类，都在元素循环里手工
+  `readerIndex(rewind)`：重放游标与手工 rewind 互不认识，同一族缺陷在两边各长了一次，症状还不同。
+  250 实测服务端侧 `ZADD z1 1 one 2 two 3 three` 被切成两包后，交出正确数组**之外**再吐出 7 个
+  散装元素，请求/响应就此错位；客户端侧 `*2 foo bar` 切在第 13 字节，解出 `["foo","foo"]`——
+  一声不响把错值交给调用方，日志里什么都没有。
+- 现在两边共用 `z-cache-common` 里的 `RespFrameReader`，规矩只有一条：**整帧到齐才前进游标**，
+  字节不够就返回 `NEED_MORE` 且一个字都不消耗。`RespDecoder` 与 `ClientRespDecoder` 各减掉
+  411 / 505 行重复状态机（两个文件合计 -893 行）。
+- 错误回复这一族补了两处对不上参考实例的地方：`RespError` 构造时把消息里的 CR/LF 换成空格
+  （Error 类型靠 CRLF 结束，文本里带一个换行就把这一行劈成几行，后面那段成了客户端从没请求过的
+  响应——而报错文本经常原样回显客户端输入）；`wrongNumberOfArguments` 打的是命令表里的小写名
+  （实测 `ZADD k CH` → `-ERR wrong number of arguments for 'zadd' command`，而调用点传进来的
+  全是 `"ZADD"` 这种大写；`CLIENT` / `DEBUG` 那类"未知子命令"文案要保留原文大写，所以清洗
+  只在各自出口做一次，不铺到几十个调用点）。
+
 ### Added
 - `RedisServer.serverScope()`：只读拿到本台那一份，测试与嵌入式据此判断作用域边界。
 - `RedisServerProtocolSemanticsTest` 增加 2 条端到端回归（`streamKeyspaceIsScopedToOneServerInstance`

@@ -1,5 +1,6 @@
 package com.zifang.z.cache.core.persistence;
 
+import com.zifang.z.cache.common.protocol.RedisDoubleFormat;
 import com.zifang.z.cache.core.storage.HashStore;
 import com.zifang.z.cache.core.storage.ListStore;
 import com.zifang.z.cache.core.storage.MemoryStore;
@@ -92,7 +93,7 @@ public class MemoryStoreAccessor implements StoreAccessor {
             Map<byte[], Double> memberScores = new LinkedHashMap<>();
             for (int i = 0; i + 1 < range.size(); i += 2) {
                 byte[] member = range.get(i);
-                double score = Double.parseDouble(new String(range.get(i + 1), StandardCharsets.UTF_8));
+                double score = RedisDoubleFormat.parse(new String(range.get(i + 1), StandardCharsets.UTF_8));
                 memberScores.put(member, score);
             }
             result.put(key, memberScores);

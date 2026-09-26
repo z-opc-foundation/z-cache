@@ -255,5 +255,24 @@
                 </snapshotRepository>
             </distributionManagement>
         </profile>
+
+        <!-- 声明的 Java 8 底线要有尺，否则它只是一句注释。
+             source/target 8 只在 JDK 9+ 的 bootclasspath 上"看起来"过了：javac 照样允许
+             Map.of / List.of 这类 Java 9 才有的 API，产出的 class 也还是 52.0，于是问题一路
+             活到真正跑在 Java 8 上的机器才炸。实测：同一棵树 macOS/JDK25 全绿，
+             250/JDK1.8.0_362 在 z-cache-core 的 testCompile 上 24 处 "cannot find symbol
+             method of(java.lang.String,java.lang.String) location: interface java.util.Map"。
+             release 8（javac 的 release 选项）用 JDK 9 之前的系统模块签名编译，
+             越界 API 在本地就直接编译失败。
+             JDK 8 上这个 profile 不激活（javac 8 不认 release 选项），source/target 8 照旧。 -->
+        <profile>
+            <id>java8-floor-on-jdk9plus</id>
+            <activation>
+                <jdk>[9,)</jdk>
+            </activation>
+            <properties>
+                <maven.compiler.release>8</maven.compiler.release>
+            </properties>
+        </profile>
     </profiles>
 </project>

@@ -1,5 +1,8 @@
 package com.zifang.z.cache.core.storage;
 
+import com.zifang.z.cache.common.protocol.RedisDoubleFormat;
+import com.zifang.z.cache.common.protocol.RedisIntegerFormat;
+
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -214,11 +217,16 @@ public class MemoryStore {
         return true;
     }
 
-    public boolean setex(String key, int seconds, byte[] value) {
+    public boolean setex(String key, long seconds, byte[] value) {
         return setexDb(0, key, seconds, value);
     }
 
-    public boolean setexDb(int db, String key, int seconds, byte[] value) {
+    /**
+     * 秒数栏收 {@code long} 而不是 {@code int}：实测 {@code SET k v EX 4000000000} 在参考实现里
+     * 回 {@code +OK} 且 {@code TTL} 就是 4000000000，用 int 接会在语法这一档就把合法输入判死
+     * （battery37 第 56/57 行）。调用方负责先挡掉"乘一千会溢出"的那一段。
+     */
+    public boolean setexDb(int db, String key, long seconds, byte[] value) {
         long expireAt = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(seconds);
         putDb(db, key, new ValueWrapper(value == null ? null : value.clone(), expireAt));
         setKeyType(key, DataType.STRING, db);
@@ -292,11 +300,14 @@ public class MemoryStore {
             ValueWrapper current = getLiveWrapper(db, key);
             long value = 0;
             if (current != null && current.data != null) {
-                try {
-                    value = Long.parseLong(new String(current.data, StandardCharsets.UTF_8));
-                } catch (NumberFormatException e) {
-                    throw new IllegalArgumentException("value is not an integer or out of range", e);
+                // 键里存的这串也是客户端给进来的文本，判据必须与 INCRBY 的增量栏同源：
+                // Long.parseLong 收 05 / +5 / -0，而参考实现 SET k 05 之后 INCR k 是拒的
+                // （两处都走 string2ll）。
+                Long parsed = RedisIntegerFormat.parse(new String(current.data, StandardCharsets.UTF_8));
+                if (parsed == null) {
+                    throw new IllegalArgumentException("value is not an integer or out of range");
                 }
+                value = parsed.longValue();
             }
             final long result;
             try {
@@ -305,6 +316,77 @@ public class MemoryStore {
                 throw new IllegalArgumentException("increment or decrement would overflow", e);
             }
             putDb(db, key, new ValueWrapper(Long.toString(result).getBytes(StandardCharsets.UTF_8),
+                    current == null ? -1 : current.expireAt));
+            setKeyType(key, DataType.STRING, db);
+            return result;
+        }
+    }
+
+    /**
+     * 参考实现里字符串的上限就是协议里 bulk 的上限，实测边界在两侧都量到过：
+     * {@code SETRANGE k 400000000 y} 成功（400000001 字节），
+     * {@code SETRANGE k 600000000 x} 回 {@code string exceeds maximum allowed size (512MB)}。
+     */
+    public static final long MAX_STRING_LENGTH = 512L * 1024 * 1024;
+
+    /**
+     * 从 {@code offset} 起覆盖写入，越出现有长度的部分用 {@code \0} 补齐（SETRange 的补齐
+     * 语义，实测 {@code SETRANGE s 5 World} 之后 {@code STRLEN} 回 10）。
+     * <p>
+     * TTL 与原值一起留着：这条走的是"改一个已存在的键"，不是 {@code SET} 的整键覆盖
+     * （{@code appendDb} / {@code incrementDb} 同规矩）。
+     *
+     * @throws IllegalArgumentException 结果长度越过 {@link #MAX_STRING_LENGTH}
+     */
+    public long setRangeDb(int db, String key, long offset, byte[] replacement) {
+        if (key == null || offset < 0) {
+            throw new IllegalArgumentException("offset is out of range");
+        }
+        byte[] suffix = replacement == null ? new byte[0] : replacement;
+        synchronized (stringStores[db]) {
+            ValueWrapper current = getLiveWrapper(db, key);
+            byte[] existing = current == null || current.data == null ? new byte[0] : current.data;
+            if (suffix.length == 0) {
+                // 空替换不改一个字节：回现长，且不给不存在的键凭空建键
+                // （这一支是从 redis 4.0 setrangeCommand 的 sdslen(value)==0 分支读来的，
+                //  对拍脚本传不出空值参数，未在 250 上实测）
+                return existing.length;
+            }
+            // 减法而不是加法：offset 可能带进 Long.MAX_VALUE，offset+length 会绕回负数，
+            // 那一支在参考实现里真的把长度检查绕过去了（实测 SETRANGE k 9223372036854775807 x
+            // 直接让 redis-server 4.0.9 段错误退出）。
+            if (offset >= MAX_STRING_LENGTH || suffix.length > MAX_STRING_LENGTH - offset) {
+                throw new IllegalArgumentException("string exceeds maximum allowed size (512MB)");
+            }
+            int end = (int) (offset + suffix.length);
+            byte[] out = Arrays.copyOf(existing, Math.max(end, existing.length));
+            System.arraycopy(suffix, 0, out, (int) offset, suffix.length);
+            putDb(db, key, new ValueWrapper(out, current == null ? -1 : current.expireAt));
+            setKeyType(key, DataType.STRING, db);
+            return out.length;
+        }
+    }
+
+    /**
+     * INCRBYFLOAT：文本进、文本出，键里存的就是回复的那一串。
+     * <p>
+     * 算术不在 double 里做 —— 参考实现这一族用的是 80 位 long double，见
+     * {@link RedisDoubleFormat#plainSum}。原值缺失时从 {@code "0"} 起算（实测
+     * {@code INCRBYFLOAT newkey 0.1} 回 {@code 0.1}）。
+     *
+     * @throws NumberFormatException   原值或增量不是合法浮点文本
+     * @throws ArithmeticException     结果不是有限值
+     */
+    public String incrementFloatDb(int db, String key, String delta) {
+        if (key == null) {
+            throw new NumberFormatException("value is not a valid float");
+        }
+        synchronized (stringStores[db]) {
+            ValueWrapper current = getLiveWrapper(db, key);
+            String base = current == null || current.data == null ? "0"
+                    : new String(current.data, StandardCharsets.UTF_8);
+            String result = RedisDoubleFormat.plainSum(base, delta);
+            putDb(db, key, new ValueWrapper(result.getBytes(StandardCharsets.UTF_8),
                     current == null ? -1 : current.expireAt));
             setKeyType(key, DataType.STRING, db);
             return result;
@@ -364,22 +446,33 @@ public class MemoryStore {
 
     // ==================== TTL 操作 ====================
 
-    public boolean expire(String key, int seconds) {
+    public boolean expire(String key, long seconds) {
         return expireDb(0, key, seconds);
     }
 
-    public boolean expireDb(int db, String key, int seconds) {
-        ValueWrapper wrapper = stringStores[db].get(key);
-        if (wrapper == null || wrapper.isExpired()) {
-            if (wrapper != null && wrapper.isExpired()) {
-                stringStores[db].remove(key);
-                keyTypeMaps[db].remove(key);
-            }
-            return false;
+    /**
+     * 与 {@link #pexpireDb} 同一条尺，只是量纲是秒：{@code seconds <= 0} 是"立刻过期"，
+     * 实测（battery37 第 28 行）{@code EXPIRE k 0} 回 {@code :1} 而键当场不见 —— 不是回 0，
+     * 也不是把过期时间写成一个非正的时刻（{@code ValueWrapper} 里 {@code expireAt <= 0}
+     * 的含义是"永不过期"，写进去等于反过来把它救活）。键不在时回 0 由 {@code delDb} 自己给。
+     */
+    public boolean expireDb(int db, String key, long seconds) {
+        if (seconds <= 0) {
+            return delDb(db, key);
         }
-        long expireAt = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(seconds);
-        putDb(db, key, new ValueWrapper(wrapper.data, expireAt));
-        return true;
+        synchronized (stringStores[db]) {
+            ValueWrapper wrapper = stringStores[db].get(key);
+            if (wrapper == null || wrapper.isExpired()) {
+                if (wrapper != null) {
+                    stringStores[db].remove(key, wrapper);
+                    keyTypeMaps[db].remove(key);
+                }
+                return false;
+            }
+            long expireAt = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(seconds);
+            putDb(db, key, new ValueWrapper(wrapper.data, expireAt));
+            return true;
+        }
     }
 
     public boolean pexpire(String key, long milliseconds) {
@@ -744,8 +837,78 @@ public class MemoryStore {
         return true;
     }
 
-    // ==================== RANDOMKEY ====================
+    /**
+     * MOVE：把当前库里的整个键搬到目标库。返回 false 表示"一下都没搬"。
+     * <p>
+     * 三条判据都量过（250 {@code refmv.tr}，五种类型各一组）：
+     * <ol>
+     *   <li>过期时间跟着键一起走 —— {@code EXPIRE mv:b 500} 之后 MOVE，目标库 {@code TTL} 回 500、
+     *       源库回 -2；</li>
+     *   <li>目标库已经有同名键就整个不做：回 0，两边都保持原值（不是覆盖，也不是报错）；</li>
+     *   <li>五种类型都能搬，搬完源库里干干净净（DBSIZE 两侧对账 1 / 7）。</li>
+     * </ol>
+     * 集合类型没有 TTL 可搬，沿本实现的同一把尺（见 {@code CommandHandler} 里 EXPIRE 一族的注释）。
+     *
+     * @return 是否真的搬走了
+     */
+    public boolean moveKeyToDb(int fromDb, int toDb, String key) {
+        if (key == null || fromDb == toDb) {
+            return false;
+        }
+        DataType type = typeOfDb(fromDb, key);
+        if (type == DataType.NONE || typeOfDb(toDb, key) != DataType.NONE) {
+            return false;
+        }
+        switch (type) {
+            case STRING: {
+                ValueWrapper wrapper;
+                synchronized (stringStores[fromDb]) {
+                    wrapper = stringStores[fromDb].remove(key);
+                    keyTypeMaps[fromDb].remove(key);
+                    if (wrapper != null) {
+                        // 目标库确认没有任何类型挂着这个键名（上面那一道判据），所以直接放，
+                        // 不走 putDb —— 那会在两把库锁之间来回，跨库的锁序说不清。
+                        stringStores[toDb].put(key, wrapper);
+                        keyTypeMaps[toDb].put(key, DataType.STRING);
+                    }
+                }
+                return wrapper != null;
+            }
+            case HASH: {
+                Map<String, byte[]> fields = hashStores[fromDb].hgetall(key);
+                hashStores[fromDb].del(key);
+                hashStores[toDb].hmset(key, fields);
+                return true;
+            }
+            case LIST: {
+                List<byte[]> elements = listStores[fromDb].lrange(key, 0, -1);
+                listStores[fromDb].del(key);
+                listStores[toDb].rpush(key, elements.toArray(new byte[0][]));
+                return true;
+            }
+            case SET: {
+                List<byte[]> members = setStores[fromDb].smembers(key);
+                setStores[fromDb].del(key);
+                setStores[toDb].sadd(key, members.toArray(new byte[0][]));
+                return true;
+            }
+            case ZSET: {
+                // 快照成 member → score，再按分数原样落进目标库。不走 "zrange WITHSCORES 再 parse
+                // 回来" 那一圈：那是让二进制值先变成文本再变回来，白白经一遍打印规则。
+                Map<String, Double> scores = sortedSetStores[fromDb].memberScores(key);
+                sortedSetStores[fromDb].del(key);
+                for (Map.Entry<String, Double> entry : scores.entrySet()) {
+                    sortedSetStores[toDb].zadd(key, entry.getValue(),
+                            entry.getKey().getBytes(StandardCharsets.UTF_8));
+                }
+                return true;
+            }
+            default:
+                return false;
+        }
+    }
 
+    // ==================== RANDOMKEY ====================
     public String randomKey(int db) {
         // 从所有 store 中随机选择一个 key
         List<String> allKeys = new ArrayList<>();
@@ -825,10 +988,37 @@ public class MemoryStore {
      * 所以这里在 string 的监视器内调用不会和它们形成反向锁序。
      */
     private void clearOtherTypes(int db, String key) {
-        hashStores[db].del(key);
-        listStores[db].del(key);
-        setStores[db].del(key);
-        sortedSetStores[db].del(key);
+        clearOtherTypes(db, key, DataType.STRING);
+    }
+
+    /**
+     * 保留 {@code keep} 那一种，把键名上其余四种清干净。
+     * <p>
+     * {@code ZUNIONSTORE}/{@code ZINTERSTORE} 覆盖目标键要的就是这一把：Redis 在那里走
+     * {@code dbOverwrite}，先把旧值整个换成新 zset，所以目标键原本挂着 string/hash/list/set
+     * 都不报 WRONGTYPE（实测 {@code SET d x; ZUNIONSTORE d 1 k 1 => 1} 且 {@code TYPE d => zset}）。
+     * 目标键同时又是源键是这条命令的合法写法，因此调用方必须先读完源再清 —— 见
+     * {@code SortedSetStore.aggregateStore}。
+     */
+    public void clearOtherTypes(int db, String key, DataType keep) {
+        if (keep != DataType.STRING) {
+            synchronized (stringStores[db]) {
+                stringStores[db].remove(key);
+                keyTypeMaps[db].remove(key);
+            }
+        }
+        if (keep != DataType.HASH) {
+            hashStores[db].del(key);
+        }
+        if (keep != DataType.LIST) {
+            listStores[db].del(key);
+        }
+        if (keep != DataType.SET) {
+            setStores[db].del(key);
+        }
+        if (keep != DataType.ZSET) {
+            sortedSetStores[db].del(key);
+        }
     }
 
     private long getTotalEntries(int db) {

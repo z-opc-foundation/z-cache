@@ -27,11 +27,19 @@ class RespErrorTest {
         assertEquals("ERR syntax error", err.getMessage());
     }
 
+    /**
+     * 命令名在参考实现里回的是小写原文（250 实测：{@code SUBSTR b4:s} →
+     * {@code ERR wrong number of arguments for 'substr' command}、{@code SETRANGE b4:wt v} →
+     * {@code ... 'setrange' ...}），而调用点一律传的大写命令名。以前这里断言
+     * {@code contains("GET")}，等于把"我们发的是大写"当成期望——它既不是参考实现的形状，
+     * 也正好是那次改动唯一会打断的断言。改成钉整条原文。
+     */
     @Test
     void testWrongNumberOfArguments() {
-        RespError err = RespError.wrongNumberOfArguments("GET");
-        assertTrue(err.getMessage().contains("GET"));
-        assertTrue(err.getMessage().contains("wrong number of arguments"));
+        assertEquals("ERR wrong number of arguments for 'get' command",
+                RespError.wrongNumberOfArguments("GET").getMessage());
+        assertEquals("ERR wrong number of arguments for 'hsetnx' command",
+                RespError.wrongNumberOfArguments("HSETNX").getMessage());
     }
 
     @Test

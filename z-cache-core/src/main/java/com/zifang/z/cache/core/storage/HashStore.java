@@ -1,5 +1,8 @@
 package com.zifang.z.cache.core.storage;
 
+import com.zifang.z.cache.common.protocol.RedisDoubleFormat;
+import com.zifang.z.cache.common.protocol.RedisIntegerFormat;
+
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -26,6 +29,13 @@ public class HashStore {
      * 存储数据: key -> (field -> value)
      */
     private final ConcurrentHashMap<String, ConcurrentHashMap<String, byte[]>> store = new ConcurrentHashMap<>();
+
+    /**
+     * 参考实现把 hash 字段抄进一个定长栈缓冲才交给 {@code strtold}，抄不进去的字段一律算
+     * "不是浮点"。实测的分界：255 字节的数字串加得动，256 字节起回
+     * {@code hash value is not a float}（250，ref21 的 d255 / d256 两行）。
+     */
+    private static final int LDBL_FIELD_READ_BUF = 256;
 
     // ==================== Hash Write Operations ====================
 
@@ -114,11 +124,13 @@ public class HashStore {
             long value = 0;
             byte[] existing = hash.get(field);
             if (existing != null) {
-                try {
-                    value = Long.parseLong(new String(existing, StandardCharsets.UTF_8));
-                } catch (NumberFormatException e) {
-                    throw new IllegalArgumentException("hash field value is not an integer or out of range", e);
+                // 键里存的那串也是客户端文本，所以用同一把尺：Long.parseLong 收得下 05 / +5 / -0，
+                // 而 HSET h f 05 之后 HINCRBY h f 1 在参考实现里是拒的（它走的是 string2ll）。
+                Long parsed = RedisIntegerFormat.parse(new String(existing, StandardCharsets.UTF_8));
+                if (parsed == null) {
+                    throw new IllegalArgumentException("hash field value is not an integer or out of range");
                 }
+                value = parsed.longValue();
             }
             long result;
             try {
@@ -133,30 +145,62 @@ public class HashStore {
 
     /**
      * 对 hash 中指定字段的浮点数值进行递增。
+     * <p>
+     * 增量和结果都是<b>文本</b>：参考实现在这一步上不做任何二进制浮点的往返（键里存的就是
+     * 回复打出的那串），而它的算术是 80 位 long double。传 double 进来等于先把增量压成
+     * 53 位再相加，{@code HINCRBYFLOAT h f 0.2}（f 已是 0.1）就会写成
+     * {@code 0.30000000000000004}，而实测对岸回 {@code 0.3}。算术与打印一起交给
+     * {@link RedisDoubleFormat#plainSum}。
      *
      * @param key   键
      * @param field 字段名
-     * @param delta 增量值
-     * @return 递增后的值
-     * @throws IllegalArgumentException 如果字段值不是有效数字
+     * @param delta 增量文本（客户端原样给进来的那串）
+     * @return 递增后的那串文本，也就是要回复给客户端的那串
+     * @throws NumberFormatException 增量不是合法浮点文本（"value is not a valid float"）
+     * @throws IllegalArgumentException 字段原值不是合法浮点文本（"hash value is not a float"）
      */
-    public double hincrbyfloat(String key, String field, double delta) {
+    public String hincrbyfloat(String key, String field, String delta) {
         if (key == null || field == null) {
             throw new IllegalArgumentException("key and field must not be null");
         }
         synchronized (store) {
-            ConcurrentHashMap<String, byte[]> hash = store.computeIfAbsent(key, k -> new ConcurrentHashMap<>());
-            double value = 0.0;
-            byte[] existing = hash.get(field);
-            if (existing != null) {
+            ConcurrentHashMap<String, byte[]> existing = store.get(key);
+            byte[] currentValue = existing == null ? null : existing.get(field);
+            // 字段不存在时从 0 起算，和参考实现一样。
+            String base = currentValue == null ? "0" : new String(currentValue, StandardCharsets.UTF_8);
+            // 增量先量、原值后量：参考实现的 hincrbyfloatCommand 是先解析 argv[3] 再回头读字段，
+            // 于是"原值已是 -nan 而增量又写了 nan"这一例回的是<b>增量</b>的文案（250 实测 ref12：
+            // HINCRBYFLOAT b12:a f nan → value is not a valid float，紧接着同一字段配 1 才回
+            // hash value is not a float，ref13）。反过来先量原值就会把这两条文案串位。
+            if (!RedisDoubleFormat.isInfinityText(delta)) {
+                RedisDoubleFormat.requirePlain(delta);
+            }
+            if (currentValue != null && !RedisDoubleFormat.isInfinityText(base)) {
+                // 读原值这一步在参考实现里要先把字段抄进一个定长栈缓冲，抄不进去就当"这字段
+                // 不是浮点"（250 实测 ref21：255 位纯数字加得动，256 位起 "hash value is not a
+                // float"）。这一条只在 hash 侧有：同样长度的值走字符串那一族的 INCRBYFLOAT
+                // 是加得动的（实测 200 位）。而它先于真正的 strtold，所以 256 位的那串哪怕
+                // 数值合法（1e4932 的精确展开就是 4933 位）也一律算坏。
+                if (currentValue.length >= LDBL_FIELD_READ_BUF) {
+                    throw new IllegalArgumentException("hash value is not a float");
+                }
+                // 坏在原值和坏在增量，参考实现回的是两条不同文案（250 实测：
+                // HSET h f abc 之后 HINCRBYFLOAT h f 1 → hash value is not a float，
+                // 而 HINCRBYFLOAT h f abc → value is not a valid float）。一次算完分不出是谁，
+                // 所以原值要先单独量一遍。原值本身是 inf 时不算坏 —— 这一族允许无穷参与运算
+                // 并把 "-inf" 写回字段（实测），只有 nan / 越界那种读不回来的才算坏。
                 try {
-                    value = Double.parseDouble(new String(existing, StandardCharsets.UTF_8));
+                    RedisDoubleFormat.requirePlain(base);
                 } catch (NumberFormatException e) {
-                    throw new IllegalArgumentException("hash field value is not a valid float", e);
+                    throw new IllegalArgumentException("hash value is not a float", e);
                 }
             }
-            double result = value + delta;
-            hash.put(field, formatDouble(result).getBytes(StandardCharsets.UTF_8));
+            // 算术先做完，再落盘：以前是 computeIfAbsent 之后才算，于是"增量写歪了"这种
+            // 一定失败的调用也会在库里留下一个空 hash —— TYPE 报 hash、DBSIZE 多算一个键，
+            // 而参考实现报错时什么都不建（实测 HINCRBYFLOAT b13:e f 1e99999 之后 EXISTS 回 0）。
+            String result = RedisDoubleFormat.plainSumAllowingNonFinite(base, delta);
+            ConcurrentHashMap<String, byte[]> hash = store.computeIfAbsent(key, k -> new ConcurrentHashMap<>());
+            hash.put(field, result.getBytes(StandardCharsets.UTF_8));
             return result;
         }
     }
@@ -327,6 +371,29 @@ public class HashStore {
     }
 
     /**
+     * HSTRLEN：字段值的<b>字节</b>长度，不是字符长度。
+     * <p>
+     * 实测两例把这条区分得很死：{@code HSET h f Hello} 之后 {@code HSTRLEN h f} 回 5，
+     * 而 {@code HSET h u 你好} 之后回的是 <b>6</b>（UTF-8 三个字节一个汉字）。
+     * 键不存在、字段不存在都回 0，都不算错。
+     *
+     * @param key    键
+     * @param field  字段名
+     * @return 字段值的字节数；键或字段不存在返回 0
+     */
+    public long hstrlen(String key, String field) {
+        if (key == null || field == null) {
+            return 0;
+        }
+        ConcurrentHashMap<String, byte[]> hash = store.get(key);
+        if (hash == null) {
+            return 0;
+        }
+        byte[] value = hash.get(field);
+        return value == null ? 0 : value.length;
+    }
+
+    /**
      * 随机返回 hash 中的一个或多个字段名。
      *
      * @param key     键
@@ -460,16 +527,6 @@ public class HashStore {
     }
 
     // ==================== Internal Utilities ====================
-
-    private static String formatDouble(double v) {
-        String s = String.valueOf(v);
-        if (s.contains(".") && !s.contains("E") && !s.contains("e")) {
-            int l = s.length();
-            while (l > 1 && s.charAt(l - 1) == '0' && s.charAt(l - 2) != '.') l--;
-            s = s.substring(0, l);
-        }
-        return s;
-    }
 
     /**
      * 将 glob 通配符模式转换为正则表达式。

@@ -1,5 +1,7 @@
 package com.zifang.z.cache.core.storage;
 
+import com.zifang.z.cache.common.protocol.RedisDoubleFormat;
+
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -278,6 +280,8 @@ public class SortedSetStore {
      * @param delta  增量值
      * @param member 成员
      * @return 递增后的 score
+     * @throws IllegalArgumentException 结果是 NaN（实测 {@code ZINCRBY z inf m}，m 已是 -inf
+     *         → {@code resulting score is not a number (NaN)}）；拦在写盘之前，坏分数不会留在库里
      */
     public double zincrby(String key, double delta, byte[] member) {
         if (key == null || member == null) {
@@ -288,8 +292,141 @@ public class SortedSetStore {
             String memberStr = new String(member, StandardCharsets.UTF_8);
             Double oldScore = data.memberScores.get(memberStr);
             double newScore = (oldScore == null ? 0.0 : oldScore) + delta;
+            requireNotNan(newScore);
             data.addMember(memberStr, newScore, member);
             return newScore;
+        }
+    }
+
+    /**
+     * {@code ZADD} 的修饰位。互斥关系（NX/XX、GT/LT、INCR 与 GT/LT）由命令层判，
+     * 这里只按位执行——存储层不认识"客户端的写法"，只认识"这一次要不要建、要不要改"。
+     */
+    public static final int ZADD_NX = 1;
+    public static final int ZADD_XX = 2;
+    public static final int ZADD_CH = 4;
+    public static final int ZADD_GT = 8;
+    public static final int ZADD_LT = 16;
+
+    /**
+     * 带修饰位的 ZADD。
+     * <p>
+     * 计数口径是实测出来的两把尺：不带 {@code CH} 只数<b>新增</b>的成员
+     * （{@code ZADD k XX 3 a} 明明把 a 的分数改了，回的仍是 0），带了 {@code CH} 才把
+     * "改动过的已有成员"一起算进去（{@code CH 6 a} 第一次回 1、原样再来一次回 0）。
+     * 250 实测的 {@code GT}/{@code LT} 那两行回的是 {@code syntax error} —— 4.0.9 还不认识它们，
+     * 本实现按 Redis 6.2 起的文法支持，而 6.2 那版的语义是<b>既不建新成员也不改劣</b>
+     * （文档原话：{@code GT -- Only update elements that have a greater score. Don't add new
+     * elements.}）。这一条没有对岸样本可钉（对岸压根不认这两个旗），依据只能是"既然自称支持
+     * 6.2 的文法，就得照 6.2 的语义走"——把它记进 README 偏差清单，别当成实测来的。
+     *
+     * @param key     键
+     * @param scores  分数数组
+     * @param members 成员数组，与 scores 一一对应
+     * @param flags   {@link #ZADD_NX} 等按位或
+     * @return 要回复给客户端的计数
+     */
+    public long zadd(String key, double[] scores, byte[][] members, int flags) {
+        if (key == null || scores == null || members == null || scores.length != members.length) {
+            return 0;
+        }
+        long added = 0;
+        long changed = 0;
+        synchronized (store) {
+            for (int i = 0; i < scores.length; i++) {
+                byte[] member = members[i];
+                if (member == null) {
+                    continue;
+                }
+                String memberStr = new String(member, StandardCharsets.UTF_8);
+                SortedSetData data = store.get(key);
+                Double oldScore = data == null ? null : data.memberScores.get(memberStr);
+                if (oldScore == null) {
+                    if ((flags & ZADD_XX) != 0) {
+                        // XX：只改已有的。一个都不改时也不该把键建出来（实测
+                        // ZADD b6:z XX 1 a 2 b 回 0，而 b 不该因此多出一个空键）
+                        continue;
+                    }
+                    if ((flags & (ZADD_GT | ZADD_LT)) != 0) {
+                        // 同上：GT/LT 也不许凭空建成员，见方法上的说明
+                        continue;
+                    }
+                    data = store.computeIfAbsent(key, k -> new SortedSetData());
+                    data.addMember(memberStr, scores[i], member);
+                    added++;
+                    continue;
+                }
+                if ((flags & ZADD_NX) != 0) {
+                    continue;
+                }
+                if ((flags & ZADD_GT) != 0 && scores[i] <= oldScore) {
+                    continue;
+                }
+                if ((flags & ZADD_LT) != 0 && scores[i] >= oldScore) {
+                    continue;
+                }
+                if (oldScore == scores[i]) {
+                    // 分数一模一样：既不算新增也不算改动（实测 CH 那一支第二次原样写回 0），
+                    // 连写都不用重写一遍
+                    continue;
+                }
+                data.addMember(memberStr, scores[i], member);
+                changed++;
+            }
+        }
+        return (flags & ZADD_CH) != 0 ? added + changed : added;
+    }
+
+    /**
+     * {@code ZADD key [NX|XX] [CH] INCR score member} —— 分数那一栏是<b>增量</b>而不是新分数。
+     *
+     * @return 递增后的分数；{@code null} 表示这一支被 NX/XX 挡下了（Redis 回的是 nil，
+     *         实测 {@code ZADD b4:zz INCR NX 5 a} → {@code (nil)}，而不是 0 也不是报错）
+     * @throws IllegalArgumentException 结果是 NaN
+     */
+    public Double zaddIncr(String key, double increment, byte[] member, int flags) {
+        if (key == null || member == null) {
+            throw new IllegalArgumentException("key and member must not be null");
+        }
+        synchronized (store) {
+            String memberStr = new String(member, StandardCharsets.UTF_8);
+            SortedSetData data = store.get(key);
+            Double oldScore = data == null ? null : data.memberScores.get(memberStr);
+            if (oldScore == null && (flags & ZADD_XX) != 0) {
+                return null;
+            }
+            if (oldScore != null && (flags & ZADD_NX) != 0) {
+                return null;
+            }
+            double newScore = (oldScore == null ? 0.0 : oldScore) + increment;
+            requireNotNan(newScore);
+            store.computeIfAbsent(key, k -> new SortedSetData()).addMember(memberStr, newScore, member);
+            return newScore;
+        }
+    }
+
+    /** 结果落在 NaN 上：Redis 在写盘之前拦下来，回的是那一句带括号的原文。 */
+    private static void requireNotNan(double score) {
+        if (Double.isNaN(score)) {
+            throw new IllegalArgumentException("resulting score is not a number (NaN)");
+        }
+    }
+
+    /**
+     * member → score 的一份快照，给跨库搬迁（MOVE）用。
+     * <p>
+     * 不复用 {@code zrange(..., withScores=true)} 再 {@code parse} 回来：那条路径要先把自己的
+     * 分数打成文本、再读回二进制，中间隔着打印规则，等于让一次纯搬运依赖一次编解码。
+     *
+     * @return 键不存在时是空表；返回的是拷贝，改它不影响库
+     */
+    public Map<String, Double> memberScores(String key) {
+        SortedSetData data = key == null ? null : store.get(key);
+        if (data == null) {
+            return new java.util.LinkedHashMap<>();
+        }
+        synchronized (store) {
+            return new java.util.LinkedHashMap<>(data.memberScores);
         }
     }
 
@@ -417,7 +554,7 @@ public class SortedSetStore {
             result.add(member.getBytes(StandardCharsets.UTF_8));
             if (withScores) {
                 Double score = data.memberScores.get(member);
-                result.add(doubleToBytes(score));
+                result.add(RedisDoubleFormat.formatBytes(score));
             }
         }
         return result;
@@ -455,7 +592,7 @@ public class SortedSetStore {
             result.add(member.getBytes(StandardCharsets.UTF_8));
             if (withScores) {
                 Double score = data.memberScores.get(member);
-                result.add(doubleToBytes(score));
+                result.add(RedisDoubleFormat.formatBytes(score));
             }
         }
         return result;
@@ -487,7 +624,7 @@ public class SortedSetStore {
             result.add(member.getBytes(StandardCharsets.UTF_8));
             if (withScores) {
                 Double score = data.memberScores.get(member);
-                result.add(doubleToBytes(score));
+                result.add(RedisDoubleFormat.formatBytes(score));
             }
         }
         return result;
@@ -531,7 +668,7 @@ public class SortedSetStore {
             result.add(member.getBytes(StandardCharsets.UTF_8));
             if (withScores) {
                 Double score = data.memberScores.get(member);
-                result.add(doubleToBytes(score));
+                result.add(RedisDoubleFormat.formatBytes(score));
             }
         }
         return result;
@@ -970,30 +1107,5 @@ public class SortedSetStore {
             return index;
         }
         return (long) size + index;
-    }
-
-    /**
-     * 将 double 转换为字节数组（Redis 协议兼容格式）。
-     * <p>
-     * 使用 String.valueOf(double) 的 UTF-8 编码，与 Redis 的 -inf/+inf/-inf 表示兼容。
-     * </p>
-     */
-    private static byte[] doubleToBytes(double value) {
-        if (value == Double.POSITIVE_INFINITY) {
-            return "+inf".getBytes(StandardCharsets.UTF_8);
-        }
-        if (value == Double.NEGATIVE_INFINITY) {
-            return "-inf".getBytes(StandardCharsets.UTF_8);
-        }
-        // 去除尾部多余的 0（如 1.0 -> "1", 1.50 -> "1.5"）
-        String str = String.valueOf(value);
-        if (str.contains(".") && !str.contains("E") && !str.contains("e")) {
-            int len = str.length();
-            while (len > 1 && str.charAt(len - 1) == '0' && str.charAt(len - 2) != '.') {
-                len--;
-            }
-            str = str.substring(0, len);
-        }
-        return str.getBytes(StandardCharsets.UTF_8);
     }
 }

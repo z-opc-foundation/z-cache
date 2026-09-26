@@ -79,6 +79,47 @@ public class ListStore {
     }
 
     /**
+     * 只在列表<b>已经存在</b>时从头部插入（LPUSHX）。
+     * <p>
+     * 与 {@link #lpush} 的差别只有一处，但那一处是可观察的：键不存在时 LPUSH 会建键，
+     * LPUSHX 回 0 且不建键（250 实测 {@code LPUSHX b2:nosuch x} → 0）。空列表等同于不存在
+     * —— 本实现在列表被弹空时会把键摘掉，所以这里判"在不在"直接读 {@code store.get}。
+     *
+     * @param key    键
+     * @param values 要插入的值
+     * @return 插入后的长度；键不存在返回 0
+     */
+    public long lpushx(String key, byte[]... values) {
+        return pushx(key, true, values);
+    }
+
+    /** 只在列表已经存在时从尾部插入（RPUSHX），判据同 {@link #lpushx}。 */
+    public long rpushx(String key, byte[]... values) {
+        return pushx(key, false, values);
+    }
+
+    private long pushx(String key, boolean head, byte[]... values) {
+        if (key == null || values == null || values.length == 0) {
+            return 0;
+        }
+        synchronized (store) {
+            CopyOnWriteArrayList<byte[]> list = store.get(key);
+            if (list == null) {
+                return 0;
+            }
+            for (int i = 0; i < values.length; i++) {
+                if (head) {
+                    list.add(0, values[i] == null ? null : values[i].clone());
+                } else {
+                    list.add(values[i] == null ? null : values[i].clone());
+                }
+            }
+            notifyWaiters(key);
+            return list.size();
+        }
+    }
+
+    /**
      * 移除并返回列表头部（左边）的元素。
      *
      * @param key 键

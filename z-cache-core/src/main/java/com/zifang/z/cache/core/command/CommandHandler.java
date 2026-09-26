@@ -255,7 +255,7 @@ public class CommandHandler {
         RespArray array = (RespArray) request;
         String[] args = array.toStringArray();
         if (args.length == 0) return RespError.of("ERR", "empty command");
-        String cmd = args[0].toUpperCase();
+        String cmd = args[0].toUpperCase(Locale.ROOT);
         logger.debug("Processing command: {} with {} args", cmd, args.length);
 
         long startTime = System.nanoTime();
@@ -284,8 +284,11 @@ public class CommandHandler {
         if ("AUTH".equals(cmd)) return handleAuth(args);
         if (!authenticated) return RespError.of("NOAUTH", "Authentication required.");
 
+        // WATCH 不入队：Redis 把它标成 no-multi，在事务里出现是当场报错而不是排队。
+        // 以前它和 SET 一样吃 +QUEUED，于是"事务里 WATCH"要到 EXEC 之后才发现根本没生效。
         if (!executingTransaction && transactionContext.isInTransaction()
-                && !"MULTI".equals(cmd) && !"EXEC".equals(cmd) && !"DISCARD".equals(cmd)) {
+                && !"MULTI".equals(cmd) && !"EXEC".equals(cmd) && !"DISCARD".equals(cmd)
+                && !"WATCH".equals(cmd)) {
             transactionManager.addCommand(transactionContext, args);
             return RespSimpleString.of("QUEUED");
         }
@@ -305,19 +308,30 @@ public class CommandHandler {
                 case "GET":      result = handleGet(args);        break;
                 case "DEL":      result = handleDel(args);        break;
                 case "EXISTS":   result = handleExists(args);     break;
-                case "EXPIRE":   result = handleExpire(args);     break;
-                case "PEXPIRE":  result = handlePexpire(args);    break;
+                case "EXPIRE":   result = handleExpireLike(args, "EXPIRE", true);   break;
+                case "PEXPIRE":  result = handleExpireLike(args, "PEXPIRE", false); break;
                 case "TTL":      result = handleTtl(args);        break;
                 case "PTTL":     result = handlePttl(args);       break;
                 case "PERSIST":  result = handlePersist(args);    break;
-                case "SETEX":    result = handleSetex(args);      break;
-                case "PSETEX":   result = handlePsetex(args);     break;
+                case "SETEX":    result = handleSetexLike(args, "SETEX", true);   break;
+                case "PSETEX":   result = handleSetexLike(args, "PSETEX", false);  break;
                 case "SETNX":    result = handleSetnx(args);      break;
                 case "GETSET":   result = handleGetset(args);     break;
                 case "MGET":     result = handleMget(args);       break;
                 case "MSET":     result = handleMset(args);       break;
                 case "APPEND":   result = handleAppend(args);     break;
                 case "STRLEN":   result = handleStrlen(args);     break;
+                case "GETRANGE": result = handleGetrange(args, false); break;
+                case "SUBSTR":   result = handleGetrange(args, true);  break;
+                case "SETRANGE": result = handleSetrange(args);   break;
+                case "BITCOUNT": result = handleBitcount(args);   break;
+                case "INCRBYFLOAT": result = handleIncrbyfloat(args); break;
+                case "MSETNX":   result = handleMsetnx(args);     break;
+                case "UNLINK":   result = handleUnlink(args);     break;
+                case "TOUCH":    result = handleTouch(args);      break;
+                case "EXPIREAT": result = handleExpireat(args, false); break;
+                case "PEXPIREAT":result = handleExpireat(args, true);  break;
+                case "MOVE":     result = handleMove(args);       break;
                 case "INCR":     result = handleIncr(args, 1);    break;
                 case "DECR":     result = handleIncr(args, -1);   break;
                 case "INCRBY":   result = handleIncrby(args, 1);  break;
@@ -338,10 +352,13 @@ public class CommandHandler {
                 case "HMSET":    result = handleHmset(args);      break;
                 case "HINCRBY":  result = handleHincrby(args);    break;
                 case "HLEN":     result = handleHlen(args);       break;
+                case "HSTRLEN":  result = handleHstrlen(args);    break;
                 case "HSETNX":   result = handleHsetnx(args);     break;
                 case "HSCAN":    result = handleHscan(args);      break;
                 case "LPUSH":    result = handleLpush(args);      break;
                 case "RPUSH":    result = handleRpush(args);      break;
+                case "LPUSHX":   result = handlePushx(args, true);  break;
+                case "RPUSHX":   result = handlePushx(args, false); break;
                 case "LPOP":     result = handleLpop(args);       break;
                 case "RPOP":     result = handleRpop(args);       break;
                 case "LRANGE":   result = handleLrange(args);     break;
@@ -386,6 +403,8 @@ public class CommandHandler {
                 case "SINTERSTORE": result = handleSinterstore(args); break;
                 case "SUNIONSTORE": result = handleSunionstore(args); break;
                 case "SDIFFSTORE":  result = handleSdiffstore(args);  break;
+                case "ZUNIONSTORE": result = handleZstore(args, false); break;
+                case "ZINTERSTORE": result = handleZstore(args, true);  break;
                 case "ZLEXCOUNT":   result = handleZlexcount(args);   break;
                 case "ZRANGEBYLEX": result = handleZrangebylex(args, false); break;
                 case "ZREVRANGEBYLEX": result = handleZrangebylex(args, true); break;
@@ -431,7 +450,11 @@ public class CommandHandler {
                 case "XINFO":      result = handleXinfo(args);     break;
                 default:
                     logger.warn("Unknown command: {}", cmd);
-                    result = RespError.unknownCommand(cmd);
+                    // 回的是客户端打进来的那一串<b>原样</b>，不是大写化之后用于分派的那一份：
+                    // 实测 {@code ZzYx e31 hello} → {@code unknown command 'ZzYx'}、
+                    // {@code zaddx ...} → {@code 'zaddx'}（battery31 第 15/16 行）。分派要大小写
+                    // 无关，报错却要照客户的写法 —— 两者不能共用同一个字符串。
+                    result = RespError.unknownCommand(args[0]);
             }
             if (slowLog() != null) {
                 long duration = System.nanoTime() - startTime;
@@ -444,6 +467,13 @@ public class CommandHandler {
             // 写命令收尾：AOF 追加 + RDB 写入计数
             propagateWriteToPersistence(args, result);
             return result;
+        } catch (NumberFormatException e) {
+            // 整数栏的语法是集中在一处判的（{@link #longArg} / {@link #intArg}），抛出来由这里
+            // 统一接：三十几个解析点里有一半本来就没有自己的 try，以前那些位置上的
+            // {@code LPOP k abc} 会一路穿到下面的兜底 catch，回成 {@code internal error: For
+            // input string "abc"} —— 一个语法错被报成了服务器内部错。
+            // 有 try 的调用点（SELECT / MOVE / ZRANGEBYSCORE 的浮点栏）各自那句仍然优先。
+            return RespError.notAnInteger();
         } catch (Exception e) {
             logger.error("Error executing command: {} - {}", cmd, e.getMessage(), e);
             return RespError.of("ERR", "internal error: " + e.getMessage());
@@ -452,11 +482,25 @@ public class CommandHandler {
 
     // ==================== 连接命令 ====================
 
+    /**
+     * AUTH —— 三条文案各自什么时候出现，全在 250 上量过（battery31/33/34，参考实例
+     * redis-server 4.0.9，带 requirepass 与不带各跑一轮）：
+     * <ul>
+     *   <li>arity 排在最前：{@code AUTH}、{@code AUTH a b}、{@code AUTH a b c} 一律
+     *       {@code wrong number of arguments for 'auth' command}，<b>即使这台实例根本没设密码</b>。
+     *       对岸这条挂在命令表上（ arity 固定 2），轮不到处理函数里的分支，所以"没设密码"
+     *       不能当先判 —— 1.3.5 之前就是先判密码，于是三条形状全回了同一句话。</li>
+     *   <li>没设密码却收到 AUTH：{@code Client sent AUTH, but no password is set}。</li>
+     *   <li>设了密码而密码不对：{@code invalid password}（不是 6.0 之后那句 WRONGPASS）。</li>
+     * </ul>
+     * 超出对岸的一条不做：Redis 6.0 的 {@code AUTH <user> <pass>} 双参形状，4.0.9 直接吃 arity 错，
+     * 我们跟着拒；对岸的 maxauthtries（错十次踢连接）同样没有照搬。
+     */
     private Object handleAuth(String[] args) {
-        if (password == null) return RespError.of("ERR", "AUTH called without any password configured");
         if (args.length != 2) return RespError.wrongNumberOfArguments("AUTH");
+        if (password == null) return RespError.of("ERR", "Client sent AUTH, but no password is set");
         if (password.equals(args[1])) { authenticated = true; return RespSimpleString.of("OK"); }
-        return RespError.of("WRONGPASS", "invalid username-password pair or user is disabled.");
+        return RespError.of("ERR", "invalid password");
     }
 
     private Object handlePing(String[] args) {
@@ -473,7 +517,7 @@ public class CommandHandler {
     private Object handleSelect(String[] args) {
         if (args.length != 2) return RespError.wrongNumberOfArguments("SELECT");
         try {
-            int db = Integer.parseInt(args[1]);
+            int db = intArg(args[1]);
             if (db < 0 || db > 15) return RespError.of("ERR", "DB index is out of range");
             this.currentDb = db;
             return RespSimpleString.of("OK");
@@ -484,21 +528,46 @@ public class CommandHandler {
 
     // ==================== String 命令 ====================
 
+    /**
+     * SET —— 修饰位这一段照参考实现的形状实现（battery32/33，250 实测）：
+     * <ul>
+     *   <li>NX/XX 各只许出现一次，且互斥；EX/PX 同理互斥。冲突是<b>扫到第二个 token 时</b>
+     *       当场回的，排在取值之前 —— 实测 {@code SET k v NX XX EX abc} 回 {@code syntax error}
+     *       而不是 {@code value is not an integer}，说明对岸根本没走到解析 "abc"。</li>
+     *   <li>EX/PX 的取值收 Redis 的整数语法（{@code +10}、{@code -0} 都算非法），且必须
+     *       {@code > 0}，否则回 {@code invalid expire time in set}（{@code EX 0}、{@code EX -1}
+     *       实测都是这一句）。</li>
+     *   <li>旗标位大小写都认（实测 {@code SET k v EX 1 nx} 在键已存在时回 nil）。</li>
+     * </ul>
+     * 超出对岸的一条：EX 大到"乘一千再加当前时刻"会绕回时，4.0.9 照样回 {@code +OK} 并把键
+     * 静默删掉（实测 {@code EX 9223372036854776} → TTL 0、{@code EX 9223372036854775807} →
+     * 键当场不见）。我们回错，理由见 {@link #expireMillisOrOverflow}。
+     */
     private Object handleSet(String[] args) {
         if (args.length < 3) return RespError.wrongNumberOfArguments("SET");
         String key = args[1], value = args[2];
-        Integer expireSeconds = null; Long expireMillis = null;
+        Long expireMillis = null;
         boolean nx = false, xx = false;
         for (int i = 3; i < args.length; i++) {
-            String opt = args[i].toUpperCase();
-            switch (opt) {
-                case "EX": if (i+1>=args.length) return RespError.syntaxError();
-                    try { expireSeconds = Integer.parseInt(args[++i]); } catch (NumberFormatException e) { return RespError.of("ERR","value is not an integer or out of range"); } break;
-                case "PX": if (i+1>=args.length) return RespError.syntaxError();
-                    try { expireMillis = Long.parseLong(args[++i]); } catch (NumberFormatException e) { return RespError.of("ERR","value is not an integer or out of range"); } break;
-                case "NX": nx = true; break;
-                case "XX": xx = true; break;
-                default: return RespError.syntaxError();
+            String opt = args[i].toUpperCase(Locale.ROOT);
+            if ("EX".equals(opt) || "PX".equals(opt)) {
+                if (expireMillis != null) return RespError.syntaxError();
+                if (i + 1 >= args.length) return RespError.syntaxError();
+                Long raw = RedisIntegerFormat.parse(args[++i]);
+                if (raw == null) return RespError.notAnInteger();
+                Long ms = expireMillisOrOverflow(raw, "EX".equals(opt));
+                if (ms == null || ms.longValue() <= 0) {
+                    return RespError.of("ERR", "invalid expire time in set");
+                }
+                expireMillis = ms;
+            } else if ("NX".equals(opt)) {
+                if (nx || xx) return RespError.syntaxError();
+                nx = true;
+            } else if ("XX".equals(opt)) {
+                if (nx || xx) return RespError.syntaxError();
+                xx = true;
+            } else {
+                return RespError.syntaxError();
             }
         }
         // NX/XX 问的是"这个键在不在"，不是"string 命名空间里有没有"：同一份判据 EXISTS /
@@ -509,7 +578,6 @@ public class CommandHandler {
         if (xx && !exists) return RespBulkString.nullBulkString();
         byte[] val = value.getBytes(StandardCharsets.UTF_8);
         if (expireMillis != null) store.psetexDb(currentDb, key, expireMillis, val);
-        else if (expireSeconds != null) store.setexDb(currentDb, key, expireSeconds, val);
         else store.setDb(currentDb, key, val);
         return RespSimpleString.of("OK");
     }
@@ -551,16 +619,79 @@ public class CommandHandler {
         return RespInteger.of(c);
     }
 
-    private Object handleExpire(String[] args) {
-        if (args.length != 3) return RespError.wrongNumberOfArguments("EXPIRE");
-        try { return RespInteger.of(store.expireDb(currentDb, args[1], Integer.parseInt(args[2])) ? 1 : 0); }
-        catch (NumberFormatException e) { return RespError.of("ERR","value is not an integer or out of range"); }
+    /**
+     * EXPIRE / PEXPIRE —— 同一个判据的两个量纲，合成一支。三条实测来的规矩
+     * （battery33/37，250 对拍）：
+     * <ul>
+     *   <li>语法走 {@link RedisIntegerFormat}：{@code EXPIRE k +10}、{@code EXPIRE k -0} 一律
+     *       {@code value is not an integer or out of range}。1.3.5 用 {@code Integer.parseInt}，
+     *       一头收下了 {@code +10}，另一头把 {@code EXPIRE k 4000000000} 这种合法秒数判死。</li>
+     *   <li>{@code <= 0} 是"立刻过期"：回 {@code :1} 且键当场不见（实测 {@code EXPIRE k 0} →
+     *       {@code :1} 而 {@code EXISTS k} → 0）。旧实现回的是 {@code :0}，而且真的把键留下跑了。</li>
+     *   <li>"键在不在"这一档由存储层的删除自己给：没删掉东西就是 0，与对岸的分界同处。</li>
+     * </ul>
+     * 有意不一致的一条：秒数大到乘一千会绕回时（{@code EXPIRE k 9223372036854775807}），
+     * 4.0.9 回 1 并静默把键删掉（绕回成了一个"过去"的绝对时刻），我们回 {@code invalid expire time}。
+     * 负数不在这条里：再负也是过去，照对岸删键回 1。
+     */
+    private Object handleExpireLike(String[] args, String cmd, boolean seconds) {
+        if (args.length != 3) return RespError.wrongNumberOfArguments(cmd);
+        Long raw = RedisIntegerFormat.parse(args[2]);
+        if (raw == null) return RespError.notAnInteger();
+        if (raw > 0 && expireMillisOrOverflow(raw, seconds) == null) {
+            return RespError.of("ERR", "invalid expire time");
+        }
+        boolean done = seconds ? store.expireDb(currentDb, args[1], raw)
+                : store.pexpireDb(currentDb, args[1], raw);
+        return RespInteger.of(done ? 1 : 0);
     }
 
-    private Object handlePexpire(String[] args) {
-        if (args.length != 3) return RespError.wrongNumberOfArguments("PEXPIRE");
-        try { return RespInteger.of(store.pexpireDb(currentDb, args[1], Long.parseLong(args[2])) ? 1 : 0); }
-        catch (NumberFormatException e) { return RespError.of("ERR","value is not an integer or out of range"); }
+    /**
+     * 把相对过期量（秒或毫秒）折成"还能落成一个真实绝对时刻"的毫秒数；折不动回 null。
+     * <p>
+     * 两道溢出都要挡：乘那一千会绕回，加上当前时刻也会绕回。绕回在参考实现里是实打实的事故
+     * ——{@code SET k v EX 9223372036854776} 绕出一个过去的时刻，于是这条"设置远未来过期"
+     * 的命令变成了删键命令。宁可回错，不要把删键藏在一次成功回复里。
+     */
+    private static Long expireMillisOrOverflow(long value, boolean inSeconds) {
+        long ms;
+        if (inSeconds) {
+            if (value > Long.MAX_VALUE / 1000 || value < Long.MIN_VALUE / 1000) return null;
+            ms = value * 1000L;
+        } else {
+            ms = value;
+        }
+        return ms > Long.MAX_VALUE - System.currentTimeMillis() ? null : Long.valueOf(ms);
+    }
+
+    /**
+     * 客户端文本 → {@code long}，用 Redis 那把尺（{@link RedisIntegerFormat}）而不是
+     * {@code Long.parseLong}。
+     * <p>
+     * 为什么全仓几十处都要换：Java 的解析比 Redis 宽，{@code +5} / {@code -0} / {@code 05}
+     * 三样它就收，Redis 三样都拒（250 实测 {@code INCRBY k +5}、{@code LINDEX k +0}、
+     * {@code GETRANGE k +0 -1} 全回 {@code value is not an integer or out of range}，
+     * 见 battery37）。这些位置每一个都是一个独立的入口，漏一处就对岸拒而我们照做。
+     * <p>
+     * 失败按 {@link NumberFormatException} 抛，是让调用点<b>原有</b>的那句 {@code catch} 去回
+     * 自己该回的文案 —— 绝大多数回通用那句，但 MOVE 回 {@code index out of range}、SELECT 回
+     * {@code invalid DB index}，把判据收成一处的同时不该把文案也收成一处。
+     * 抛而不是返回 {@code null}：三十几处调用点的改动因此压成一次替换，语义换了而形状没换，
+     * diff 才看得见。
+     *
+     * @throws NumberFormatException 语法不对或超出 long 的范围
+     */
+    private static long longArg(String text) {
+        Long v = RedisIntegerFormat.parse(text);
+        if (v == null) throw new NumberFormatException(text);
+        return v.longValue();
+    }
+
+    /** {@link #longArg} 的 int 版：语法同一把尺，范围另有一道（实测各命令的越界也是这一句）。 */
+    private static int intArg(String text) {
+        Integer v = RedisIntegerFormat.parseAsInt(text);
+        if (v == null) throw new NumberFormatException(text);
+        return v.intValue();
     }
 
     private Object handleTtl(String[] args) {
@@ -578,16 +709,24 @@ public class CommandHandler {
         return RespInteger.of(store.persistDb(currentDb, args[1]) ? 1 : 0);
     }
 
-    private Object handleSetex(String[] args) {
-        if (args.length != 4) return RespError.wrongNumberOfArguments("SETEX");
-        try { store.setexDb(currentDb, args[1], Integer.parseInt(args[2]), args[3].getBytes(StandardCharsets.UTF_8)); return RespSimpleString.of("OK"); }
-        catch (NumberFormatException e) { return RespError.of("ERR","value is not an integer or out of range"); }
-    }
-
-    private Object handlePsetex(String[] args) {
-        if (args.length != 4) return RespError.wrongNumberOfArguments("PSETEX");
-        try { store.psetexDb(currentDb, args[1], Long.parseLong(args[2]), args[3].getBytes(StandardCharsets.UTF_8)); return RespSimpleString.of("OK"); }
-        catch (NumberFormatException e) { return RespError.of("ERR","value is not an integer or out of range"); }
+    /**
+     * SETEX / PSETEX —— 与 SET 的 EX/PX 同一档判据，但<b>各自的文案不同</b>：实测
+     * {@code SETEX k -1 v} 回 {@code invalid expire time in setex}、{@code PSETEX k 0 v} 回
+     * {@code invalid expire time in psetex}，而 SET 那条是 {@code ... in set}。对岸这句是
+     * {@code addReplyErrorFormat(c,"invalid expire time in %s",c->cmd->name)}，名字取自命令表，
+     * 所以三个调用点不能共用一条常量。
+     */
+    private Object handleSetexLike(String[] args, String cmd, boolean seconds) {
+        if (args.length != 4) return RespError.wrongNumberOfArguments(cmd);
+        Long raw = RedisIntegerFormat.parse(args[2]);
+        if (raw == null) return RespError.notAnInteger();
+        Long ms = expireMillisOrOverflow(raw, seconds);
+        if (ms == null || ms.longValue() <= 0) {
+            return RespError.of("ERR", "invalid expire time in " + cmd.toLowerCase(Locale.ROOT));
+        }
+        // 一律按毫秒落盘：SETEX 的秒数栏在参考实现里也是先乘一千再当绝对时刻用的。
+        store.psetexDb(currentDb, args[1], ms, args[3].getBytes(StandardCharsets.UTF_8));
+        return RespSimpleString.of("OK");
     }
 
     private Object handleSetnx(String[] args) {
@@ -610,7 +749,10 @@ public class CommandHandler {
     }
 
     private Object handleMset(String[] args) {
-        if (args.length < 3 || args.length%2==0) return RespError.wrongNumberOfArguments("MSET");
+        if (args.length < 3) return RespError.wrongNumberOfArguments("MSET");
+        // 参数凑不成对走的是 MSET/MSETNX 共用的那段码，回的是一句写死的大写 MSET
+        // （实测 MSET a 1 c → {@code wrong number of arguments for MSET}，而 MSET a 才吃通用 arity 错）。
+        if (args.length % 2 == 0) return RespError.of("ERR", "wrong number of arguments for MSET");
         for (int i = 1; i < args.length; i += 2) store.setDb(currentDb, args[i], args[i+1].getBytes(StandardCharsets.UTF_8));
         return RespSimpleString.of("OK");
     }
@@ -626,6 +768,182 @@ public class CommandHandler {
         return RespInteger.of(v==null ? 0 : v.length);
     }
 
+    /**
+     * GETRANGE 与它的历史别名 SUBSTR —— 同一段码、同一个 arity 之外的形状，只是报错时
+     * 报自己的名字（实测两者各自回 {@code 'getrange'} / {@code 'substr'}）。
+     * <p>
+     * 下标折叠照参考实现的 sdsrange：负数先加长度、加完还是负数就归 0，右端超出长度就截到
+     * 最后一个字节，{@code start > end} 或 {@code start >= 长度} 是空串。两条边界实测撑着：
+     * {@code GETRANGE b4:s -100 -100} 回 {@code "H"}（两端都归 0，不是空串），
+     * {@code GETRANGE b4:s 9223372036854775807 5} 回空串（没绕成负数）。
+     */
+    private Object handleGetrange(String[] args, boolean substr) {
+        if (args.length != 4) return RespError.wrongNumberOfArguments(substr ? "SUBSTR" : "GETRANGE");
+        long start, end;
+        try {
+            start = longArg(args[2]);
+            end = longArg(args[3]);
+        } catch (NumberFormatException e) {
+            return RespError.notAnInteger();
+        }
+        byte[] v = store.getDb(currentDb, args[1]);
+        int len = v == null ? 0 : v.length;
+        long from = foldRangeIndex(start, len), to = foldRangeIndex(end, len);
+        if (from > to || from >= len) return RespBulkString.of("");
+        if (to >= len) to = len - 1;
+        return RespBulkString.of(Arrays.copyOfRange(v, (int) from, (int) to + 1));
+    }
+
+    /** 负下标先按"离末尾多远"折成正数；折不动（比整个串还左）就贴到 0，绝不绕回正数。 */
+    private static long foldRangeIndex(long index, int len) {
+        if (index >= 0) return index;
+        return index < -(long) len ? 0 : index + len;
+    }
+
+    /**
+     * BITCOUNT key [start end] —— 数的是<b>位</b>，而区间量的是<b>字节</b>、两端都含
+     * （250 实测 battery32/33/35，值 "hello" 逐档钉住：裸回 21、{@code 0 0} 回 3、
+     * {@code 1 1} 回 4、{@code -1 -1} 回 6、{@code 2 -1} 回 14、{@code -3 -2} 回 8、
+     * {@code -100 100} 与 {@code 0 -1} 都回 21）。
+     * <p>
+     * 判据顺序也是量出来的：参数个数（{@code BITCOUNT k} 是 arity 错、{@code BITCOUNT k 0}
+     * 是 syntax error）→ 两个下标的整数语法（{@code abc} 与 20 位那一串都是整数那句）→
+     * 键的类型（list 键回 WRONGTYPE）→ 才轮到取值。下标折叠与 GETRANGE 共用
+     * {@link #foldRangeIndex}，{@code 5 5}（起点越出串尾）、{@code 2 0}、{@code -1 -4}
+     * 三档都是 0 而不是负数或错。
+     * <p>
+     * Redis 6.2 的 {@code BIT} / {@code BYTE} 尾栏在 4.0.9 上就是多余的 token，回
+     * syntax error（实测两样都是），所以这里跟着拒 —— 支持它等于对外承诺一种对岸没有的形状。
+     */
+    private Object handleBitcount(String[] args) {
+        if (args.length < 2 || args.length > 4) return RespError.wrongNumberOfArguments("BITCOUNT");
+        if (args.length == 3) return RespError.syntaxError();
+        long start = 0, end = -1;
+        if (args.length == 4) {
+            Long s = RedisIntegerFormat.parse(args[2]);
+            Long e = RedisIntegerFormat.parse(args[3]);
+            if (s == null || e == null) return RespError.notAnInteger();
+            start = s;
+            end = e;
+        }
+        RespError conflict = wrongTypeAfterParse(MemoryStore.DataType.STRING, args[1]);
+        if (conflict != null) return conflict;
+        byte[] v = store.getDb(currentDb, args[1]);
+        if (v == null || v.length == 0) return RespInteger.of(0);
+        long from = foldRangeIndex(start, v.length);
+        long to = foldRangeIndex(end, v.length);
+        if (to >= v.length) to = v.length - 1;
+        if (from > to || from >= v.length) return RespInteger.of(0);
+        long bits = 0;
+        for (long i = from; i <= to; i++) bits += Integer.bitCount(v[(int) i] & 0xFF);
+        return RespInteger.of(bits);
+    }
+
+    private Object handleSetrange(String[] args) {
+        if (args.length != 4) return RespError.wrongNumberOfArguments("SETRANGE");
+        long offset;
+        try { offset = longArg(args[2]); }
+        catch (NumberFormatException e) { return RespError.notAnInteger(); }
+        // 偏移的两道判据问的都是"偏移"本身，跟键在不在、是什么类型都无关 —— 这一档排在查库
+        // 之前（实测 SETRANGE <list 键> -5 x → offset is out of range，而不是 WRONGTYPE）。
+        if (offset < 0) return RespError.of("ERR", "offset is out of range");
+        // 类型检查补在偏移之后、写入之前：实测 SETRANGE <list 键> 0 x → WRONGTYPE，
+        // 而 SETRANGE <list 键> 600000000 x 也是 WRONGTYPE（参考实现的 checkType 在
+        // checkStringLength 前面）。512MB 那一档留在存储层，它排在类型检查之后。
+        RespError conflict = wrongTypeAfterParse(MemoryStore.DataType.STRING, args[1]);
+        if (conflict != null) return conflict;
+        try {
+            return RespInteger.of(store.setRangeDb(currentDb, args[1], offset,
+                    args[3].getBytes(StandardCharsets.UTF_8)));
+        } catch (IllegalArgumentException e) {
+            return RespError.of("ERR", e.getMessage());
+        }
+    }
+
+    /**
+     * INCRBYFLOAT：文本进、文本出，回复的那串就是键里存的那串（long double 口径，
+     * 见 {@link RedisDoubleFormat#plainSum}）。
+     */
+    private Object handleIncrbyfloat(String[] args) {
+        if (args.length != 3) return RespError.wrongNumberOfArguments("INCRBYFLOAT");
+        try {
+            return RespBulkString.of(store.incrementFloatDb(currentDb, args[1], args[2]));
+        } catch (NumberFormatException e) {
+            return RespError.of("ERR", "value is not a valid float");
+        } catch (ArithmeticException e) {
+            return RespError.of("ERR", "increment would produce NaN or Infinity");
+        } catch (IllegalArgumentException e) {
+            return RespError.of("ERR", e.getMessage());
+        }
+    }
+
+    /**
+     * MSETNX —— 要么全写，要么一个都不写。
+     * <p>
+     * 两条实测的边角：① 判"已存在"用的是全类型那把尺（对 hash 键 {@code MSETNX b4:hh1 a b4:other b}
+     * 回 0，而 {@code EXISTS b4:other} 也是 0，说明它整条没动手）；② 参数凑不成对时，参考实现
+     * 走的是 MSET/MSETNX 共用的那段码，回的是一句写死的大写
+     * {@code wrong number of arguments for MSET}（不是带引号的 {@code 'msetnx'}）。
+     */
+    private Object handleMsetnx(String[] args) {
+        if (args.length < 3) return RespError.wrongNumberOfArguments("MSETNX");
+        if (args.length % 2 == 0) return RespError.of("ERR", "wrong number of arguments for MSET");
+        for (int i = 1; i < args.length; i += 2) {
+            if (keyExists(args[i])) return RespInteger.of(0);
+        }
+        for (int i = 1; i < args.length; i += 2) {
+            store.setDb(currentDb, args[i], args[i + 1].getBytes(StandardCharsets.UTF_8));
+        }
+        return RespInteger.of(1);
+    }
+
+    /** UNLINK 就是"承诺异步回收的 DEL"：判据、计数、返回值全同，只是名字要报对自己的。 */
+    private Object handleUnlink(String[] args) {
+        if (args.length < 2) return RespError.wrongNumberOfArguments("UNLINK");
+        return handleDel(args);
+    }
+
+    /** TOUCH 的计数形状与 EXISTS 一模一样（实测重复键重复计：{@code TOUCH a nope a b} → 3）。 */
+    private Object handleTouch(String[] args) {
+        if (args.length < 2) return RespError.wrongNumberOfArguments("TOUCH");
+        return handleExists(args);
+    }
+
+    /**
+     * EXPIREAT / PEXPIREAT —— 绝对时间版的 EXPIRE / PEXPIRE，所以直接折到那一条尺上
+     * （{@code pexpireDb} 的"过期时间已过就当场删掉并回 1"这一支实测与参考实现一致：
+     * {@code EXPIREAT b4:ex 946684800} → 1 而 {@code EXISTS} → 0）。
+     * <p>
+     * 已知偏差一条：{@code EXPIREAT k 9223372036854775807} 参考实现因自身溢出回"已过期"
+     * （TTL -2），本实现把秒→毫秒饱和处理，键留在"远未来"那一侧。
+     */
+    private Object handleExpireat(String[] args, boolean millis) {
+        if (args.length != 3) return RespError.wrongNumberOfArguments(millis ? "PEXPIREAT" : "EXPIREAT");
+        long timestamp;
+        try { timestamp = longArg(args[2]); }
+        catch (NumberFormatException e) { return RespError.notAnInteger(); }
+        long now = System.currentTimeMillis();
+        // 秒→毫秒：越界就贴到上界，别让乘法绕回负数（绕回去等于把一个未来时刻说过期了）
+        long targetMs = millis ? timestamp
+                : (timestamp > Long.MAX_VALUE / 1000 ? Long.MAX_VALUE : timestamp * 1000L);
+        return RespInteger.of(store.pexpireDb(currentDb, args[1], targetMs - now) ? 1 : 0);
+    }
+
+    /**
+     * MOVE —— 整键换库。三道判据的先后是实测定的：库号（含非数字，一律 {@code index out of
+     * range}）→ 同库（{@code source and destination objects are the same}，键存不存在都报）→
+     * 才轮到"源库里有没有、目标库里撞不撞名"。
+     */
+    private Object handleMove(String[] args) {
+        if (args.length != 3) return RespError.wrongNumberOfArguments("MOVE");
+        int target;
+        try { target = intArg(args[2]); }
+        catch (NumberFormatException e) { return RespError.of("ERR", "index out of range"); }
+        if (target < 0 || target >= store.getDbCount()) return RespError.of("ERR", "index out of range");
+        if (target == currentDb) return RespError.of("ERR", "source and destination objects are the same");
+        return RespInteger.of(store.moveKeyToDb(currentDb, target, args[1]) ? 1 : 0);
+    }
+
     private Object handleIncr(String[] args, long delta) {
         if (args.length != 2) return RespError.wrongNumberOfArguments(delta>0?"INCR":"DECR");
         try { return RespInteger.of(store.incrementDb(currentDb, args[1], delta)); }
@@ -634,9 +952,18 @@ public class CommandHandler {
 
     private Object handleIncrby(String[] args, long sign) {
         if (args.length != 3) return RespError.wrongNumberOfArguments(sign>0?"INCRBY":"DECRBY");
-        try { long d = Long.parseLong(args[2]); return RespInteger.of(store.incrementDb(currentDb, args[1], sign>0?d:Math.negateExact(d))); }
-        catch (NumberFormatException e) { return RespError.of("ERR","value is not an integer or out of range"); }
-        catch (ArithmeticException e) { return RespError.of("ERR","increment or decrement would overflow"); }
+        try {
+            long d = longArg(args[2]);
+            return RespInteger.of(store.incrementDb(currentDb, args[1], sign > 0 ? d : Math.negateExact(d)));
+        } catch (NumberFormatException e) {
+            return RespError.notAnInteger();
+        } catch (IllegalArgumentException | ArithmeticException e) {
+            // 存储层把两件事都包成 IllegalArgumentException："键里存的不是整数"与"加完会溢出"。
+            // 这一支以前只 catch 了 ArithmeticException，于是溢出那句穿到 handle() 的兜底 catch，
+            // 客户端收到的是 -ERR internal error: increment or decrement would overflow
+            // （对岸那句没有前缀，battery37 第 10 行）。
+            return RespError.of("ERR", e.getMessage());
+        }
     }
 
     private Object handleKeys(String[] args) {
@@ -656,7 +983,7 @@ public class CommandHandler {
     private Object handleType(String[] args) {
         if (args.length != 2) return RespError.wrongNumberOfArguments("TYPE");
         // 与 EXISTS、类型闸门共用 MemoryStore.typeOfDb 这一把尺，三者不会再互相打脸
-        return RespSimpleString.of(store.typeOfDb(currentDb, args[1]).name().toLowerCase());
+        return RespSimpleString.of(store.typeOfDb(currentDb, args[1]).name().toLowerCase(Locale.ROOT));
     }
 
     private Object handleDbsize() { return RespInteger.of(store.dbsizeDb(currentDb)); }
@@ -711,7 +1038,7 @@ public class CommandHandler {
                 List<byte[]> r = store.getSortedSetStore(currentDb).zrange(src, 0, -1, true);
                 deleteEveryType(src);
                 for (int i = 0; i < r.size(); i += 2) {
-                    double score = Double.parseDouble(new String(r.get(i + 1), StandardCharsets.UTF_8));
+                    double score = parseScore(new String(r.get(i + 1), StandardCharsets.UTF_8));
                     store.getSortedSetStore(currentDb).zadd(dst, score, r.get(i));
                 }
                 break;
@@ -794,14 +1121,20 @@ public class CommandHandler {
 
     private Object handleHincrby(String[] args) {
         if (args.length != 4) return RespError.wrongNumberOfArguments("HINCRBY");
-        try { return RespInteger.of(store.getHashStore(currentDb).hincrby(args[1], args[2], Long.parseLong(args[3]))); }
-        catch (NumberFormatException e) { return RespError.of("ERR","value is not an integer or out of range"); }
+        try { return RespInteger.of(store.getHashStore(currentDb).hincrby(args[1], args[2], longArg(args[3]))); }
+        catch (NumberFormatException e) { return RespError.notAnInteger(); }
         catch (IllegalArgumentException e) { return RespError.of("ERR", e.getMessage()); }
     }
 
     private Object handleHlen(String[] args) {
         if (args.length != 2) return RespError.wrongNumberOfArguments("HLEN");
         return RespInteger.of(store.getHashStore(currentDb).hlen(args[1]));
+    }
+
+    private Object handleHstrlen(String[] args) {
+        if (args.length != 3) return RespError.wrongNumberOfArguments("HSTRLEN");
+        // 数的是字节数不是字符数：实测 HSET h f 你好; HSTRLEN h f => 6。
+        return RespInteger.of(store.getHashStore(currentDb).hstrlen(args[1], args[2]));
     }
 
     private Object handleHsetnx(String[] args) {
@@ -835,6 +1168,15 @@ public class CommandHandler {
         return RespInteger.of(store.getListStore(currentDb).rpush(args[1], v));
     }
 
+    private Object handlePushx(String[] args, boolean head) {
+        if (args.length < 3) return RespError.wrongNumberOfArguments(head ? "LPUSHX" : "RPUSHX");
+        byte[][] v = new byte[args.length-2][]; for (int i=2;i<args.length;i++) v[i-2]=args[i].getBytes(StandardCharsets.UTF_8);
+        // 键不存在时返回 0 并且**不**把键建出来：Redis 的 lpushxCommand 直接答
+        // serverObjectNull，连列表对象都不创建，所以这里不能用 computeIfAbsent 那套。
+        ListStore ls = store.getListStore(currentDb);
+        return RespInteger.of(head ? ls.lpushx(args[1], v) : ls.rpushx(args[1], v));
+    }
+
     private Object handleLpop(String[] args) {
         if (args.length != 2) return RespError.wrongNumberOfArguments("LPOP");
         byte[] v = store.getListStore(currentDb).lpop(args[1]); return v==null?RespBulkString.nullBulkString():RespBulkString.of(v);
@@ -848,16 +1190,16 @@ public class CommandHandler {
     private Object handleLrange(String[] args) {
         if (args.length != 4) return RespError.wrongNumberOfArguments("LRANGE");
         try {
-            List<byte[]> l = store.getListStore(currentDb).lrange(args[1], Integer.parseInt(args[2]), Integer.parseInt(args[3]));
+            List<byte[]> l = store.getListStore(currentDb).lrange(args[1], intArg(args[2]), intArg(args[3]));
             Object[] r = new Object[l.size()]; for (int i=0;i<l.size();i++) r[i]=l.get(i)==null?RespBulkString.nullBulkString():RespBulkString.of(l.get(i));
             return RespArray.of(r);
-        } catch (NumberFormatException e) { return RespError.of("ERR","value is not an integer or out of range"); }
+        } catch (NumberFormatException e) { return RespError.notAnInteger(); }
     }
 
     private Object handleLindex(String[] args) {
         if (args.length != 3) return RespError.wrongNumberOfArguments("LINDEX");
-        try { byte[] v = store.getListStore(currentDb).lindex(args[1], Integer.parseInt(args[2])); return v==null?RespBulkString.nullBulkString():RespBulkString.of(v); }
-        catch (NumberFormatException e) { return RespError.of("ERR","value is not an integer or out of range"); }
+        try { byte[] v = store.getListStore(currentDb).lindex(args[1], intArg(args[2])); return v==null?RespBulkString.nullBulkString():RespBulkString.of(v); }
+        catch (NumberFormatException e) { return RespError.notAnInteger(); }
     }
 
     private Object handleLlen(String[] args) {
@@ -867,8 +1209,8 @@ public class CommandHandler {
 
     private Object handleLset(String[] args) {
         if (args.length != 4) return RespError.wrongNumberOfArguments("LSET");
-        try { store.getListStore(currentDb).lset(args[1], Integer.parseInt(args[2]), args[3].getBytes(StandardCharsets.UTF_8)); return RespSimpleString.of("OK"); }
-        catch (NumberFormatException e) { return RespError.of("ERR","value is not an integer or out of range"); }
+        try { store.getListStore(currentDb).lset(args[1], intArg(args[2]), args[3].getBytes(StandardCharsets.UTF_8)); return RespSimpleString.of("OK"); }
+        catch (NumberFormatException e) { return RespError.notAnInteger(); }
         catch (IndexOutOfBoundsException e) { return RespError.of("ERR","index out of range"); }
     }
 
@@ -881,14 +1223,14 @@ public class CommandHandler {
 
     private Object handleLrem(String[] args) {
         if (args.length != 4) return RespError.wrongNumberOfArguments("LREM");
-        try { return RespInteger.of(store.getListStore(currentDb).lrem(args[1], Integer.parseInt(args[2]), args[3].getBytes(StandardCharsets.UTF_8))); }
-        catch (NumberFormatException e) { return RespError.of("ERR","value is not an integer or out of range"); }
+        try { return RespInteger.of(store.getListStore(currentDb).lrem(args[1], intArg(args[2]), args[3].getBytes(StandardCharsets.UTF_8))); }
+        catch (NumberFormatException e) { return RespError.notAnInteger(); }
     }
 
     private Object handleLtrim(String[] args) {
         if (args.length != 4) return RespError.wrongNumberOfArguments("LTRIM");
-        try { store.getListStore(currentDb).ltrim(args[1], Integer.parseInt(args[2]), Integer.parseInt(args[3])); return RespSimpleString.of("OK"); }
-        catch (NumberFormatException e) { return RespError.of("ERR","value is not an integer or out of range"); }
+        try { store.getListStore(currentDb).ltrim(args[1], intArg(args[2]), intArg(args[3])); return RespSimpleString.of("OK"); }
+        catch (NumberFormatException e) { return RespError.notAnInteger(); }
     }
 
     private Object handleRpoplpush(String[] args) {
@@ -930,7 +1272,7 @@ public class CommandHandler {
 
     private Object handleSrandmember(String[] args) {
         if (args.length<2||args.length>3) return RespError.wrongNumberOfArguments("SRANDMEMBER");
-        int count = args.length==3 ? Integer.parseInt(args[2]) : 1;
+        int count = args.length==3 ? intArg(args[2]) : 1;
         List<byte[]> m = store.getSetStore(currentDb).srandmember(args[1], count);
         if (args.length==2) { if (m.isEmpty()) return RespBulkString.nullBulkString(); return RespBulkString.of(m.get(0)); }
         Object[] r = new Object[m.size()]; for (int i=0;i<m.size();i++) r[i]=RespBulkString.of(m.get(i));
@@ -965,15 +1307,170 @@ public class CommandHandler {
 
     // ==================== Sorted Set 命令 ====================
 
+    /**
+     * ZADD 的完整文法：{@code ZADD key [NX|XX] [GT|LT] [CH] [INCR] score member [score member ...]}。
+     * <p>
+     * 1.3.5 及之前只认裸的 {@code key score member ...}，任何修饰位都吃 arity 错。这一版按
+     * 250 实测的形状实现，四条纹路各自有样本：
+     * <ul>
+     *   <li>修饰位只能在<b>最前面连续一段</b>出现，落在数对之后就是 {@code syntax error}
+     *       （实测 {@code ZADD b6:z 1 a NX}）；大小写都认（{@code ch nx}）。</li>
+     *   <li>计数默认只数新增（{@code XX 3 a} 改了分数仍回 0），带 {@code CH} 才把改动算上。</li>
+     *   <li>{@code INCR} 的分数栏是增量，回的是 bulk 而不是整数；被 NX/XX 挡下回 {@code nil}；
+     *       只许带一对（实测 {@code INCR 1 a 2 b} → {@code INCR option supports a single
+     *       increment-element pair}），与 GT/LT 同时出现回 {@code syntax error}。</li>
+     *   <li>成员名不做浮点解释（实测 {@code ZADD b4:zz 1 nan} → 1，成员就叫 "nan"），
+     *       但分数栏里 {@code nan} 死在解析、{@code inf} 活着进库（{@code ZSCORE} 回 {@code inf}）。</li>
+     * </ul>
+     * {@code GT}/{@code LT} 本实现按 Redis 6.2 起的语义支持（既不凭空建成员，也不把分数改到
+     * 不更优），而 4.0.9 回 {@code syntax error} —— 这是有意超出对岸版本的一条，见 README 偏差清单。
+     * {@code NX} 与 {@code GT}/{@code LT} 同时出现是 {@code syntax error}（两条问的是不相交的
+     * 两件事，合起来没有任何成员能满足）。
+     */
     private Object handleZadd(String[] args) {
-        if (args.length < 4 || (args.length-2)%2!=0) return RespError.wrongNumberOfArguments("ZADD");
-        long added = 0;
-        for (int i = 2; i < args.length; i += 2) {
-            try { added += store.getSortedSetStore(currentDb).zadd(args[1], Double.parseDouble(args[i]), args[i+1].getBytes(StandardCharsets.UTF_8)); }
-            catch (NumberFormatException e) { return RespError.of("ERR","value is not a valid float"); }
+        if (args.length < 4) return RespError.wrongNumberOfArguments("ZADD");
+        int flags = 0;
+        boolean incr = false;
+        int i = 2;
+        while (i < args.length) {
+            String token = args[i];
+            if ("NX".equalsIgnoreCase(token)) flags |= SortedSetStore.ZADD_NX;
+            else if ("XX".equalsIgnoreCase(token)) flags |= SortedSetStore.ZADD_XX;
+            else if ("CH".equalsIgnoreCase(token)) flags |= SortedSetStore.ZADD_CH;
+            else if ("GT".equalsIgnoreCase(token)) flags |= SortedSetStore.ZADD_GT;
+            else if ("LT".equalsIgnoreCase(token)) flags |= SortedSetStore.ZADD_LT;
+            else if ("INCR".equalsIgnoreCase(token)) incr = true;
+            else break;
+            i++;
         }
-        return RespInteger.of(added);
+        int rest = args.length - i;
+        if (rest == 0 || rest % 2 != 0) return RespError.syntaxError();
+        // 判据先后也是量出来的：{@code ZADD k NX XX} 回的是 syntax error（数对不够那一档在前），
+        // {@code ZADD k NX XX abc m} 才回互斥；而 {@code NX XX INCR 1 a 2 b} 仍回互斥，
+        // 说明互斥排在"INCR 只许一对"之前。
+        if ((flags & SortedSetStore.ZADD_NX) != 0 && (flags & SortedSetStore.ZADD_XX) != 0) {
+            return RespError.of("ERR", "XX and NX options at the same time are not compatible");
+        }
+        if ((flags & SortedSetStore.ZADD_GT) != 0 && (flags & SortedSetStore.ZADD_LT) != 0) {
+            return RespError.of("ERR", "GT and LT options at the same time are not compatible");
+        }
+        // NX 问的是"只许新增"，GT/LT 问的是"只许把分数改到更优"，两条一起出现时没有任何成员
+        // 能满足，所以它俩是互斥的（实测 4.0.9 那边 {@code ZADD k NX GT 1 a} 回 syntax error，
+        // 现代 Redis 回的是各自那句 —— 都拒。这里回对岸那句）。XX + GT 是合法组合，别一并挡掉。
+        if ((flags & SortedSetStore.ZADD_NX) != 0
+                && (flags & (SortedSetStore.ZADD_GT | SortedSetStore.ZADD_LT)) != 0) {
+            return RespError.syntaxError();
+        }
+        if (incr && rest != 2) {
+            return RespError.of("ERR", "INCR option supports a single increment-element pair");
+        }
+        if (incr && (flags & (SortedSetStore.ZADD_GT | SortedSetStore.ZADD_LT)) != 0) {
+            return RespError.syntaxError();
+        }
+        try {
+            if (incr) {
+                double increment = parseScore(args[i]);
+                RespError blocked = wrongTypeAfterParse(MemoryStore.DataType.ZSET, args[1]);
+                if (blocked != null) return blocked;
+                Double score = store.getSortedSetStore(currentDb).zaddIncr(args[1], increment,
+                        args[i + 1].getBytes(StandardCharsets.UTF_8), flags);
+                return score == null ? RespBulkString.nullBulkString()
+                        : RespBulkString.of(RedisDoubleFormat.format(score));
+            }
+            int pairs = rest / 2;
+            double[] scores = new double[pairs];
+            byte[][] members = new byte[pairs][];
+            for (int k = 0; k < pairs; k++) {
+                scores[k] = parseScore(args[i + 2 * k]);
+                members[k] = args[i + 2 * k + 1].getBytes(StandardCharsets.UTF_8);
+            }
+            // 整串数对先全部解析完，再判类型：实测 {@code ZADD <string 键> 1 a abc b} 回的是
+            // {@code value is not a valid float}（ref17），说明对岸不会因为第一对合法就先去碰键。
+            RespError conflict = wrongTypeAfterParse(MemoryStore.DataType.ZSET, args[1]);
+            if (conflict != null) return conflict;
+            return RespInteger.of(store.getSortedSetStore(currentDb).zadd(args[1], scores, members, flags));
+        } catch (NumberFormatException e) {
+            return RespError.of("ERR", "value is not a valid float");
+        } catch (IllegalArgumentException e) {
+            return RespError.of("ERR", e.getMessage());
+        }
     }
+
+    /**
+     * ZUNIONSTORE / ZINTERSTORE —— {@code STORE} 一族里唯一带"键数"的两种，所以类型闸门
+     * 那张表帮不上忙（{@code args[2]} 是键数不是键名），源键的 WRONGTYPE 在这里自己判。
+     * <p>
+     * 实测的形状：
+     * <ul>
+     *   <li>键数不是整数 → {@code value is not an integer or out of range}；是 0 或负数 →
+     *       {@code at least 1 input key is needed for ZUNIONSTORE/ZINTERSTORE}；
+     *       而 {@code ZUNIONSTORE d abc}（token 不够）先吃 arity 错。</li>
+     *   <li>{@code WEIGHTS} 少给一个 → {@code syntax error}；权重不是浮点 →
+     *       {@code weight value is not a float}（注意这句是这一族独有的，不是通用的
+     *       {@code value is not a valid float}）；{@code nan} 和 {@code 1e4000} 都算非法，
+     *       {@code inf} 合法。</li>
+     *   <li>{@code AGGREGATE} 只认 SUM/MIN/MAX，给 AVG 是 {@code syntax error}；尾巴上不认识的
+     *        token（{@code WITHSCORES}）同样是 {@code syntax error}。</li>
+     *   <li>目标键上原来挂的别的类型会被整个顶掉（{@code SET b4:str2 hello} 之后
+     *       {@code ZUNIONSTORE b4:str2 1 b4:src1} → 2、TYPE 变 zset），但<b>不能</b>连 zset
+     *       那份一起清 —— 目标键常常同时是源键（实测 {@code ZUNIONSTORE b4:src2 1 b4:src2
+     *       WEIGHTS 2} 把分数翻倍，是对的）。</li>
+     *   <li>算出来是空 → 目标键不留（{@code ZUNIONSTORE b4:dst7 1 nosuch} → 0 而
+     *       {@code EXISTS b4:dst7} → 0），缺源的并集当空集处理。</li>
+     * </ul>
+     */
+    private Object handleZstore(String[] args, boolean intersect) {
+        String name = intersect ? "ZINTERSTORE" : "ZUNIONSTORE";
+        if (args.length < 4) return RespError.wrongNumberOfArguments(name);
+        int numKeys;
+        try { numKeys = intArg(args[2]); }
+        catch (NumberFormatException e) { return RespError.notAnInteger(); }
+        if (numKeys < 1) {
+            return RespError.of("ERR", "at least 1 input key is needed for ZUNIONSTORE/ZINTERSTORE");
+        }
+        // 键数比给出来的参数还多：参考实现是照着 argv 直接取（越界即崩），这里当语法错处理。
+        if (args.length < 3 + numKeys) return RespError.syntaxError();
+        for (int i = 0; i < numKeys; i++) {
+            MemoryStore.DataType actual = store.typeOfDb(currentDb, args[3 + i]);
+            if (actual != MemoryStore.DataType.NONE && actual != MemoryStore.DataType.ZSET) {
+                return RespError.wrongType("Operation against a key holding the wrong kind of value");
+            }
+        }
+        double[] weights = null;
+        String aggregate = "SUM";
+        int i = 3 + numKeys;
+        while (i < args.length) {
+            if ("WEIGHTS".equalsIgnoreCase(args[i])) {
+                i++;
+                weights = new double[numKeys];
+                for (int k = 0; k < numKeys; k++) {
+                    if (i >= args.length) return RespError.syntaxError();
+                    try { weights[k] = parseScore(args[i++]); }
+                    catch (NumberFormatException e) { return RespError.of("ERR", "weight value is not a float"); }
+                }
+            } else if ("AGGREGATE".equalsIgnoreCase(args[i])) {
+                i++;
+                if (i >= args.length) return RespError.syntaxError();
+                String candidate = args[i++];
+                if (!"SUM".equalsIgnoreCase(candidate) && !"MIN".equalsIgnoreCase(candidate)
+                        && !"MAX".equalsIgnoreCase(candidate)) {
+                    return RespError.syntaxError();
+                }
+                aggregate = candidate;
+            } else {
+                return RespError.syntaxError();
+            }
+        }
+        String[] keys = Arrays.copyOfRange(args, 3, 3 + numKeys);
+        String dest = args[1];
+        // 目标键上别的类型要顶掉，zset 那一份留给存储层自己覆盖
+        store.clearOtherTypes(currentDb, dest, MemoryStore.DataType.ZSET);
+        SortedSetStore zset = store.getSortedSetStore(currentDb);
+        long count = intersect ? zset.zinterstore(dest, keys, weights, aggregate)
+                : zset.zunionstore(dest, keys, weights, aggregate);
+        return RespInteger.of(count);
+    }
+
 
     private Object handleZrem(String[] args) {
         if (args.length < 3) return RespError.wrongNumberOfArguments("ZREM");
@@ -984,7 +1481,7 @@ public class CommandHandler {
     private Object handleZscore(String[] args) {
         if (args.length != 3) return RespError.wrongNumberOfArguments("ZSCORE");
         Double s = store.getSortedSetStore(currentDb).zscore(args[1], args[2].getBytes(StandardCharsets.UTF_8));
-        return s==null ? RespBulkString.nullBulkString() : RespBulkString.of(formatDouble(s));
+        return s==null ? RespBulkString.nullBulkString() : RespBulkString.of(RedisDoubleFormat.format(s));
     }
 
     private Object handleZrank(String[] args) {
@@ -1012,10 +1509,10 @@ public class CommandHandler {
         if (args.length < 4) return RespError.wrongNumberOfArguments(reverse?"ZREVRANGE":"ZRANGE");
         try {
             boolean ws = args.length==5 && "WITHSCORES".equalsIgnoreCase(args[4]);
-            List<byte[]> r = reverse ? store.getSortedSetStore(currentDb).zrevrange(args[1], Long.parseLong(args[2]), Long.parseLong(args[3]), ws)
-                    : store.getSortedSetStore(currentDb).zrange(args[1], Long.parseLong(args[2]), Long.parseLong(args[3]), ws);
+            List<byte[]> r = reverse ? store.getSortedSetStore(currentDb).zrevrange(args[1], longArg(args[2]), longArg(args[3]), ws)
+                    : store.getSortedSetStore(currentDb).zrange(args[1], longArg(args[2]), longArg(args[3]), ws);
             return toRespArray(r);
-        } catch (NumberFormatException e) { return RespError.of("ERR","value is not an integer or out of range"); }
+        } catch (NumberFormatException e) { return RespError.notAnInteger(); }
     }
 
     private Object handleZrangebyscore(String[] args, boolean reverse) {
@@ -1023,7 +1520,19 @@ public class CommandHandler {
         try {
             double min = parseScore(args[2]), max = parseScore(args[3]);
             boolean ws=false; int offset=0, count=-1;
-            for (int i=4;i<args.length;i++) { if ("WITHSCORES".equalsIgnoreCase(args[i])) ws=true; else if ("LIMIT".equalsIgnoreCase(args[i])&&i+2<args.length) { offset=Integer.parseInt(args[++i]); count=Integer.parseInt(args[++i]); } }
+            for (int i=4;i<args.length;i++) {
+                if ("WITHSCORES".equalsIgnoreCase(args[i])) ws=true;
+                else if ("LIMIT".equalsIgnoreCase(args[i])&&i+2<args.length) {
+                    // 这一支不能搭外层那个 try 的便车：它 catch 的是 NumberFormatException，
+                    // 而那句回的是 "value is not a valid float" —— 分数栏确实是浮点，
+                    // LIMIT 的两个下标不是（实测 ZRANGEBYSCORE k -inf +inf LIMIT abc 1 回的是
+                    // 整数那句）。
+                    Integer off = RedisIntegerFormat.parseAsInt(args[i+1]);
+                    Integer cnt = RedisIntegerFormat.parseAsInt(args[i+2]);
+                    if (off == null || cnt == null) return RespError.notAnInteger();
+                    offset = off; count = cnt; i += 2;
+                }
+            }
             List<byte[]> r = reverse ? store.getSortedSetStore(currentDb).zrevrangebyscore(args[1], max, min, ws, offset, count)
                     : store.getSortedSetStore(currentDb).zrangebyscore(args[1], min, max, ws, offset, count);
             return toRespArray(r);
@@ -1033,9 +1542,18 @@ public class CommandHandler {
     private Object handleZincrby(String[] args) {
         if (args.length != 4) return RespError.wrongNumberOfArguments("ZINCRBY");
         try {
-            double ns = store.getSortedSetStore(currentDb).zincrby(args[1], Double.parseDouble(args[2]), args[3].getBytes(StandardCharsets.UTF_8));
-            return RespBulkString.of(formatDouble(ns));
+            double increment = parseScore(args[2]);
+            // 分数先解析、类型后判：实测 ZINCRBY <string 键> nan m → value is not a valid float，
+            // 而 ZINCRBY <string 键> 1 m → WRONGTYPE（ref17）。
+            RespError conflict = wrongTypeAfterParse(MemoryStore.DataType.ZSET, args[1]);
+            if (conflict != null) return conflict;
+            double ns = store.getSortedSetStore(currentDb).zincrby(args[1], increment,
+                    args[3].getBytes(StandardCharsets.UTF_8));
+            return RespBulkString.of(RedisDoubleFormat.format(ns));
         } catch (NumberFormatException e) { return RespError.of("ERR","value is not a valid float"); }
+        // +inf 加到 -inf 成员上得到 NaN：Redis 在算完分数后才判 isnan(newscore) 并答
+        // "resulting score is not a number (NaN)"，此时集合与成员都还没动过。
+        catch (IllegalArgumentException e) { return RespError.of("ERR", e.getMessage()); }
     }
 
     // ==================== 事务命令 ====================
@@ -1125,7 +1643,7 @@ public class CommandHandler {
         if (args.length<2) return RespError.wrongNumberOfArguments("PUBSUB");
         PubSubManager pubSub = pubSub();
         if (pubSub==null) return RespError.of("ERR","Pub/Sub not configured");
-        switch (args[1].toUpperCase()) {
+        switch (args[1].toUpperCase(Locale.ROOT)) {
             case "CHANNELS": { String p=args.length>2?args[2]:null; Set<String> c=pubSub.getChannels(p); Object[] r=new Object[c.size()]; int i=0; for (String s:c) r[i++]=RespBulkString.of(s); return RespArray.of(r); }
             case "NUMSUB": { String[] ch=args.length>2?Arrays.copyOfRange(args,2,args.length):new String[0]; Map<String,Integer> n=pubSub.getNumSub(ch); List<Object> r=new ArrayList<>(); for (Map.Entry<String,Integer> e:n.entrySet()) { r.add(RespBulkString.of(e.getKey())); r.add(RespInteger.of(e.getValue())); } return RespArray.of(r); }
             case "NUMPAT": return RespInteger.of(pubSub.getNumPat());
@@ -1138,8 +1656,8 @@ public class CommandHandler {
     private Object handleSlowlog(String[] args) {
         if (args.length<2) return RespError.wrongNumberOfArguments("SLOWLOG");
         if (slowLog()==null) return RespError.of("ERR","SlowLog not configured");
-        switch (args[1].toUpperCase()) {
-            case "GET": { int c=args.length>2?Integer.parseInt(args[2]):10; List<SlowLog.SlowLogEntry> e=slowLog().get(c); Object[] r=new Object[e.size()]; for(int i=0;i<e.size();i++) { SlowLog.SlowLogEntry en=e.get(i); r[i]=RespArray.of(RespInteger.of(en.getId()),RespInteger.of(en.getTimestampNanos()/1000),RespInteger.of(en.getDurationNanos()/1000),toRespArray(en.getArgs())); } return RespArray.of(r); }
+        switch (args[1].toUpperCase(Locale.ROOT)) {
+            case "GET": { int c=args.length>2?intArg(args[2]):10; List<SlowLog.SlowLogEntry> e=slowLog().get(c); Object[] r=new Object[e.size()]; for(int i=0;i<e.size();i++) { SlowLog.SlowLogEntry en=e.get(i); r[i]=RespArray.of(RespInteger.of(en.getId()),RespInteger.of(en.getTimestampNanos()/1000),RespInteger.of(en.getDurationNanos()/1000),toRespArray(en.getArgs())); } return RespArray.of(r); }
             case "LEN": return RespInteger.of(slowLog().len());
             case "RESET": slowLog().reset(); return RespSimpleString.of("OK");
             default: return RespError.syntaxError();
@@ -1186,7 +1704,7 @@ public class CommandHandler {
     private Object handleFlushall() { store.flushAll(); return RespSimpleString.of("OK"); }
 
     private Object handleInfo(String[] args) {
-        String sec = args.length > 1 ? args[1].toUpperCase() : null;
+        String sec = args.length > 1 ? args[1].toUpperCase(Locale.ROOT) : null;
         StringBuilder sb = new StringBuilder();
         if (sec == null || "SERVER".equals(sec)) {
             sb.append("# Server\r\n");
@@ -1260,7 +1778,7 @@ public class CommandHandler {
             // 抛 NPE，被 handle() 兜成 -ERR internal error: null。
             return RespError.of("ERR", "CLIENT is only available on a connected session");
         }
-        switch (args[1].toUpperCase()) {
+        switch (args[1].toUpperCase(Locale.ROOT)) {
             case "LIST": {
                 // 列出所有活着的连接。以前这里只拼自己一条，等于"连接列表"里永远只有一个元素，
                 // 而且 sub=/psub= 恒为 0 —— 因为订阅中的连接根本走不到 CLIENT（被 pubsub 闸门挡了），
@@ -1319,7 +1837,7 @@ public class CommandHandler {
         sb.append(" flags=N");
         sb.append(" multi=").append(transactionContext.isInTransaction()
                 ? transactionContext.getCommands().size() : -1);
-        sb.append(" cmd=").append(lastCommand.toLowerCase());
+        sb.append(" cmd=").append(lastCommand.toLowerCase(Locale.ROOT));
         return sb.append("\r\n").toString();
     }
 
@@ -1362,7 +1880,7 @@ public class CommandHandler {
             if (args.length < 4) return null;
             long id;
             try {
-                id = Long.parseLong(args[3]);
+                id = longArg(args[3]);
             } catch (NumberFormatException e) {
                 return null;
             }
@@ -1417,26 +1935,69 @@ public class CommandHandler {
     }
 
     /**
-     * DEBUG 命令：调试工具（SLEEP / OBJECT / SLOWLOG-RESET / ERROR）。
-     * <p>仅实现安全子命令，不暴露 SEGFAULT 等危险操作。
+     * DEBUG 调试子命令：只接安全的那几条（SLEEP / ERROR / SLOWLOG-RESET / OBJECT 的显式拒绝），
+     * SEGFAULT、PANIC、RESTART 一类会让进程消失的支路一概不做。
+     * <p>
+     * 文案与判据顺序照 redis 4.0.9 的 {@code debugCommand()} 逐条量过
+     * （battery31/32/33/35/36/37，250）：
+     * <ul>
+     *   <li>裸 {@code DEBUG} 回的是它自己那句提示，不是通用的 arity 错 —— 对岸把这句话写成了
+     *       一个 {@code if (c->argc == 1) } 分支。</li>
+     *   <li>子命令<b>不认识</b>和<b>arity 不对</b>共用一句
+     *       {@code Unknown DEBUG subcommand or wrong number of arguments for '<原样>'}：对岸在
+     *       每个子命令分支里各写了一遍 arity，落不到分支上就统一回这句，所以没有"参数太多/太少"
+     *       的区分。名字部分回的是客户端敲进来的那一串，大小写照原样（实测 {@code DEBUG FoO} →
+     *       {@code 'FoO'}）。</li>
+     *   <li>{@code SLEEP} 的参数是<b>秒</b>且可以带小数（{@code 0.5} → 睡半秒），读不出数就当 0，
+     *       对岸照样回 {@code +OK}（实测 {@code DEBUG SLEEP abc}）。旧实现按毫秒的整数解析，
+     *       于是 {@code SLEEP 0.5} 报整数错、而 {@code SLEEP 1} 只睡了一毫秒。</li>
+     *   <li>{@code ERROR <一段>} 把那段<b>原样</b>当错误文本回，不添 {@code ERR } 前缀
+     *       （实测 {@code DEBUG ERROR hello} → {@code -hello}、{@code DEBUG ERROR -dash-first} →
+     *       {@code --dash-first}）。这条存在的意义就是让客户端收到任意形状的错误回复，
+     *       给它固定一句等于把它废掉。</li>
+     * </ul>
+     * 有意超出对岸的两条：{@code SLOWLOG-RESET}（4.0.9 不认，而我们的 SLOWLOG 需要一个重置入口）、
+     * {@code DEBUG HELP} 回的是<b>本实现</b>的子命令清单而不是对岸那 21 条 —— 照抄那份清单等于
+     * 对外承诺实现 segfault。{@code OBJECT} 在键不存在时与对岸同句（{@code no such key}），
+     * 键存在时回拒绝而不是回四个常量假字段。
      */
     private Object handleDebug(String[] args) {
-        if (args.length < 2) return RespError.wrongNumberOfArguments("DEBUG");
-        switch (args[1].toUpperCase()) {
+        if (args.length < 2) {
+            return RespError.of("ERR You must specify a subcommand for DEBUG. Try DEBUG HELP for info.");
+        }
+        String sub = args[1].toUpperCase(Locale.ROOT);
+        switch (sub) {
+            case "HELP": {
+                if (args.length != 2) return unknownDebugSubcommand(args[1]);
+                Object[] lines = new Object[DEBUG_HELP.size()];
+                for (int i = 0; i < lines.length; i++) lines[i] = RespBulkString.of(DEBUG_HELP.get(i));
+                return RespArray.of(lines);
+            }
             case "SLEEP": {
-                if (args.length < 3) return RespError.wrongNumberOfArguments("DEBUG SLEEP");
+                if (args.length != 3) return unknownDebugSubcommand(args[1]);
+                // 对岸走的是 strtod()：读不出数就当 0 并回 +OK（实测 DEBUG SLEEP abc）。
+                // 只对整串试一次，"12abc" 这种"前缀读得出、尾巴读不出"的形状没有实测样本，
+                // 这里同样当 0，不去猜 strtod 的最长前缀。
+                double seconds;
                 try {
-                    long ms = Long.parseLong(args[2]);
-                    Thread.sleep(ms);
-                    return RespSimpleString.of("OK");
+                    seconds = Double.parseDouble(args[2]);
                 } catch (NumberFormatException e) {
-                    return RespError.of("ERR", "value is not an integer or out of range");
+                    seconds = 0;
+                }
+                if (Double.isNaN(seconds) || Double.isInfinite(seconds)) seconds = 0;
+                long ms = seconds > 0 ? (long) Math.min(seconds * 1000.0, Long.MAX_VALUE) : 0;
+                try {
+                    if (ms > 0) Thread.sleep(ms);
+                    return RespSimpleString.of("OK");
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     return RespError.of("ERR", "sleep interrupted");
                 }
             }
             case "OBJECT": {
+                if (args.length != 3) return unknownDebugSubcommand(args[1]);
+                // 键在不在这一档与对岸同句（实测 DEBUG OBJECT <不存在的键> → no such key）
+                if (!keyExists(args[2])) return RespError.noSuchKey();
                 // 以前回的是 "Value at:0x<key.hashCode()> refcount:1 ... serializedlength:0 lru:0"：
                 // 地址是哈希值假扮的、refcount/lru 是常量、serializedlength 恒为 0，
                 // 四个字段没有一个是量出来的。Redis 自己也已经把这条废弃掉了。
@@ -1444,19 +2005,36 @@ public class CommandHandler {
                         + " cannot be measured from the JVM, and reporting constants would be worse than an error");
             }
             case "SLOWLOG-RESET": {
+                if (args.length != 2) return unknownDebugSubcommand(args[1]);
                 if (slowLog() == null) return RespError.of("ERR", "SlowLog not configured");
                 slowLog().reset();
                 // Redis 回 +OK；回 :1 会让按 Redis 协议写的客户端把整型当成解析失败。
                 return RespSimpleString.of("OK");
             }
             case "ERROR": {
-                // DEBUG ERROR — 返回错误（用于测试客户端错误处理）
-                return RespError.of("ERR", "DEBUG ERROR: this is a debug error");
+                if (args.length != 3) return unknownDebugSubcommand(args[1]);
+                // 原样回，不添 ERR 前缀：见方法上的说明。RespError 自己会清 CR/LF，
+                // 这一条与对岸一致（实测对岸把 'FOO\r\nBAR' 也压成了空格）。
+                return RespError.of(args[2]);
             }
             default:
-                return RespError.of("ERR", "DEBUG subcommand '" + args[1] + "' not supported. Supported: SLEEP, OBJECT, SLOWLOG-RESET, ERROR");
+                return unknownDebugSubcommand(args[1]);
         }
     }
+
+    /** DEBUG 那一句"要么不认识、要么参数个数不对"，名字部分照客户端写的回。 */
+    private static RespError unknownDebugSubcommand(String rawSub) {
+        return RespError.of("ERR", "Unknown DEBUG subcommand or wrong number of arguments for '"
+                + rawSub + "'");
+    }
+
+    /** {@code DEBUG HELP} 回的内容 —— 只列真做得到的那几条。 */
+    private static final List<String> DEBUG_HELP = Collections.unmodifiableList(Arrays.asList(
+            "DEBUG <subcommand> arg arg ... arg. Subcommands:",
+            "sleep <seconds> -- Stop the server for <seconds>. Decimals allowed.",
+            "error <string> -- Return a Redis protocol error with <string> as message.",
+            "slowlog-reset -- Clears the slow log. Not accepted by redis-server 4.0.9.",
+            "object <key> -- Refused: refcount / lru / serializedlength cannot be measured from the JVM."));
 
     /**
      * MONITOR 命令：开启/关闭实时命令监控。
@@ -1487,22 +2065,27 @@ public class CommandHandler {
 
     /**
      * 向所有 MONITOR 客户端转发命令。
-     * <p>格式与 Redis MONITOR 兼容：timestamp.epoch [db id addr] "command" "arg1" "arg2" ...
+     * <p>形状与 Redis 一致：简单串一行，{@code <秒>.<6 位微秒> [<db> <ip:port>] "cmd" "arg" …}。
+     * 三处偏离是本轮实测出来的（{@code $1790395133.000000 [0 763503151 /127.0.0.1:50047] "SET" …}）：
+     * 推 bulk string（多一段长度行，按行读的客户端整体错位）、小数位写死 {@code .000000}、
+     * db 与地址之间塞了一个 channel hashCode、地址用 {@code InetSocketAddress.toString()}
+     * 因而带 Java 特有的前导斜杠。
      */
     private void forwardToMonitors(String[] args) {
         if (monitorClients().isEmpty()) return;
-        long epoch = System.currentTimeMillis() / 1000;
-        int db = currentDb;
-        int id = channelContext.channel().hashCode() & 0x7FFFFFFF;
-        String addr = String.valueOf(channelContext.channel().remoteAddress());
+        long now = System.currentTimeMillis();
 
         StringBuilder sb = new StringBuilder();
-        sb.append(epoch).append(".000000 [").append(db).append(" ").append(id).append(" ").append(addr).append("]");
+        sb.append(now / 1000).append('.')
+                // Java 的钟只有毫秒粒度，后三位恒为 000；前四位必须是真实时刻
+                .append(String.format(java.util.Locale.ROOT, "%06d", (now % 1000) * 1000))
+                .append(" [").append(currentDb).append(' ')
+                .append(addressForm(channelContext.channel().remoteAddress())).append(']');
         for (String arg : args) {
-            sb.append(" \"").append(arg.replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
+            sb.append(" \"").append(monitorArg(arg)).append("\"");
         }
 
-        RespBulkString msg = RespBulkString.of(sb.toString());
+        RespSimpleString msg = RespSimpleString.of(sb.toString());
         java.util.Iterator<ChannelHandlerContext> it = monitorClients().iterator();
         while (it.hasNext()) {
             ChannelHandlerContext monitorCtx = it.next();
@@ -1513,6 +2096,25 @@ public class CommandHandler {
                 it.remove();
             }
         }
+    }
+
+    /**
+     * MONITOR 行里的参数转义。改成简单串之后这一步不是可选的：bulk 有长度前缀，裸换行还能被
+     * 按字节读走；简单串靠 CRLF 结束，参数里带一个换行就会把一行劈成两行，后面的响应全部错位。
+     */
+    private static String monitorArg(String arg) {
+        StringBuilder out = new StringBuilder(arg.length() + 8);
+        for (int i = 0; i < arg.length(); i++) {
+            char c = arg.charAt(i);
+            switch (c) {
+                case '\\': out.append("\\\\"); break;
+                case '"': out.append("\\\""); break;
+                case '\n': out.append("\\n"); break;
+                case '\r': out.append("\\r"); break;
+                default: out.append(c);
+            }
+        }
+        return out.toString();
     }
 
     // ==================== Stream 命令 ====================
@@ -1540,9 +2142,9 @@ public class CommandHandler {
                 i++;
             }
             try {
-                maxLen = Long.parseLong(args[i]);
+                maxLen = longArg(args[i]);
             } catch (NumberFormatException e) {
-                return RespError.of("ERR", "value is not an integer or out of range");
+                return RespError.notAnInteger();
             }
             if (maxLen < 0) return RespError.of("ERR", "MAXLEN requires a non-negative integer");
             i++;
@@ -1591,7 +2193,7 @@ public class CommandHandler {
         int count = -1;
 
         if (args.length > 4 && "COUNT".equalsIgnoreCase(args[4]) && args.length > 5) {
-            count = Integer.parseInt(args[5]);
+            count = intArg(args[5]);
         }
 
         List<StreamEntry> entries = reverse
@@ -1643,9 +2245,9 @@ public class CommandHandler {
         if (idx != args.length - 1) return RespError.syntaxError();
         long maxLen;
         try {
-            maxLen = Long.parseLong(args[idx]);
+            maxLen = longArg(args[idx]);
         } catch (NumberFormatException e) {
-            return RespError.of("ERR", "value is not an integer or out of range");
+            return RespError.notAnInteger();
         }
         if (maxLen < 0) return RespError.of("ERR", "MAXLEN requires a non-negative integer");
         return RespInteger.of((int) streams().xtrim(currentDb, args[1], maxLen));
@@ -1663,7 +2265,7 @@ public class CommandHandler {
 
         // 解析 COUNT
         if ("COUNT".equalsIgnoreCase(args[i]) && i + 1 < args.length) {
-            count = Integer.parseInt(args[i + 1]);
+            count = intArg(args[i + 1]);
             i += 2;
         }
 
@@ -1723,7 +2325,7 @@ public class CommandHandler {
 
         int count = -1;
         if ("COUNT".equalsIgnoreCase(args[i]) && i + 1 < args.length) {
-            count = Integer.parseInt(args[i + 1]);
+            count = intArg(args[i + 1]);
             i += 2;
         }
         if ("BLOCK".equalsIgnoreCase(args[i])) {
@@ -1765,7 +2367,7 @@ public class CommandHandler {
     private Object handleXgroup(String[] args) {
         if (streams() == null) return RespError.of("ERR", "Stream not configured");
         if (args.length < 2) return RespError.wrongNumberOfArguments("XGROUP");
-        String sub = args[1].toUpperCase();
+        String sub = args[1].toUpperCase(Locale.ROOT);
         switch (sub) {
             case "CREATE": {
                 if (args.length < 5) return RespError.wrongNumberOfArguments("XGROUP CREATE");
@@ -1858,7 +2460,7 @@ public class CommandHandler {
     private Object handleXinfo(String[] args) {
         if (streams() == null) return RespError.of("ERR", "Stream not configured");
         if (args.length < 3) return RespError.wrongNumberOfArguments("XINFO");
-        String sub = args[1].toUpperCase();
+        String sub = args[1].toUpperCase(Locale.ROOT);
         switch (sub) {
             case "GROUPS": {
                 com.zifang.z.cache.core.stream.Stream stream = streams().getStream(currentDb, args[2]);
@@ -1927,12 +2529,14 @@ public class CommandHandler {
      * </ul>
      */
     private static final java.util.Set<String> WRITE_COMMANDS = new java.util.HashSet<>(java.util.Arrays.asList(
-        "SET", "SETEX", "PSETEX", "SETNX", "GETSET", "MSET", "APPEND", "INCR", "DECR", "INCRBY", "DECRBY",
-        "DEL", "EXPIRE", "PEXPIRE", "PERSIST", "RENAME", "RENAMENX",
+        "SET", "SETEX", "PSETEX", "SETNX", "GETSET", "MSET", "MSETNX", "APPEND", "INCR", "DECR", "INCRBY", "DECRBY",
+        "SETRANGE", "INCRBYFLOAT",
+        "DEL", "UNLINK", "EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT", "PERSIST", "RENAME", "RENAMENX", "MOVE",
         "HSET", "HDEL", "HMSET", "HINCRBY", "HINCRBYFLOAT", "HSETNX",
-        "LPUSH", "RPUSH", "LPOP", "RPOP", "LSET", "LINSERT", "LREM", "LTRIM", "RPOPLPUSH", "LMOVE",
+        "LPUSH", "RPUSH", "LPUSHX", "RPUSHX", "LPOP", "RPOP", "LSET", "LINSERT", "LREM", "LTRIM", "RPOPLPUSH", "LMOVE",
         "SADD", "SREM", "SMOVE", "SPOP", "SINTERSTORE", "SUNIONSTORE", "SDIFFSTORE",
         "ZADD", "ZREM", "ZINCRBY", "ZREMRANGEBYLEX", "ZREMRANGEBYRANK", "ZREMRANGEBYSCORE",
+        "ZUNIONSTORE", "ZINTERSTORE",
         "FLUSHDB", "FLUSHALL"
     ));
 
@@ -1959,7 +2563,7 @@ public class CommandHandler {
         if (isLoading() || args.length == 0) {
             return;
         }
-        String cmd = args[0].toUpperCase();
+        String cmd = args[0].toUpperCase(Locale.ROOT);
         String[] record;
         if (BLOCKING_POP_COMMANDS.contains(cmd)) {
             // 没弹出任何值 ⇒ 这条命令什么都没改，AOF 与写计数器都不记
@@ -2033,18 +2637,27 @@ public class CommandHandler {
         MemoryStore.DataType zset = MemoryStore.DataType.ZSET;
 
         for (String c : new String[]{"GET", "SETNX", "GETSET", "APPEND", "STRLEN",
-                "INCR", "DECR", "INCRBY", "DECRBY"}) {
+                "INCR", "DECR", "INCRBY", "DECRBY", "GETRANGE", "SUBSTR", "INCRBYFLOAT"}) {
             typed(c, string, KeyPos.SINGLE);
         }
         typed("MGET", string, KeyPos.ALL);
+        // SETRANGE 不挂中央闸门：实测 {@code SETRANGE <list 键> -5 x} 回的是
+        // "offset is out of range"、{@code ... abc x} 回 "value is not an integer or out of range"，
+        // 都不是 WRONGTYPE —— 参考实现把偏移检查排在 lookupKeyWrite 之前，所以这道类型检查
+        // 必须由 handleSetrange 自己在偏移之后补。
+        // BITCOUNT 同理：实测 {@code BITCOUNT <string 键> abc 1} 回整数那句，
+        // 而 WRONGTYPE 要排在下标检查之后（handleBitcount 自己补这一刀）。
 
         for (String c : new String[]{"HSET", "HGET", "HDEL", "HEXISTS", "HGETALL", "HKEYS", "HVALS",
-                "HMGET", "HMSET", "HLEN", "HSETNX", "HSCAN", "HRANDFIELD", "HINCRBY", "HINCRBYFLOAT"}) {
+                "HMGET", "HMSET", "HLEN", "HSETNX", "HSCAN", "HRANDFIELD", "HINCRBY",
+                "HSTRLEN"}) {
             typed(c, hash, KeyPos.SINGLE);
         }
+        // HINCRBYFLOAT 有意不在表里：它先解析增量再判类型（实测见 wrongTypeAfterParse），
+        // 中央闸门跑在分发之前，会把"增量本身就写歪"那一档的文案抢答成 WRONGTYPE。
 
-        for (String c : new String[]{"LPUSH", "RPUSH", "LPOP", "RPOP", "LLEN", "LRANGE", "LINDEX",
-                "LSET", "LINSERT", "LREM", "LTRIM"}) {
+        for (String c : new String[]{"LPUSH", "RPUSH", "LPUSHX", "RPUSHX", "LPOP", "RPOP", "LLEN", "LRANGE",
+                "LINDEX", "LSET", "LINSERT", "LREM", "LTRIM"}) {
             typed(c, list, KeyPos.SINGLE);
         }
         typed("RPOPLPUSH", list, KeyPos.FIRST_TWO);
@@ -2066,12 +2679,38 @@ public class CommandHandler {
         typed("SUNIONSTORE", set, KeyPos.FROM_SECOND);
         typed("SDIFFSTORE", set, KeyPos.FROM_SECOND);
 
-        for (String c : new String[]{"ZADD", "ZREM", "ZSCORE", "ZRANK", "ZREVRANK", "ZCARD", "ZCOUNT",
-                "ZRANGE", "ZREVRANGE", "ZRANGEBYSCORE", "ZREVRANGEBYSCORE", "ZINCRBY", "ZLEXCOUNT",
+        for (String c : new String[]{"ZREM", "ZSCORE", "ZRANK", "ZREVRANK", "ZCARD", "ZCOUNT",
+                "ZRANGE", "ZREVRANGE", "ZRANGEBYSCORE", "ZREVRANGEBYSCORE", "ZLEXCOUNT",
                 "ZRANGEBYLEX", "ZREVRANGEBYLEX", "ZREMRANGEBYLEX", "ZREMRANGEBYRANK",
                 "ZREMRANGEBYSCORE", "ZRANDMEMBER", "ZSCAN"}) {
             typed(c, zset, KeyPos.SINGLE);
         }
+        // ZADD / ZINCRBY 同样有意不在表里：实测 ZADD <string 键> abc a → value is not a valid
+        // float、ZINCRBY <string 键> nan m → 同一句（ref16 / ref17），都是"分数解析在前"，
+        // 所以这道类型检查由两个 handler 自己在解析完（全部）数对之后补。
+        // ZUNIONSTORE/ZINTERSTORE 有意不挂进这张表：它们的第一枚参数是 numkeys 而不是键
+        // （SINTERSTORE 那三兄弟的键从 args[1] 就开始，形状不同），而且目标键是被覆盖的、
+        // 不该报 WRONGTYPE。源键的类型检查由 handleZstore 自己按 numkeys 数完再做。
+    }
+
+    /**
+     * "先解析参数、后判类型"那一族命令自己补的类型检查。
+     * <p>
+     * 中央闸门 {@link #typeConflict} 是在分发前一次性问的，而对岸这几种命令的 {@code checkType}
+     * 排在参数解析<b>之后</b>，于是同一枚坏键名要按坏的到底是哪一栏给两种答案（250 实测）：
+     * {@code ZADD <string 键> abc a} → {@code value is not a valid float}（ref16），
+     * 而 {@code ZADD <string 键> 1 a} → {@code WRONGTYPE}；
+     * {@code HINCRBYFLOAT <string 键> f abc} → 增量的错，{@code ... f 1} → WRONGTYPE（ref15）；
+     * {@code SETRANGE <list 键> -5 x} → {@code offset is out of range}（ref9）。
+     * 反过来 {@code ZINCRBY <string 键> nan m} 也是先 float 后 WRONGTYPE（ref17），
+     * 所以这一把尺量的是"参数已经解析成功了"这个前提，谁在前谁在后由实测说了算。
+     */
+    private RespError wrongTypeAfterParse(MemoryStore.DataType family, String key) {
+        MemoryStore.DataType actual = store.typeOfDb(currentDb, key);
+        if (actual == MemoryStore.DataType.NONE || actual == family) {
+            return null;
+        }
+        return RespError.wrongType("Operation against a key holding the wrong kind of value");
     }
 
     /**
@@ -2087,7 +2726,7 @@ public class CommandHandler {
      * （dbOverwrite），这条语义由 {@code MemoryStore.putDb} 的 {@code clearOtherTypes} 兑现。
      */
     private RespError typeConflict(String[] args) {
-        TypeSpec spec = TYPED_COMMANDS.get(args[0].toUpperCase());
+        TypeSpec spec = TYPED_COMMANDS.get(args[0].toUpperCase(Locale.ROOT));
         if (spec == null) {
             return null;
         }
@@ -2126,7 +2765,7 @@ public class CommandHandler {
         if (record.length < 2 || record[1] == null) {
             return;
         }
-        String cmd = record[0].toUpperCase();
+        String cmd = record[0].toUpperCase(Locale.ROOT);
         if ("MSET".equals(cmd)) {
             for (int i = 1; i + 1 < record.length; i += 2) {
                 store.bumpKeyVersion(currentDb, record[i]);
@@ -2172,17 +2811,37 @@ public class CommandHandler {
     private static RespArray toRespArray(List<byte[]> l) { Object[] r=new Object[l.size()]; for(int i=0;i<l.size();i++) r[i]=l.get(i)==null?RespBulkString.nullBulkString():RespBulkString.of(l.get(i)); return RespArray.of(r); }
     private static RespArray toRespArray(String[] a) { Object[] r=new Object[a.length]; for(int i=0;i<a.length;i++) r[i]=RespBulkString.of(a[i]); return RespArray.of(r); }
 
-    private static double parseScore(String s) { if ("+inf".equalsIgnoreCase(s)||"inf".equalsIgnoreCase(s)) return Double.POSITIVE_INFINITY; if ("-inf".equalsIgnoreCase(s)) return Double.NEGATIVE_INFINITY; return Double.parseDouble(s); }
-    private static String formatDouble(double v) { String s=String.valueOf(v); if (s.contains(".")&&!s.contains("E")&&!s.contains("e")) { int l=s.length(); while(l>1&&s.charAt(l-1)=='0') l--; if(l>1&&s.charAt(l-1)=='.') l--; s=s.substring(0,l); } return s; }
+    /**
+     * 分数 / 增量参数的解析。{@code +inf} / {@code inf} / {@code -inf} 是 Redis 认的写法
+     * （实测 {@code ZADD z inf m} 之后 {@code ZSCORE z m} 回 {@code inf}），而
+     * {@code Double.parseDouble} 只认 {@code Infinity}；{@code nan} 两侧都必须在解析阶段拒掉
+     * （实测 {@code ZINCRBY z nan m} 回 {@code -ERR value is not a valid float}），否则会一路
+     * 走到存储里变成第三种形状。
+     */
+    private static double parseScore(String s) {
+        return RedisDoubleFormat.parse(s);
+    }
     private static String fmtBytes(long b) { if(b<1024)return b+"B"; double k=b/1024.0; if(k<1024)return String.format(java.util.Locale.ROOT,"%.2fKB",k); double m=k/1024.0; if(m<1024)return String.format(java.util.Locale.ROOT,"%.2fMB",m); return String.format(java.util.Locale.ROOT,"%.2fGB",m/1024.0); }
 
     // ==================== 新增 Hash 命令 ====================
 
     private Object handleHincrbyfloat(String[] args) {
         if (args.length != 4) return RespError.wrongNumberOfArguments("HINCRBYFLOAT");
+        // 这条命令不挂中央类型闸门，因为对岸的顺序是"解析增量 → 查键并判类型 → 读字段"：
+        // 实测 HINCRBYFLOAT <string 键> f abc → value is not a valid float，而同一枚键配
+        // 合法增量 f 1 → WRONGTYPE（ref15）。增量这一栏因此要先单独量一遍。
         try {
-            double result = store.getHashStore(currentDb).hincrbyfloat(args[1], args[2], Double.parseDouble(args[3]));
-            return RespBulkString.of(formatDouble(result));
+            if (!RedisDoubleFormat.isInfinityText(args[3])) RedisDoubleFormat.requirePlain(args[3]);
+        } catch (NumberFormatException e) {
+            return RespError.of("ERR", "value is not a valid float");
+        }
+        RespError conflict = wrongTypeAfterParse(MemoryStore.DataType.HASH, args[1]);
+        if (conflict != null) return conflict;
+        try {
+            // 增量原样交给存储层做文本进/文本出：回复的那串和存进 hash 的那串必须是同一次
+            // long double 量化的结果，中间过一遍 double 就会两边不一样（250 实测两列逐例相同）。
+            String result = store.getHashStore(currentDb).hincrbyfloat(args[1], args[2], args[3]);
+            return RespBulkString.of(result);
         } catch (NumberFormatException e) { return RespError.of("ERR", "value is not a valid float"); }
         catch (IllegalArgumentException e) { return RespError.of("ERR", e.getMessage()); }
     }
@@ -2199,7 +2858,7 @@ public class CommandHandler {
 
     private Object handleSpop(String[] args) {
         if (args.length < 2 || args.length > 3) return RespError.wrongNumberOfArguments("SPOP");
-        int count = args.length == 3 ? Integer.parseInt(args[2]) : 1;
+        int count = args.length == 3 ? intArg(args[2]) : 1;
         List<byte[]> m = store.getSetStore(currentDb).spop(args[1], count);
         if (args.length == 2) {
             if (m.isEmpty()) return RespBulkString.nullBulkString();
@@ -2265,8 +2924,8 @@ public class CommandHandler {
     private Object handleZremrangebyrank(String[] args) {
         if (args.length != 4) return RespError.wrongNumberOfArguments("ZREMRANGEBYRANK");
         try {
-            return RespInteger.of(store.getSortedSetStore(currentDb).zremrangebyrank(args[1], Long.parseLong(args[2]), Long.parseLong(args[3])));
-        } catch (NumberFormatException e) { return RespError.of("ERR", "value is not an integer or out of range"); }
+            return RespInteger.of(store.getSortedSetStore(currentDb).zremrangebyrank(args[1], longArg(args[2]), longArg(args[3])));
+        } catch (NumberFormatException e) { return RespError.notAnInteger(); }
     }
 
     private Object handleZremrangebyscore(String[] args) {
@@ -2278,7 +2937,7 @@ public class CommandHandler {
 
     private Object handleZrandmember(String[] args) {
         if (args.length < 2 || args.length > 3) return RespError.wrongNumberOfArguments("ZRANDMEMBER");
-        int count = args.length == 3 ? Integer.parseInt(args[2]) : 1;
+        int count = args.length == 3 ? intArg(args[2]) : 1;
         List<byte[]> m = store.getSortedSetStore(currentDb).zrandmember(args[1], count);
         if (args.length == 2) {
             if (m.isEmpty()) return RespBulkString.nullBulkString();
@@ -2294,7 +2953,7 @@ public class CommandHandler {
     private Object handleBpop(String[] args, String direction) {
         if (args.length < 3) return RespError.wrongNumberOfArguments(direction.equals("LEFT") ? "BLPOP" : "BRPOP");
         int timeout;
-        try { timeout = Integer.parseInt(args[args.length - 1]); }
+        try { timeout = intArg(args[args.length - 1]); }
         catch (NumberFormatException e) { return RespError.of("ERR", "timeout is not an integer or out of range"); }
         if (timeout < 0) return RespError.of("ERR", "timeout is negative");
 
@@ -2323,7 +2982,7 @@ public class CommandHandler {
     private Object handleBrpoplpush(String[] args) {
         if (args.length != 4) return RespError.wrongNumberOfArguments("BRPOPLPUSH");
         int timeout;
-        try { timeout = Integer.parseInt(args[3]); }
+        try { timeout = intArg(args[3]); }
         catch (NumberFormatException e) { return RespError.of("ERR", "timeout is not an integer or out of range"); }
         if (timeout < 0) return RespError.of("ERR", "timeout is negative");
 
@@ -2339,7 +2998,7 @@ public class CommandHandler {
 
     private Object handleHrandfield(String[] args) {
         if (args.length < 2 || args.length > 3) return RespError.wrongNumberOfArguments("HRANDFIELD");
-        int count = args.length == 3 ? Integer.parseInt(args[2]) : 1;
+        int count = args.length == 3 ? intArg(args[2]) : 1;
         List<String> fields = store.getHashStore(currentDb).hrandfield(args[1], count);
         if (args.length == 2) {
             if (fields.isEmpty()) return RespBulkString.nullBulkString();
@@ -2389,7 +3048,7 @@ public class CommandHandler {
         int count = 10;
         for (int i = 2; i < args.length; i++) {
             if ("MATCH".equalsIgnoreCase(args[i]) && i + 1 < args.length) pattern = args[++i];
-            else if ("COUNT".equalsIgnoreCase(args[i]) && i + 1 < args.length) count = Integer.parseInt(args[++i]);
+            else if ("COUNT".equalsIgnoreCase(args[i]) && i + 1 < args.length) count = intArg(args[++i]);
         }
         Object[] scanResult = store.scan(currentDb, cursor, pattern, count);
         String nextCursor = (String) scanResult[0];

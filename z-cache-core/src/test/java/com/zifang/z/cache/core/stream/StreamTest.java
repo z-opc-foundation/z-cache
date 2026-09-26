@@ -3,6 +3,7 @@ package com.zifang.z.cache.core.stream;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -61,9 +62,9 @@ class StreamTest {
 
     @Test
     void testRange_Ascending() {
-        stream.addEntry(Map.of("k", "v1"), "100-0");
-        stream.addEntry(Map.of("k", "v2"), "200-0");
-        stream.addEntry(Map.of("k", "v3"), "300-0");
+        stream.addEntry(Collections.singletonMap("k", "v1"), "100-0");
+        stream.addEntry(Collections.singletonMap("k", "v2"), "200-0");
+        stream.addEntry(Collections.singletonMap("k", "v3"), "300-0");
 
         List<StreamEntry> result = stream.range("-", "+", 0);
         assertEquals(3, result.size());
@@ -74,7 +75,7 @@ class StreamTest {
     @Test
     void testRange_WithCount() {
         for (int i = 1; i <= 10; i++) {
-            stream.addEntry(Map.of("k", "v" + i), i + "-0");
+            stream.addEntry(Collections.singletonMap("k", "v" + i), i + "-0");
         }
         List<StreamEntry> result = stream.range("-", "+", 5);
         assertEquals(5, result.size());
@@ -82,9 +83,9 @@ class StreamTest {
 
     @Test
     void testRevRange_Descending() {
-        stream.addEntry(Map.of("k", "v1"), "100-0");
-        stream.addEntry(Map.of("k", "v2"), "200-0");
-        stream.addEntry(Map.of("k", "v3"), "300-0");
+        stream.addEntry(Collections.singletonMap("k", "v1"), "100-0");
+        stream.addEntry(Collections.singletonMap("k", "v2"), "200-0");
+        stream.addEntry(Collections.singletonMap("k", "v3"), "300-0");
 
         List<StreamEntry> result = stream.revRange("-", "+", 0);
         assertEquals(3, result.size());
@@ -96,9 +97,9 @@ class StreamTest {
     @Test
     void testLength() {
         assertEquals(0, stream.length());
-        stream.addEntry(Map.of("k", "v"), "*");
+        stream.addEntry(Collections.singletonMap("k", "v"), "*");
         assertEquals(1, stream.length());
-        stream.addEntry(Map.of("k", "v2"), "*");
+        stream.addEntry(Collections.singletonMap("k", "v2"), "*");
         assertEquals(2, stream.length());
     }
 
@@ -106,8 +107,8 @@ class StreamTest {
 
     @Test
     void testDelete() {
-        stream.addEntry(Map.of("k", "v1"), "100-0");
-        stream.addEntry(Map.of("k", "v2"), "200-0");
+        stream.addEntry(Collections.singletonMap("k", "v1"), "100-0");
+        stream.addEntry(Collections.singletonMap("k", "v2"), "200-0");
         long deleted = stream.delete("100-0");
         assertEquals(1, deleted);
         assertEquals(1, stream.length());
@@ -118,7 +119,7 @@ class StreamTest {
     @Test
     void testTrim() {
         for (int i = 1; i <= 5; i++) {
-            stream.addEntry(Map.of("k", "v" + i), i + "-0");
+            stream.addEntry(Collections.singletonMap("k", "v" + i), i + "-0");
         }
         long removed = stream.trim(3);
         assertEquals(2, removed);
@@ -129,7 +130,7 @@ class StreamTest {
 
     @Test
     void testCreateGroup() {
-        stream.addEntry(Map.of("k", "v1"), "100-0");
+        stream.addEntry(Collections.singletonMap("k", "v1"), "100-0");
         assertTrue(stream.createGroup("mygroup", "0"));
         assertNotNull(stream.getGroup("mygroup"));
     }
@@ -151,7 +152,7 @@ class StreamTest {
 
     @Test
     void testConsumerGroup_Ack() {
-        stream.addEntry(Map.of("k", "v1"), "100-0");
+        stream.addEntry(Collections.singletonMap("k", "v1"), "100-0");
         stream.createGroup("g1", "0");
         ConsumerGroup cg = stream.getGroup("g1");
 
@@ -165,8 +166,8 @@ class StreamTest {
 
     @Test
     void testConsumerGroup_MultipleConsumers() {
-        stream.addEntry(Map.of("k", "v1"), "100-0");
-        stream.addEntry(Map.of("k", "v2"), "200-0");
+        stream.addEntry(Collections.singletonMap("k", "v1"), "100-0");
+        stream.addEntry(Collections.singletonMap("k", "v2"), "200-0");
         stream.createGroup("g1", "0");
         ConsumerGroup cg = stream.getGroup("g1");
 
@@ -182,7 +183,7 @@ class StreamTest {
     @Test
     void testStreamStore_Xadd() {
         StreamStore store = new StreamStore(1);
-        Map<String, String> fields = Map.of("name", "test");
+        Map<String, String> fields = Collections.singletonMap("name", "test");
         String id = store.xadd(0, "mystream", fields, "*", 0);
         assertNotNull(id);
         assertEquals(1, store.xlen(0, "mystream"));
@@ -191,8 +192,8 @@ class StreamTest {
     @Test
     void testStreamStore_Xrange() {
         StreamStore store = new StreamStore(1);
-        store.xadd(0, "s1", Map.of("a", "1"), "100-0", 0);
-        store.xadd(0, "s1", Map.of("a", "2"), "200-0", 0);
+        store.xadd(0, "s1", Collections.singletonMap("a", "1"), "100-0", 0);
+        store.xadd(0, "s1", Collections.singletonMap("a", "2"), "200-0", 0);
 
         List<StreamEntry> result = store.xrange(0, "s1", "-", "+", 0);
         assertEquals(2, result.size());
@@ -201,12 +202,12 @@ class StreamTest {
     @Test
     void testStreamStore_ConsumerGroup() {
         StreamStore store = new StreamStore(1);
-        store.xadd(0, "s1", Map.of("a", "1"), "100-0", 0);
-        store.xadd(0, "s1", Map.of("a", "2"), "200-0", 0);
+        store.xadd(0, "s1", Collections.singletonMap("a", "1"), "100-0", 0);
+        store.xadd(0, "s1", Collections.singletonMap("a", "2"), "200-0", 0);
 
         assertTrue(store.xgroupCreate(0, "s1", "g1", "0"));
 
-        Map<String, String> streams = Map.of("s1", ">");
+        Map<String, String> streams = Collections.singletonMap("s1", ">");
         Map<String, List<StreamEntry>> result = store.xreadgroup(0, "g1", "c1", streams, 10);
         assertEquals(1, result.size());
         assertEquals(2, result.get("s1").size());
@@ -219,8 +220,8 @@ class StreamTest {
     @Test
     void testStreamStore_Xdel() {
         StreamStore store = new StreamStore(1);
-        store.xadd(0, "s1", Map.of("a", "1"), "100-0", 0);
-        store.xadd(0, "s1", Map.of("a", "2"), "200-0", 0);
+        store.xadd(0, "s1", Collections.singletonMap("a", "1"), "100-0", 0);
+        store.xadd(0, "s1", Collections.singletonMap("a", "2"), "200-0", 0);
 
         long deleted = store.xdel(0, "s1", "100-0");
         assertEquals(1, deleted);

@@ -53,7 +53,10 @@ class RedisServerProtocolSemanticsTest {
             send(socket, "SLOWLOG", "LEN");
             assertEquals(":0", readReply(in), "没跑过慢命令时账上应该是空的");
 
-            send(socket, "DEBUG", "SLEEP", "400");
+            // 单位是<b>秒</b>（250 实测 DEBUG SLEEP 0.5 睡半秒、DEBUG SLEEP 1e3 把对岸挂了一千秒）。
+            // 这一支以前写的是 "400"，在"毫秒"的错读法下刚好睡 400ms 越过 100ms 阈值而全绿 ——
+            // 改成秒以后它要睡 400 秒，于是这条测试把那个错读法钉在了红线上。
+            send(socket, "DEBUG", "SLEEP", "0.4");
             assertEquals("+OK", readReply(in));
 
             send(socket, "SLOWLOG", "LEN");
@@ -506,6 +509,71 @@ class RedisServerProtocolSemanticsTest {
     }
 
     /**
+     * 浮点回复的形状与事务错误的文案，逐条按 250 上一次性 redis-server 4.0.9 参考实例量到的原文钉住。
+     * <p>
+     * 形状这一族以前有四份各自 trimming 的副本，同一个值能给出三种答案：
+     * {@code ZRANGE … WITHSCORES} 把整数分数回成 {@code 1.0}（参考实现回 {@code 1}）、
+     * {@code +inf} 成员回成 {@code "+inf"}（参考实现回 {@code inf}）、
+     * {@code HINCRBYFLOAT} 存进 hash 的那串又是第三种写法。
+     * 事务这一族则是每条消息带两个 {@code ERR}：实测到的原文是
+     * {@code -ERR ERR no transaction in progress}，而参考实现是 {@code -ERR EXEC without MULTI}。
+     */
+    @Test
+    void doubleRepliesAndTransactionErrorsMatchTheReference() throws Exception {
+        int port = freePort();
+        RedisServer server = new RedisServer("127.0.0.1", port, 0);
+        Thread thread = startAndWait(server, port);
+        try (Socket socket = connect(port)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+
+            // 分数一族（d2string：%.17g + 削尾零）
+            send(socket, "ZADD", "sem:dbl", "1", "int");
+            assertEquals(":1", readReply(in));
+            send(socket, "ZSCORE", "sem:dbl", "int");
+            assertEquals("1", readReply(in), "整数分数回 1，不是 1.0");
+            send(socket, "ZRANGE", "sem:dbl", "0", "-1", "WITHSCORES");
+            assertEquals("[int, 1]", readReplyDeep(in));
+            send(socket, "ZADD", "sem:dbl", "0.1", "tenth");
+            assertEquals(":1", readReply(in));
+            send(socket, "ZSCORE", "sem:dbl", "tenth");
+            assertEquals("0.10000000000000001", readReply(in), "double 的 %.17g 就是这么打的");
+            send(socket, "ZADD", "sem:dbl", "inf", "hi");
+            assertEquals(":1", readReply(in));
+            send(socket, "ZSCORE", "sem:dbl", "hi");
+            assertEquals("inf", readReply(in), "参考实现回 inf，不是 +inf");
+            send(socket, "ZADD", "sem:dbl", "-inf", "lo");
+            assertEquals(":1", readReply(in));
+            send(socket, "ZSCORE", "sem:dbl", "lo");
+            assertEquals("-inf", readReply(in));
+
+            // humanReadable 一族：回复与存进 hash 的字节在参考实现里逐例相同
+            send(socket, "HINCRBYFLOAT", "sem:hdbl", "f", "0.1");
+            assertEquals("0.1", readReply(in));
+            send(socket, "HGET", "sem:hdbl", "f");
+            assertEquals("0.1", readReply(in), "存进去的那串必须与回复同一形状");
+            send(socket, "HINCRBYFLOAT", "sem:hdbl", "f", "1.0");
+            assertEquals("1.1", readReply(in));
+
+            // 事务错误文案：每条只加一次 ERR
+            send(socket, "EXEC");
+            assertEquals("-ERR EXEC without MULTI", readReply(in));
+            send(socket, "DISCARD");
+            assertEquals("-ERR DISCARD without MULTI", readReply(in));
+            send(socket, "MULTI");
+            assertEquals("+OK", readReply(in));
+            send(socket, "MULTI");
+            assertEquals("-ERR MULTI calls can not be nested", readReply(in));
+            send(socket, "WATCH", "sem:dbl");
+            assertEquals("-ERR WATCH inside MULTI is not allowed", readReply(in));
+            send(socket, "DISCARD");
+            assertEquals("+OK", readReply(in));
+        } finally {
+            server.stop();
+            thread.join(DEADLINE_MS);
+        }
+    }
+
+    /**
      * EXEC 与 DISCARD 都要 flush 掉 WATCH 记录（Redis 就是这样的）。
      * <p>
      * {@code TransactionManager.resetContext} 以前刻意"保留 WATCH 信息"，于是上一条事务里
@@ -820,6 +888,144 @@ class RedisServerProtocolSemanticsTest {
     }
 
     /**
+     * MONITOR 每一行都要能按 Redis 的形状被机器读：RESP 简单串（'+'），
+     * 形如 {@code <秒>.<6 位微秒> [<db> <ip:port>] "CMD" "arg" …}。
+     * <p>
+     * 注册与转发这条链本身是通的（本轮实测拿得到行），形状有四处不对：推的是 bulk string
+     * （按行读的客户端会把长度行当内容、随后错位）、小数位写死 {@code .000000}、
+     * db 与地址之间多塞了一个 channel hashCode、地址用的是 {@code InetSocketAddress.toString()}
+     * 因而带一个 Java 特有的前导斜杠。改成简单串之后还多一道必须一起补的：参数里的裸换行
+     * 会把这一行劈成两行（bulk 有长度前缀所以原来不炸），Redis 的做法是转义。
+     */
+    @Test
+    void monitorLinesUseTheRedisWireFormat() throws Exception {
+        int port = freePort();
+        RedisServer server = new RedisServer("127.0.0.1", port, 0);
+        Thread thread = startAndWait(server, port);
+        try (Socket mon = connect(port); Socket peer = connect(port)) {
+            DataInputStream min = new DataInputStream(mon.getInputStream());
+            DataInputStream pin = new DataInputStream(peer.getInputStream());
+
+            send(mon, "MONITOR");
+            assertEquals("+OK", readReply(min));
+
+            long before = System.currentTimeMillis();
+            send(peer, "SET", "mon:key", "v1");
+            assertEquals("+OK", readReply(pin));
+            long after = System.currentTimeMillis();
+
+            String raw = readWireReply(min);
+            // 阳性对照：别人那条命令确实推到了这条连接上（形状的问题留给后面几条判据）
+            String line = raw.startsWith("+") ? raw.substring(1) : raw;
+            assertTrue(line.contains("\"SET\" \"mon:key\" \"v1\""),
+                    "MONITOR 该收到别的连接这条命令与参数，实得 " + raw);
+
+            assertTrue(raw.startsWith("+"), "MONITOR 行是简单串而不是 bulk，实得 " + raw);
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                    .compile("^(\\d+)\\.(\\d{6}) \\[(\\d+) ([^\\]]*)\\] ").matcher(line);
+            assertTrue(m.find(), "行首要形如 <秒>.<微秒> [<库号> <ip:port>]，实得 " + line);
+            assertEquals("0", m.group(3), "这条连接默认在 db 0");
+            String addr = m.group(4);
+            assertFalse(addr.startsWith("/"), "地址不能带 Java toString 的前导斜杠，实得 " + addr);
+            assertTrue(addr.matches("\\d+\\.\\d+\\.\\d+\\.\\d+:\\d+"), "应是 ip:port，实得 " + addr);
+
+            long stamped = Long.parseLong(m.group(1)) * 1000 + Long.parseLong(m.group(2)) / 1000;
+            assertTrue(stamped >= before - 1 && stamped <= after + 1,
+                    "时间戳要是命令真正发生的时刻（小数位不是写死的 000000）："
+                            + "实得 " + stamped + "，窗口 [" + (before - 1) + ", " + (after + 1) + "]");
+
+            // 参数里有裸换行时不能把这一行劈成两行：下一行还得对得上
+            send(peer, "SET", "mon:nl", "a\nb");
+            assertEquals("+OK", readReply(pin));
+            String withNewline = readWireReply(min);
+            assertTrue(withNewline.startsWith("+"), "带换行的参数仍要是一整行简单串，实得 " + withNewline);
+            // 这一条才是"转义"的判据：测试里的 readLine 对裸换行是宽容的（读到 \r 才停），
+            // 只判 startsWith("+") 的话不转义也照样绿，而真客户端在这里就已经把一行读成两行。
+            assertFalse(withNewline.contains("\n") || withNewline.contains("\r"),
+                    "参数里的换行必须转义成 \\\\n，不能原样进这一行（简单串靠 CRLF 结束），实得 " + withNewline);
+            assertTrue(withNewline.contains("\"mon:nl\""), "命令与键名要还在行里，实得 " + withNewline);
+            send(peer, "SET", "mon:after", "x");
+            assertEquals("+OK", readReply(pin));
+            String after2 = readWireReply(min);
+            assertTrue(after2.contains("\"SET\" \"mon:after\" \"x\""),
+                    "上一行若把帧读错位，这条就对不上，实得 " + after2);
+
+            // RESET 退出 MONITOR 之后不再收到推送（这里用"下一条命令读不到行"来判，
+            // 所以必须在上面几条判据之后才做，否则会污染后面的读取）
+            send(mon, "RESET");
+            assertEquals("+OK", readReply(min));
+            send(peer, "SET", "mon:quiet", "1");
+            assertEquals("+OK", readReply(pin));
+            mon.setSoTimeout(600);
+            String late;
+            try {
+                late = readWireReply(min);
+            } catch (java.net.SocketTimeoutException nothing) {
+                late = null;
+            }
+            assertNull(late, "RESET 之后这条连接不该再收推送，实得 " + late);
+        } finally {
+            server.stop();
+            thread.join(DEADLINE_MS);
+        }
+    }
+
+    /**
+     * 错误回复不能把这条连接上的帧劈开。
+     * <p>
+     * 一个 bulk 参数里可以放任意字节，CR/LF 也算，而报错文本会把客户端给的东西原样抄进去：
+     * 未实现命令回 {@code -ERR unknown command '<名字>'}，{@code XTRIM} 的策略位、
+     * {@code DEBUG} 的子命令名、以及若干 {@code e.getMessage()}（NumberFormatException 会带上
+     * 出问题的那串输入）同理。名字里带一组 CRLF，服务器吐出的就是三行——第二行是一条
+     * 客户端从没请求过的响应。Redis 的 {@code addReplyErrorLength} 专门把 CR/LF 换成空格，
+     * 就是为这件事。判据不放在"读到的第一行"上（读到这里正好停在被注入的那个 CR 上，
+     * 看着一切正常），放在紧接着的下一条命令：劈了帧的话它读到的就是伪造行。
+     */
+    @Test
+    void errorRepliesCannotForgeAnExtraLine() throws Exception {
+        int port = freePort();
+        RedisServer server = new RedisServer("127.0.0.1", port, 0);
+        Thread thread = startAndWait(server, port);
+        try (Socket socket = connect(port)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+
+            // 阳性对照：普通报错形状正常，文本也照原样带得出来
+            send(socket, "NOSUCHCMD", "a");
+            assertEquals("-ERR unknown command 'NOSUCHCMD'", readReply(in));
+
+            send(socket, "PING\r\n+FORGED\r\n", "x");
+            String first = readReply(in);
+            assertTrue(first.startsWith("-"), "未实现命令仍是一条错误回复，实得 " + first);
+            send(socket, "PING");
+            assertEquals("+PONG", readReply(in),
+                    "上一条若劈开了帧，这里读到的会是被伪造的那一行；上一条实得 " + first);
+            // 走到这里说明整行是一次读干净的：文本还在同一行里，只是 CRLF 被换成了空格
+            assertTrue(first.contains("+FORGED"), "只换掉 CRLF，不截断文本，实得 " + first);
+
+            // 另一个载体：XTRIM 的策略位也在报错文本里
+            send(socket, "XTRIM", "err:trim", "MAXLENX\r\n+FORGED2\r\n", "3");
+            String second = readReply(in);
+            assertTrue(second.startsWith("-"), "不认识的裁剪策略要报错，实得 " + second);
+            send(socket, "PING");
+            assertEquals("+PONG", readReply(in), "XTRIM 那条报错若劈开了帧，这里对不上");
+            assertTrue(second.contains("+FORGED2"), "文本保留、只洗 CRLF，实得 " + second);
+
+            // 数字解析的报错走的是 e.getMessage()，那串文本里带着客户端的输入。
+            // 但反过来：bulk 是二进制安全的，member 里带换行完全合法，清洗只能做在
+            // 简单串/错误这两类"靠 CRLF 结束"的形状上，不能顺手把键名也改了。
+            send(socket, "ZADD", "err:zset", "1", "a\r\n+FORGED3\r\n");
+            assertEquals(":1", readReply(in), "带换行的 member 照样写得进去");
+            send(socket, "ZSCORE", "err:zset", "a\r\n+FORGED3\r\n");
+            assertEquals("1", readReply(in), "读回来的分数不受影响（bulk 按长度取，不看换行）");
+            send(socket, "PING");
+            assertEquals("+PONG", readReply(in), "上面两条若把帧劈开了，这里对不上");
+        } finally {
+            server.stop();
+            thread.join(DEADLINE_MS);
+        }
+    }
+
+    /**
      * 一台服务器的连接表与订阅态不能漏到另一台。
      * <p>
      * pub/sub 管理器和连接登记表以前是 {@code CommandHandler} 上的静态字段，每条新连接还会
@@ -971,6 +1177,800 @@ class RedisServerProtocolSemanticsTest {
         }
     }
 
+    /**
+     * GETRANGE / SUBSTR / SETRANGE 三兄弟：越界怎么钳、错先报哪一个，逐条钉 250 上一次性
+     * redis-server 4.0.9 抄下的原文（ref.tr、ref2-6.tr、ref9-11.tr、ref15-17.tr）。
+     * <p>
+     * 两处最容易自己发明：
+     * <ul>
+     *   <li>取不到内容的 GETRANGE 回<b>空 bulk</b>而不是 nil：{@code 5 5}、{@code 6 9}、
+     *       {@code 10 20}、{@code 2 1}（end 排在 start 之前）、键不存在，五例全回空串。</li>
+     *   <li>SETRANGE 的偏移判据<b>排在类型闸门之前</b>：同一枚 list 键，{@code -5 x} 回
+     *       {@code offset is out of range}、{@code abc x} 回
+     *       {@code value is not an integer or out of range}、{@code 0 x} 才轮到 WRONGTYPE。
+     *       中央类型闸门跑在分发之前，答不出这个先后，所以这条命令由 {@code handleSetrange}
+     *       自己在偏移之后补类型检查。</li>
+     * </ul>
+     */
+    @Test
+    void stringRangeFamilyFollowsTheMeasuredClampsAndPrecedence() throws Exception {
+        int port = freePort();
+        RedisServer server = new RedisServer("127.0.0.1", port, 0);
+        Thread thread = startAndWait(server, port);
+        try (Socket socket = connect(port)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+
+            send(socket, "SET", "sr:hello", "Hello");
+            assertEquals("+OK", readReply(in));
+            send(socket, "GETRANGE", "sr:hello", "0", "1");
+            assertEquals("He", readReply(in));
+            send(socket, "GETRANGE", "sr:hello", "0", "99999999999999999999");
+            assertEquals("-ERR value is not an integer or out of range", readReply(in),
+                    "end 装不进 int64 时先吃解析错，轮不到钳位");
+            send(socket, "GETRANGE", "sr:hello", "abc", "2");
+            assertEquals("-ERR value is not an integer or out of range", readReply(in));
+            send(socket, "GETRANGE", "sr:hello", "5", "5");
+            assertEquals("", readReply(in), "start 落在串尾之外是空 bulk，不是 nil");
+            send(socket, "GETRANGE", "sr:hello", "6", "9");
+            assertEquals("", readReply(in));
+            send(socket, "GETRANGE", "sr:hello", "10", "20");
+            assertEquals("", readReply(in));
+            send(socket, "GETRANGE", "sr:hello", "2", "1");
+            assertEquals("", readReply(in), "end 在 start 之前也是空串");
+            send(socket, "GETRANGE", "sr:hello", "0", "-100");
+            assertEquals("H", readReply(in), "负的 end 从串尾倒着换算");
+            send(socket, "GETRANGE", "sr:hello", "-100", "-100");
+            assertEquals("H", readReply(in));
+            send(socket, "GETRANGE", "sr:hello", "-100", "100");
+            assertEquals("Hello", readReply(in), "两头都越界就是整串");
+            send(socket, "GETRANGE", "sr:hello", "-3", "-1");
+            assertEquals("llo", readReply(in));
+            send(socket, "GETRANGE", "sr:hello", "9223372036854775807", "5");
+            assertEquals("", readReply(in), "int64 上界本身要能进钳位");
+            send(socket, "GETRANGE", "sr:hello", "-9223372036854775808", "5");
+            assertEquals("Hello", readReply(in), "int64 下界换算后落在串头之前，钳到 0");
+            send(socket, "GETRANGE", "sr:missing", "0", "5");
+            assertEquals("", readReply(in), "键不存在回空串");
+            send(socket, "GETRANGE", "sr:missing", "0", "-100");
+            assertEquals("", readReply(in));
+            send(socket, "GETRANGE", "sr:hello", "1");
+            assertEquals("-ERR wrong number of arguments for 'getrange' command", readReply(in));
+
+            // SUBSTR 与 GETRANGE 同一把尺（实测两族逐例一致，含 arity 文案里的名字）
+            send(socket, "SUBSTR", "sr:hello", "0", "3");
+            assertEquals("Hell", readReply(in));
+            send(socket, "SUBSTR", "sr:hello", "1", "-2");
+            assertEquals("ell", readReply(in));
+            send(socket, "SUBSTR", "sr:hello", "0", "-100");
+            assertEquals("H", readReply(in));
+            send(socket, "SUBSTR", "sr:hello", "3", "0");
+            assertEquals("", readReply(in));
+            send(socket, "SUBSTR", "sr:hello", "-3");
+            assertEquals("-ERR wrong number of arguments for 'substr' command", readReply(in));
+
+            // 非 string 键：这两条的闸门在参数之后吗？实测在<b>之前</b>（参数合法就 WRONGTYPE）
+            send(socket, "HSET", "sr:h", "f", "v");
+            assertEquals(":1", readReply(in));
+            send(socket, "GETRANGE", "sr:h", "0", "1");
+            assertEquals("-WRONGTYPE Operation against a key holding the wrong kind of value", readReply(in));
+            send(socket, "SUBSTR", "sr:h", "0", "1");
+            assertEquals("-WRONGTYPE Operation against a key holding the wrong kind of value", readReply(in));
+            send(socket, "HSET", "sr:h", "big", "你好");
+            assertEquals(":1", readReply(in));
+            send(socket, "HSTRLEN", "sr:h", "big");
+            assertEquals(":6", readReply(in), "数的是字节数不是字符数");
+            send(socket, "HSTRLEN", "sr:h", "nosuch");
+            assertEquals(":0", readReply(in), "缺字段回 0，不是 nil");
+            send(socket, "HSTRLEN", "sr:nokey", "f");
+            assertEquals(":0", readReply(in), "缺键同样回 0");
+            send(socket, "HSTRLEN", "sr:h");
+            assertEquals("-ERR wrong number of arguments for 'hstrlen' command", readReply(in));
+            send(socket, "HSTRLEN", "sr:hello", "f");
+            assertEquals("-WRONGTYPE Operation against a key holding the wrong kind of value", readReply(in));
+
+            // SETRANGE：偏移 → 类型 → 长度，三档各回一句
+            send(socket, "LPUSH", "sr:l", "a");
+            assertEquals(":1", readReply(in));
+            send(socket, "SETRANGE", "sr:l", "-5", "x");
+            assertEquals("-ERR offset is out of range", readReply(in), "负的偏移先于类型闸门");
+            send(socket, "SETRANGE", "sr:l", "-9223372036854775808", "x");
+            assertEquals("-ERR offset is out of range", readReply(in));
+            send(socket, "SETRANGE", "sr:l", "abc", "x");
+            assertEquals("-ERR value is not an integer or out of range", readReply(in));
+            send(socket, "SETRANGE", "sr:l", "0", "x");
+            assertEquals("-WRONGTYPE Operation against a key holding the wrong kind of value", readReply(in));
+            send(socket, "LLEN", "sr:l");
+            assertEquals(":1", readReply(in), "四类失败都不许动到列表本体");
+
+            send(socket, "SETRANGE", "sr:fresh", "3", "x");
+            assertEquals(":4", readReply(in), "缺键时按零补齐到偏移");
+            send(socket, "EXISTS", "sr:fresh");
+            assertEquals(":1", readReply(in));
+            send(socket, "GETRANGE", "sr:fresh", "0", "-1");
+            assertEquals("\u0000\u0000\u0000x", readReply(in), "补齐的那三段是 0x00");
+            send(socket, "SETRANGE", "sr:hello", "5", "World");
+            assertEquals(":10", readReply(in));
+            send(socket, "GET", "sr:hello");
+            assertEquals("HelloWorld", readReply(in));
+            send(socket, "SETRANGE", "sr:hello", "1", "ey");
+            assertEquals(":10", readReply(in), "原地替换不改长度");
+            send(socket, "GET", "sr:hello");
+            assertEquals("HeyloWorld", readReply(in));
+            send(socket, "SETRANGE", "sr:hello", "5", "abc");
+            assertEquals(":10", readReply(in));
+
+            // 512MB 那一档在分配之前拒：这四条必须一条堆都不吃
+            send(socket, "SETRANGE", "sr:hello", "600000000", "x");
+            assertEquals("-ERR string exceeds maximum allowed size (512MB)", readReply(in));
+            send(socket, "SETRANGE", "sr:hello", "2000000000", "x");
+            assertEquals("-ERR string exceeds maximum allowed size (512MB)", readReply(in));
+            send(socket, "SETRANGE", "sr:hello", "2147483647", "x");
+            assertEquals("-ERR string exceeds maximum allowed size (512MB)", readReply(in));
+            // 这一条在参考实现里直接把 4.0.9 打崩（长度检查用加法，绕回负数后放行）。
+            // 本实现用减法问"还剩多少地方"，所以回的是同一句错而不是把连接弄断。
+            send(socket, "SETRANGE", "sr:hello", "9223372036854775807", "x");
+            assertEquals("-ERR string exceeds maximum allowed size (512MB)", readReply(in),
+                    "int64 上界的偏移不许把长度检查绕过去");
+            send(socket, "PING");
+            assertEquals("+PONG", readReply(in), "越界的偏移不能把服务器打死");
+            send(socket, "STRLEN", "sr:hello");
+            assertEquals(":10", readReply(in), "被拒的大偏移不许留下任何补齐");
+
+            // SETRANGE 不动 TTL（实测 200 → 200）
+            send(socket, "SETEX", "sr:ttl", "200", "v");
+            assertEquals("+OK", readReply(in));
+            send(socket, "SETRANGE", "sr:ttl", "0", "x");
+            assertEquals(":1", readReply(in));
+            send(socket, "TTL", "sr:ttl");
+            String ttl = readReply(in);
+            assertTrue(ttl.startsWith(":") && Long.parseLong(ttl.substring(1)) > 150,
+                    "SETRANGE 之后 TTL 要还在: " + ttl);
+        } finally {
+            server.stop();
+            thread.join(DEADLINE_MS);
+        }
+    }
+
+    /**
+     * 两族浮点：同一台机器上的两套算术，加同一个数给出两个答案。
+     * <p>
+     * {@code INCRBYFLOAT} / {@code HINCRBYFLOAT} 这一族在 x86-64 上算的是 80 位 long double，
+     * {@code 0.1 + 0.2} 回 {@code 0.3}；{@code ZADD} / {@code ZINCRBY} 那一族算的是 64 位 double，
+     * 同一道加法回 {@code 0.30000000000000004}（ref19 实测，两行都在同一个实例上量到）。
+     * 十进制溢出的口子也只开在一族上：分数一族 {@code 1e4000} 直接
+     * {@code value is not a valid float}，长双数一族却把 4000 位整数字符串打回来
+     * （{@code %.17Lf} 打整数位，实测长度正好 4000）。
+     * <p>
+     * 更细的一条是<b>非有限值的政策</b>：{@code incrbyfloatCommand} 在算完之后显式挡
+     * {@code NaN}/{@code Infinity}，而 {@code hincrbyfloatCommand} 没有那一步 —— 于是
+     * {@code HINCRBYFLOAT h f -inf} 把 "-inf" 原样写进字段，{@code -inf} 再加 {@code inf}
+     * 写出 "-nan"，下一次读它时以 {@code hash value is not a float} 拒绝（ref12 / ref13）。
+     */
+    @Test
+    void theTwoFloatFamiliesShareArithmeticButNotTheNonFinitePolicy() throws Exception {
+        int port = freePort();
+        RedisServer server = new RedisServer("127.0.0.1", port, 0);
+        Thread thread = startAndWait(server, port);
+        try (Socket socket = connect(port)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+
+            // ---- 长双数一族：INCRBYFLOAT
+            send(socket, "INCRBYFLOAT", "ibf:f", "0.1");
+            assertEquals("0.1", readReply(in), "缺键时从 0 起算，回复的就是增量");
+            send(socket, "INCRBYFLOAT", "ibf:f", "0.2");
+            assertEquals("0.3", readReply(in), "double 里算是 0.30000000000000004");
+            send(socket, "INCRBYFLOAT", "ibf:f", "1e21");
+            assertEquals("1000000000000000000000", readReply(in));
+            send(socket, "INCRBYFLOAT", "ibf:f", "-0.5");
+            assertEquals("1000000000000000000000", readReply(in), "小于格点间距的增量加不进去");
+            send(socket, "INCRBYFLOAT", "ibf:f", "inf");
+            assertEquals("-ERR increment would produce NaN or Infinity", readReply(in));
+            send(socket, "GET", "ibf:f");
+            assertEquals("1000000000000000000000", readReply(in), "被挡下的增量不许动原值");
+            send(socket, "INCRBYFLOAT", "ibf:f", "1e99999999999");
+            assertEquals("-ERR value is not a valid float", readReply(in));
+
+            // 需要还原二进制网格才算对的四例：整数位超过 64 位有效位
+            send(socket, "SET", "ibf:grid", "12345678901234567890123");
+            assertEquals("+OK", readReply(in));
+            send(socket, "INCRBYFLOAT", "ibf:grid", "0");
+            assertEquals("12345678901234567889920", readReply(in));
+            send(socket, "SET", "ibf:pi", "3.141592653589793238462643383279");
+            assertEquals("+OK", readReply(in));
+            send(socket, "INCRBYFLOAT", "ibf:pi", "0");
+            assertEquals("3.14159265358979324", readReply(in));
+            send(socket, "SET", "ibf:tiny", "1e-17");
+            assertEquals("+OK", readReply(in));
+            send(socket, "INCRBYFLOAT", "ibf:tiny", "0");
+            assertEquals("0.00000000000000001", readReply(in));
+            send(socket, "SET", "ibf:tiny2", "2.5e-17");
+            assertEquals("+OK", readReply(in));
+            send(socket, "INCRBYFLOAT", "ibf:tiny2", "0");
+            assertEquals("0.00000000000000002", readReply(in));
+            // strtold 认十六进制浮点文本
+            send(socket, "SET", "ibf:hex", "0x1p3");
+            assertEquals("+OK", readReply(in));
+            send(socket, "INCRBYFLOAT", "ibf:hex", "0");
+            assertEquals("8", readReply(in));
+            send(socket, "INCRBYFLOAT", "ibf:hex", "1");
+            assertEquals("9", readReply(in));
+            // 库里存的就是 "9"（INCRBYFLOAT 的返回值与写入值同串），所以 APPEND 后长度是 2
+            send(socket, "APPEND", "ibf:hex", "x");
+            assertEquals(":2", readReply(in));
+            send(socket, "INCRBYFLOAT", "ibf:hex", "1");
+            assertEquals("-ERR value is not a valid float", readReply(in), "原值读不回来时是这一句");
+
+            // 1e4000 在 long double 的射程里：4000 位整数，不是 inf
+            send(socket, "SET", "ibf:huge", "0");
+            assertEquals("+OK", readReply(in));
+            send(socket, "INCRBYFLOAT", "ibf:huge", "1e4000");
+            String huge = readReply(in);
+            assertEquals(4000, huge.length(), "回复的整数位长度实测是 4000");
+            assertTrue(huge.startsWith("9999999999999999999965463873099623784932492583506957631301508333043261"),
+                    "逐位要还原 64 位有效位的网格: " + huge.substring(0, 40));
+
+            // 类型闸门在这一族排在增量之前（实测 INCRBYFLOAT <list 键> abc → WRONGTYPE）
+            send(socket, "LPUSH", "ibf:l", "a");
+            assertEquals(":1", readReply(in));
+            send(socket, "INCRBYFLOAT", "ibf:l", "abc");
+            assertEquals("-WRONGTYPE Operation against a key holding the wrong kind of value", readReply(in));
+            send(socket, "HSET", "ibf:h0", "f", "v");
+            assertEquals(":1", readReply(in));
+            send(socket, "INCRBYFLOAT", "ibf:h0", "1");
+            assertEquals("-WRONGTYPE Operation against a key holding the wrong kind of value", readReply(in));
+
+            // ---- 分数一族：同一个加法给不同答案
+            send(socket, "ZADD", "sc:z", "0.1", "m");
+            assertEquals(":1", readReply(in));
+            send(socket, "ZINCRBY", "sc:z", "0.2", "m");
+            assertEquals("0.30000000000000004", readReply(in), "分数一族是 64 位 double 相加");
+            send(socket, "ZSCORE", "sc:z", "m");
+            assertEquals("0.30000000000000004", readReply(in), "存进去的那串与回复同一形状");
+            send(socket, "ZADD", "sc:z2", "1e4000", "m");
+            assertEquals("-ERR value is not a valid float", readReply(in),
+                    "十进制溢出在分数一族是解析失败，不是 inf");
+            send(socket, "ZADD", "sc:z2", "1e309", "m");
+            assertEquals("-ERR value is not a valid float", readReply(in));
+            send(socket, "ZADD", "sc:inf", "inf", "hi");
+            assertEquals(":1", readReply(in), "inf 是合法分数");
+            send(socket, "ZSCORE", "sc:inf", "hi");
+            assertEquals("inf", readReply(in), "回的是 inf，不是 Java 的 Infinity");
+
+            // ---- HINCRBYFLOAT：算术与 INCRBYFLOAT 同一套，非有限值的政策相反
+            send(socket, "HINCRBYFLOAT", "hf:h", "f", "0.1");
+            assertEquals("0.1", readReply(in));
+            send(socket, "HINCRBYFLOAT", "hf:h", "f", "0.2");
+            assertEquals("0.3", readReply(in));
+            send(socket, "HGET", "hf:h", "f");
+            assertEquals("0.3", readReply(in), "存进去的那串就是回复那串");
+            send(socket, "HINCRBYFLOAT", "hf:h", "f", "-inf");
+            assertEquals("-inf", readReply(in), "这一族不挡无穷，并把 -inf 原样写回字段");
+            send(socket, "HGET", "hf:h", "f");
+            assertEquals("-inf", readReply(in));
+            send(socket, "HINCRBYFLOAT", "hf:h", "f", "1");
+            assertEquals("-inf", readReply(in), "无穷加有限还是无穷");
+            send(socket, "HINCRBYFLOAT", "hf:h", "f", "inf");
+            assertEquals("-nan", readReply(in), "-inf 加 inf 是带符号的 nan（实测就是这两个字节）");
+            send(socket, "HGET", "hf:h", "f");
+            assertEquals("-nan", readReply(in));
+            send(socket, "HINCRBYFLOAT", "hf:h", "f", "1");
+            assertEquals("-ERR hash value is not a float", readReply(in),
+                    "字段里已经是 -nan 之后再碰它，回的是原值的错");
+            send(socket, "HGET", "hf:h", "f");
+            assertEquals("-nan", readReply(in), "报错的调用不改字段");
+            send(socket, "HINCRBYFLOAT", "hf:h", "f", "nan");
+            assertEquals("-ERR value is not a valid float", readReply(in),
+                    "增量先解析：同一枚坏字段，坏在增量时回的是增量的文案（ref12）");
+
+            send(socket, "HSET", "hf:bad", "f", "abc");
+            assertEquals(":1", readReply(in));
+            send(socket, "HINCRBYFLOAT", "hf:bad", "f", "1");
+            assertEquals("-ERR hash value is not a float", readReply(in));
+            send(socket, "HINCRBYFLOAT", "hf:bad", "f", "abc");
+            assertEquals("-ERR value is not a valid float", readReply(in),
+                    "两边都坏时报增量那一边（ref14）");
+
+            // 1e4932 在射程边缘：两下相加越过 LDBL_MAX 就回 inf
+            send(socket, "HSET", "hf:max", "f", "1e4932");
+            assertEquals(":1", readReply(in));
+            send(socket, "HINCRBYFLOAT", "hf:max", "f", "1e4932");
+            assertEquals("inf", readReply(in));
+            send(socket, "HSET", "hf:min", "f", "-1e4932");
+            assertEquals(":1", readReply(in));
+            send(socket, "HINCRBYFLOAT", "hf:min", "f", "-1e4932");
+            assertEquals("-inf", readReply(in));
+
+            // 一定失败的调用不许在库里留下空 hash（实测 EXISTS 0、DBSIZE 0）
+            send(socket, "HINCRBYFLOAT", "hf:none", "f", "1e99999");
+            assertEquals("-ERR value is not a valid float", readReply(in));
+            send(socket, "EXISTS", "hf:none");
+            assertEquals(":0", readReply(in));
+            send(socket, "TYPE", "hf:none");
+            assertEquals("+none", readReply(in));
+            // 增量先解析、键的类型后判：实测 HINCRBYFLOAT <string 键> f abc → 增量的错
+            send(socket, "SET", "hf:str", "v");
+            assertEquals("+OK", readReply(in));
+            send(socket, "HINCRBYFLOAT", "hf:str", "f", "abc");
+            assertEquals("-ERR value is not a valid float", readReply(in));
+            send(socket, "HINCRBYFLOAT", "hf:str", "f", "1");
+            assertEquals("-WRONGTYPE Operation against a key holding the wrong kind of value", readReply(in));
+            send(socket, "GET", "hf:str");
+            assertEquals("v", readReply(in));
+            send(socket, "HINCRBYFLOAT", "hf:h", "x", "1e4000");
+            String hashHuge = readReply(in);
+            assertEquals(4000, hashHuge.length(), "这一族写进 hash 的也是 4000 位整数");
+        } finally {
+            server.stop();
+            thread.join(DEADLINE_MS);
+        }
+    }
+
+    /**
+     * ZADD 的文法与报错先后 —— 每一档都有 ref8 / ref9 / ref16 / ref17 的行号作凭。
+     * <p>
+     * 先后本身就是被测的判据之一：{@code NX XX} 的互斥排在"数对不够"之后、排在
+     * {@code INCR 只许一对}之前（{@code NX XX INCR 1 a 2 b} 回的是互斥那句），
+     * 而<b>所有</b>分数解析又排在类型闸门之前
+     * （{@code ZADD <string 键> 1 a abc b} 回 {@code value is not a valid float}）。
+     */
+    @Test
+    void zaddGrammarAndErrorPrecedenceMatchTheReference() throws Exception {
+        int port = freePort();
+        RedisServer server = new RedisServer("127.0.0.1", port, 0);
+        Thread thread = startAndWait(server, port);
+        try (Socket socket = connect(port)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+
+            send(socket, "ZADD", "za:z", "1", "a");
+            assertEquals(":1", readReply(in));
+            send(socket, "ZADD", "za:z", "1", "a");
+            assertEquals(":0", readReply(in), "默认只数新增");
+            send(socket, "ZADD", "za:z", "CH", "2", "a");
+            assertEquals(":1", readReply(in), "带 CH 才算改动");
+            send(socket, "ZADD", "za:z", "CH", "2", "a");
+            assertEquals(":0", readReply(in), "分数没变，CH 也不算");
+            send(socket, "ZADD", "za:z", "NX", "9", "a");
+            assertEquals(":0", readReply(in));
+            send(socket, "ZSCORE", "za:z", "a");
+            assertEquals("2", readReply(in), "NX 挡住了改分数");
+            send(socket, "ZADD", "za:z", "XX", "3", "a");
+            assertEquals(":0", readReply(in), "XX 下改了分数也只数新增");
+            send(socket, "ZSCORE", "za:z", "a");
+            assertEquals("3", readReply(in));
+            send(socket, "ZADD", "za:z", "XX", "4", "a", "5", "b");
+            assertEquals(":0", readReply(in));
+            send(socket, "ZSCORE", "za:z", "b");
+            assertEquals("$-1", readReply(in), "XX 挡下时新成员一个都不能建");
+            send(socket, "ZCARD", "za:z");
+            assertEquals(":1", readReply(in));
+            send(socket, "ZADD", "za:z", "ch", "nx", "7", "c");
+            assertEquals(":1", readReply(in), "修饰位大小写都认");
+            send(socket, "ZADD", "za:rep", "CH", "CH", "CH", "1", "a");
+            assertEquals(":1", readReply(in), "重复的修饰位不报错");
+            send(socket, "ZCARD", "za:rep");
+            assertEquals(":1", readReply(in));
+
+            // 成员名不做浮点解释，分数栏才做
+            send(socket, "ZADD", "za:nan", "1", "nan");
+            assertEquals(":1", readReply(in));
+            send(socket, "ZSCORE", "za:nan", "nan");
+            assertEquals("1", readReply(in), "成员就叫 nan");
+            send(socket, "ZADD", "za:nan", "nan", "m2");
+            assertEquals("-ERR value is not a valid float", readReply(in));
+            send(socket, "ZADD", "za:nan", "-nan", "m3");
+            assertEquals("-ERR value is not a valid float", readReply(in));
+            send(socket, "ZADD", "za:nan", "abc", "m4");
+            assertEquals("-ERR value is not a valid float", readReply(in));
+            send(socket, "ZCARD", "za:nan");
+            assertEquals(":1", readReply(in), "三笔坏分数都没建成员");
+
+            // 修饰位只认最前面连续的一段
+            send(socket, "ZADD", "za:tail", "1", "a", "INCR");
+            assertEquals("-ERR syntax error", readReply(in));
+            send(socket, "ZADD", "za:tail", "1", "INCR", "a");
+            assertEquals("-ERR syntax error", readReply(in));
+            send(socket, "ZADD", "za:tail", "1", "a", "WEIGHTS", "2");
+            assertEquals("-ERR value is not a valid float", readReply(in),
+                    "认不出的 token 落回分数栏，于是死于浮点解析而不是 syntax error");
+            send(socket, "ZADD", "za:tail", "1", "a", "2");
+            assertEquals("-ERR syntax error", readReply(in), "数对不成双");
+            send(socket, "ZADD", "za:tail", "1");
+            assertEquals("-ERR wrong number of arguments for 'zadd' command", readReply(in));
+            send(socket, "ZADD", "za:tail", "INCR");
+            assertEquals("-ERR wrong number of arguments for 'zadd' command", readReply(in));
+            send(socket, "ZADD", "za:tail", "CH");
+            assertEquals("-ERR wrong number of arguments for 'zadd' command", readReply(in),
+                    "只剩选项没有数对时，参考实现回的是 arity 而不是 syntax error");
+
+            // NX/XX 互斥：排在数对之后、INCR 之前，且报错时整条命令不落库
+            send(socket, "ZADD", "za:mx", "NX", "XX", "abc", "m");
+            assertEquals("-ERR XX and NX options at the same time are not compatible", readReply(in));
+            send(socket, "ZADD", "za:mx", "XX", "NX", "1", "a");
+            assertEquals("-ERR XX and NX options at the same time are not compatible", readReply(in));
+            send(socket, "ZADD", "za:mx", "NX", "XX", "INCR", "1", "a");
+            assertEquals("-ERR XX and NX options at the same time are not compatible", readReply(in));
+            send(socket, "ZADD", "za:mx", "INCR", "NX", "XX", "1", "a", "2", "b");
+            assertEquals("-ERR XX and NX options at the same time are not compatible", readReply(in));
+            send(socket, "ZADD", "za:mx", "NX", "XX");
+            assertEquals("-ERR syntax error", readReply(in), "数对不够那一档排在互斥之前");
+            send(socket, "EXISTS", "za:mx");
+            assertEquals(":0", readReply(in), "四笔互斥错都不该把键建出来");
+
+            // INCR：分数栏是增量，回 bulk；被 NX/XX 挡下回 nil
+            send(socket, "ZADD", "za:incr", "INCR", "1", "a");
+            assertEquals("1", readReply(in));
+            send(socket, "ZADD", "za:incr", "incr", "2", "a");
+            assertEquals("3", readReply(in));
+            send(socket, "ZADD", "za:incr", "INCR", "NX", "9", "a");
+            assertEquals("$-1", readReply(in), "NX 挡下时回 nil 而不是 0");
+            send(socket, "ZADD", "za:incr", "INCR", "XX", "5", "a");
+            assertEquals("8", readReply(in));
+            send(socket, "ZADD", "za:incr", "INCR", "1", "a", "2", "b");
+            assertEquals("-ERR INCR option supports a single increment-element pair", readReply(in));
+            send(socket, "ZADD", "za:incr", "INCR", "1");
+            assertEquals("-ERR syntax error", readReply(in));
+            send(socket, "ZADD", "za:fresh", "INCR", "CH", "5", "nosuch");
+            assertEquals("5", readReply(in), "CH 不改 INCR 的算术，缺成员照样从 0 起算");
+            send(socket, "ZSCORE", "za:fresh", "nosuch");
+            assertEquals("5", readReply(in));
+
+            // 分数解析排在类型闸门之前，而且是<b>整串</b>数对解析完才去碰键
+            send(socket, "SET", "za:str", "v");
+            assertEquals("+OK", readReply(in));
+            send(socket, "ZADD", "za:str", "abc", "a");
+            assertEquals("-ERR value is not a valid float", readReply(in));
+            send(socket, "ZADD", "za:str", "1e4000", "a");
+            assertEquals("-ERR value is not a valid float", readReply(in));
+            send(socket, "ZADD", "za:str", "1", "a", "abc", "b");
+            assertEquals("-ERR value is not a valid float", readReply(in),
+                    "第一对合法也不许先去碰键");
+            send(socket, "ZADD", "za:str", "1", "a");
+            assertEquals("-WRONGTYPE Operation against a key holding the wrong kind of value", readReply(in));
+            send(socket, "GET", "za:str");
+            assertEquals("v", readReply(in));
+            send(socket, "ZINCRBY", "za:str", "abc", "m");
+            assertEquals("-ERR value is not a valid float", readReply(in));
+            send(socket, "ZINCRBY", "za:str", "nan", "m");
+            assertEquals("-ERR value is not a valid float", readReply(in));
+            send(socket, "ZINCRBY", "za:str", "1e4000", "m");
+            assertEquals("-ERR value is not a valid float", readReply(in));
+            send(socket, "ZINCRBY", "za:str", "1", "m");
+            assertEquals("-WRONGTYPE Operation against a key holding the wrong kind of value", readReply(in));
+            send(socket, "ZINCRBY", "za:nokey", "1.5", "x");
+            assertEquals("1.5", readReply(in));
+            send(socket, "ZINCRBY", "za:nokey", "-0", "x");
+            assertEquals("1.5", readReply(in), "减 0 不改分数");
+
+            // 结果不是数：Redis 在算完之后判 nan，此时集合没动过
+            send(socket, "ZADD", "za:inf", "inf", "m");
+            assertEquals(":1", readReply(in));
+            send(socket, "ZINCRBY", "za:inf", "-inf", "m");
+            assertEquals("-ERR resulting score is not a number (NaN)", readReply(in));
+            send(socket, "ZSCORE", "za:inf", "m");
+            assertEquals("inf", readReply(in), "NaN 那一步之前不落库");
+            send(socket, "ZINCRBY", "za:inf", "nan", "m");
+            assertEquals("-ERR value is not a valid float", readReply(in));
+        } finally {
+            server.stop();
+            thread.join(DEADLINE_MS);
+        }
+    }
+
+    /**
+     * ZUNIONSTORE / ZINTERSTORE 与 MOVE —— 两件事放在一起，是因为都要"按数读回"才判得准：
+     * 前者要读目标键的内容与类型，后者要把键读到另一个库里去。
+     * <p>
+     * ZSTORE 一族的实测形状（ref2 / ref3 / ref4 / ref6 / ref7 / ref10）：
+     * 键数不是整数 → {@code value is not an integer or out of range}；是 0 或负 →
+     * {@code at least 1 input key is needed for ZUNIONSTORE/ZINTERSTORE}；键数比给的 token 多 →
+     * {@code syntax error}；{@code WEIGHTS} 少给或尾巴不认 → {@code syntax error}；权重不是浮点 →
+     * {@code weight value is not a float}（这一族独有的文案），其中 {@code nan} 与 {@code 1e4000}
+     * 都算非法而 {@code inf} 合法；{@code AGGREGATE} 只认 SUM/MIN/MAX；目标键上别的类型整个顶掉，
+     * 但目标键同时是源键时不能把 zset 那份一起清；算出来是空 → 回 0 且不留目标键。
+     * <p>
+     * MOVE 的三道判据先后同样只有对岸说得清（ref18）：库号 → 同库 → 才轮到"有没有这个键"，
+     * 三档对<b>不存在的键</b>分别回 {@code index out of range} /
+     * {@code source and destination objects are the same} / {@code 0}。
+     */
+    @Test
+    void zstoreAndCrossDbMoveFollowTheMeasuredRows() throws Exception {
+        int port = freePort();
+        RedisServer server = new RedisServer("127.0.0.1", port, 0);
+        Thread thread = startAndWait(server, port);
+        try (Socket socket = connect(port)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+
+            send(socket, "ZADD", "zs:z1", "1", "a", "2", "b");
+            assertEquals(":2", readReply(in));
+            send(socket, "ZADD", "zs:z2", "3", "b", "4", "c");
+            assertEquals(":2", readReply(in));
+            send(socket, "ZUNIONSTORE", "zs:d", "2", "zs:z1", "zs:z2");
+            assertEquals(":3", readReply(in));
+            send(socket, "ZRANGE", "zs:d", "0", "-1", "WITHSCORES");
+            assertEquals("[a, 1, c, 4, b, 5]", readReplyDeep(in), "并集是同名成员分数相加");
+            send(socket, "ZINTERSTORE", "zs:di", "2", "zs:z1", "zs:z2");
+            assertEquals(":1", readReply(in), "交集只剩 b");
+            send(socket, "ZRANGE", "zs:di", "0", "-1", "WITHSCORES");
+            assertEquals("[b, 5]", readReplyDeep(in));
+            send(socket, "ZUNIONSTORE", "zs:dmin", "2", "zs:z1", "zs:z2", "AGGREGATE", "MIN");
+            assertEquals(":3", readReply(in));
+            send(socket, "ZSCORE", "zs:dmin", "b");
+            assertEquals("2", readReply(in), "AGGREGATE MIN 取小的那个");
+            send(socket, "ZUNIONSTORE", "zs:dmax", "2", "zs:z1", "zs:z2", "AGGREGATE", "MAX");
+            assertEquals(":3", readReply(in));
+            send(socket, "ZSCORE", "zs:dmax", "b");
+            assertEquals("3", readReply(in));
+            send(socket, "ZUNIONSTORE", "zs:dw", "2", "zs:z1", "zs:z2", "WEIGHTS", "2", "3");
+            assertEquals(":3", readReply(in));
+            send(socket, "ZSCORE", "zs:dw", "b");
+            assertEquals("13", readReply(in), "2×2 + 3×3");
+
+            // 目标键被别的类型占着时要整个顶掉
+            send(socket, "SET", "zs:str", "hello");
+            assertEquals("+OK", readReply(in));
+            send(socket, "ZUNIONSTORE", "zs:str", "1", "zs:z1");
+            assertEquals(":2", readReply(in));
+            send(socket, "TYPE", "zs:str");
+            assertEquals("+zset", readReply(in), "覆盖目标键时连旧的 string 一起换掉");
+            // 目标键同时是源键时，源那一份不能被自己清掉
+            send(socket, "ZADD", "zs:self", "1", "x", "2", "y");
+            assertEquals(":2", readReply(in));
+            send(socket, "ZUNIONSTORE", "zs:self", "1", "zs:self", "WEIGHTS", "2");
+            assertEquals(":2", readReply(in));
+            send(socket, "ZRANGE", "zs:self", "0", "-1", "WITHSCORES");
+            assertEquals("[x, 2, y, 4]", readReplyDeep(in), "翻倍是在自己乘二，不是变成空集");
+            send(socket, "ZINTERSTORE", "zs:self", "1", "zs:self");
+            assertEquals(":2", readReply(in));
+            // 算出来是空 → 不留目标键
+            send(socket, "ZUNIONSTORE", "zs:empty", "1", "zs:nosuch");
+            assertEquals(":0", readReply(in));
+            send(socket, "EXISTS", "zs:empty");
+            assertEquals(":0", readReply(in), "空结果不该把目标键建出来");
+            send(socket, "ZUNIONSTORE", "zs:halfempty", "2", "zs:z1", "zs:nosuch");
+            assertEquals(":2", readReply(in), "缺的源当空集，另一份照抄");
+
+            // 参数形状与文案
+            send(socket, "ZUNIONSTORE", "zs:a", "0");
+            assertEquals("-ERR wrong number of arguments for 'zunionstore' command", readReply(in));
+            send(socket, "ZUNIONSTORE", "zs:a", "-1", "zs:z1");
+            assertEquals("-ERR at least 1 input key is needed for ZUNIONSTORE/ZINTERSTORE", readReply(in));
+            send(socket, "ZINTERSTORE", "zs:a", "-1", "zs:z1");
+            assertEquals("-ERR at least 1 input key is needed for ZUNIONSTORE/ZINTERSTORE", readReply(in));
+            send(socket, "ZUNIONSTORE", "zs:a", "x", "zs:z1");
+            assertEquals("-ERR value is not an integer or out of range", readReply(in));
+            send(socket, "ZUNIONSTORE", "zs:a", "3", "zs:z1", "zs:z2");
+            assertEquals("-ERR syntax error", readReply(in), "键数比给的 token 多");
+            send(socket, "ZUNIONSTORE", "zs:a", "1", "zs:z1", "WEIGHTS");
+            assertEquals("-ERR syntax error", readReply(in));
+            send(socket, "ZUNIONSTORE", "zs:a", "1", "zs:z1", "WEIGHTS", "2", "3");
+            assertEquals("-ERR syntax error", readReply(in), "权重比键多也吃 syntax error");
+            send(socket, "ZUNIONSTORE", "zs:a", "1", "zs:z1", "WEIGHTS", "nan");
+            assertEquals("-ERR weight value is not a float", readReply(in));
+            send(socket, "ZUNIONSTORE", "zs:a", "1", "zs:z1", "WEIGHTS", "1e4000");
+            assertEquals("-ERR weight value is not a float", readReply(in));
+            send(socket, "ZUNIONSTORE", "zs:a", "1", "zs:z1", "WEIGHTS", "x");
+            assertEquals("-ERR weight value is not a float", readReply(in));
+            send(socket, "ZUNIONSTORE", "zs:infw", "1", "zs:z1", "WEIGHTS", "inf");
+            assertEquals(":2", readReply(in), "inf 权重是合法的");
+            send(socket, "ZSCORE", "zs:infw", "a");
+            assertEquals("inf", readReply(in));
+            send(socket, "ZUNIONSTORE", "zs:a", "1", "zs:z1", "AGGREGATE", "AVG");
+            assertEquals("-ERR syntax error", readReply(in));
+            send(socket, "ZUNIONSTORE", "zs:a", "1", "zs:z1", "WITHSCORES");
+            assertEquals("-ERR syntax error", readReply(in), "尾巴上不认的 token 不静默忽略");
+            send(socket, "LPUSH", "zs:li", "a");
+            assertEquals(":1", readReply(in));
+            send(socket, "ZUNIONSTORE", "zs:a", "1", "zs:li");
+            assertEquals("-WRONGTYPE Operation against a key holding the wrong kind of value", readReply(in));
+
+            // ---- MOVE：库号 → 同库 → 存在性，之后才轮到真的搬
+            send(socket, "SET", "mv:a", "v");
+            assertEquals("+OK", readReply(in));
+            send(socket, "MOVE", "mv:nope", "abc");
+            assertEquals("-ERR index out of range", readReply(in), "库号解析不动就报 index out of range");
+            send(socket, "MOVE", "mv:nope", "16");
+            assertEquals("-ERR index out of range", readReply(in), "只有 0..15 这 16 个库");
+            send(socket, "MOVE", "mv:nope", "99999999999");
+            assertEquals("-ERR index out of range", readReply(in));
+            send(socket, "MOVE", "mv:nope", "-1");
+            assertEquals("-ERR index out of range", readReply(in));
+            send(socket, "MOVE", "mv:nope", "0");
+            assertEquals("-ERR source and destination objects are the same", readReply(in),
+                    "同库那一档排在存在性检查之前");
+            send(socket, "MOVE", "mv:nope", "3");
+            assertEquals(":0", readReply(in), "库号合法、也不是同库，才轮到源库里有没有这个键");
+            send(socket, "MOVE", "mv:a");
+            assertEquals("-ERR wrong number of arguments for 'move' command", readReply(in));
+            send(socket, "MOVE", "mv:a", "1");
+            assertEquals(":1", readReply(in));
+            send(socket, "EXISTS", "mv:a");
+            assertEquals(":0", readReply(in), "搬走之后源库里就没了");
+            send(socket, "MOVE", "mv:a", "1");
+            assertEquals(":0", readReply(in), "源库里没有时第二次搬回 0");
+            send(socket, "SELECT", "1");
+            assertEquals("+OK", readReply(in));
+            send(socket, "GET", "mv:a");
+            assertEquals("v", readReply(in), "键要落在目标库里，内容与库号一起对");
+            send(socket, "DBSIZE");
+            assertEquals(":1", readReply(in));
+            send(socket, "SELECT", "0");
+            assertEquals("+OK", readReply(in));
+
+            // 带着 TTL 搬：过期时间要跟着键走，不带跟着连接走
+            send(socket, "SETEX", "mv:t", "200", "v");
+            assertEquals("+OK", readReply(in));
+            send(socket, "MOVE", "mv:t", "2");
+            assertEquals(":1", readReply(in));
+            send(socket, "SELECT", "2");
+            assertEquals("+OK", readReply(in));
+            send(socket, "TTL", "mv:t");
+            String movedTtl = readReply(in);
+            assertTrue(movedTtl.startsWith(":") && Long.parseLong(movedTtl.substring(1)) > 150,
+                    "MOVE 之后 TTL 要跟着过去: " + movedTtl);
+            send(socket, "TYPE", "mv:t");
+            assertEquals("+string", readReply(in));
+            send(socket, "SELECT", "0");
+            assertEquals("+OK", readReply(in));
+            // 集合类型也能整键搬走（实测 hash/list/zset 三种都回 1）
+            send(socket, "HSET", "mv:h", "f", "v");
+            assertEquals(":1", readReply(in));
+            send(socket, "MOVE", "mv:h", "5");
+            assertEquals(":1", readReply(in));
+            send(socket, "EXISTS", "mv:h");
+            assertEquals(":0", readReply(in), "搬走的键在源库里不再留壳");
+            send(socket, "SELECT", "5");
+            assertEquals("+OK", readReply(in));
+            send(socket, "HGET", "mv:h", "f");
+            assertEquals("v", readReply(in));
+            send(socket, "DBSIZE");
+            assertEquals(":1", readReply(in), "库 5 里只有搬来的这一枚");
+        } finally {
+            server.stop();
+            thread.join(DEADLINE_MS);
+        }
+    }
+
+    /**
+     * 一批"文案与计数形状"的实测行：MSET / MSETNX / UNLINK / TOUCH / EXPIREAT / LPUSHX / RPUSHX。
+     * <p>
+     * 值得单独钉住的三条：
+     * <ul>
+     *   <li>MSET 一族的 arity 文案<b>两套</b>：参数不够长时是小写带引号命令名
+     *       （{@code 'mset'} / {@code 'msetnx'}），而"数对不成双"走的是另一条硬编码的
+     *       {@code wrong number of arguments for MSET} —— 大写、不带引号，而且 {@code MSETNX}
+     *       的不成双也照抄 MSET 这个名字（实测 {@code MSETNX b4:m1 a b4:x}）。</li>
+     *   <li>MSETNX 是全有全无，而"已存在"是按<b>所有类型</b>一起看的；同一次调用里键名重复
+     *       却算得过去（回 1，后写的赢）。</li>
+     *   <li>{@code LPUSHX}/{@code RPUSHX} 在键不存在时回 0 并且<b>不</b>把键建出来。</li>
+     * </ul>
+     */
+    @Test
+    void batchWordingCountsAndPushxFollowTheReference() throws Exception {
+        int port = freePort();
+        RedisServer server = new RedisServer("127.0.0.1", port, 0);
+        Thread thread = startAndWait(server, port);
+        try (Socket socket = connect(port)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+
+            send(socket, "MSET", "w:m1", "1", "w:m2", "2");
+            assertEquals("+OK", readReply(in));
+            send(socket, "MSET", "w:a", "1", "w:c");
+            assertEquals("-ERR wrong number of arguments for MSET", readReply(in),
+                    "不成双那一档是大写不带引号的原文案");
+            send(socket, "MSETNX", "w:a", "1", "w:x");
+            assertEquals("-ERR wrong number of arguments for MSET", readReply(in),
+                    "MSETNX 的不成双照抄 MSET 这个名字");
+            send(socket, "MSET", "w:a");
+            assertEquals("-ERR wrong number of arguments for 'mset' command", readReply(in));
+            send(socket, "MSET");
+            assertEquals("-ERR wrong number of arguments for 'mset' command", readReply(in));
+            send(socket, "MSETNX", "w:a");
+            assertEquals("-ERR wrong number of arguments for 'msetnx' command", readReply(in));
+            send(socket, "MSETNX", "w:m1", "9", "w:b", "9");
+            assertEquals(":0", readReply(in), "只要有一个键已存在就整笔不做");
+            send(socket, "MGET", "w:m1", "w:b");
+            assertEquals("[1, $-1]", readReplyDeep(in), "存在的那枚也不许被覆盖");
+            send(socket, "EXISTS", "w:b");
+            assertEquals(":0", readReply(in));
+            send(socket, "HSET", "w:hash", "f", "v");
+            assertEquals(":1", readReply(in));
+            send(socket, "MSETNX", "w:hash", "1", "w:other", "2");
+            assertEquals(":0", readReply(in), "\"已存在\"是按所有类型一起看的");
+            send(socket, "EXISTS", "w:other");
+            assertEquals(":0", readReply(in));
+            send(socket, "MSETNX", "w:n1", "a", "w:n1", "b");
+            assertEquals(":1", readReply(in), "同一次调用里键名重复算得过去");
+            send(socket, "MGET", "w:n1");
+            assertEquals("[b]", readReplyDeep(in), "重复时后写的赢");
+            send(socket, "DBSIZE");
+            assertEquals(":4", readReply(in), "w:m1 w:m2 w:hash w:n1（重复的键名只算一个）");
+
+            send(socket, "MSET", "w:u1", "1", "w:u2", "2", "w:u3", "3");
+            assertEquals("+OK", readReply(in));
+            send(socket, "TOUCH", "w:u1", "w:nope", "w:u1", "w:u3");
+            assertEquals(":3", readReply(in), "TOUCH 与 EXISTS 同一把尺，重复键重复计");
+            send(socket, "TOUCH", "w:nope1", "w:nope2");
+            assertEquals(":0", readReply(in));
+            send(socket, "TOUCH");
+            assertEquals("-ERR wrong number of arguments for 'touch' command", readReply(in));
+            send(socket, "UNLINK", "w:u1", "w:u2", "w:nope");
+            assertEquals(":2", readReply(in), "UNLINK 的计数与 DEL 相同");
+            send(socket, "EXISTS", "w:u1", "w:u2");
+            assertEquals(":0", readReply(in), "多键 EXISTS 回的是\"存在几枚\"的计数，不是逐键数组");
+            send(socket, "EXISTS", "w:u3", "w:nope");
+            assertEquals(":1", readReply(in), "计数与 TOUCH 同一把尺");
+            send(socket, "ZADD", "w:zz", "1", "a");
+            assertEquals(":1", readReply(in));
+            send(socket, "UNLINK", "w:zz");
+            assertEquals(":1", readReply(in), "zset 键也能 UNLINK");
+            send(socket, "UNLINK");
+            assertEquals("-ERR wrong number of arguments for 'unlink' command", readReply(in));
+
+            // EXPIREAT / PEXPIREAT
+            send(socket, "SET", "w:exp", "v");
+            assertEquals("+OK", readReply(in));
+            send(socket, "EXPIREAT", "w:exp", "946684800");
+            assertEquals(":1", readReply(in), "时刻已过 → 1，且当场就把键删掉");
+            send(socket, "EXISTS", "w:exp");
+            assertEquals(":0", readReply(in));
+            send(socket, "SET", "w:future", "v");
+            assertEquals("+OK", readReply(in));
+            send(socket, "EXPIREAT", "w:future", "4000000000");
+            assertEquals(":1", readReply(in));
+            send(socket, "TTL", "w:future");
+            String farTtl = readReply(in);
+            assertTrue(farTtl.startsWith(":") && Long.parseLong(farTtl.substring(1)) > 2_209_500_000L,
+                    "时刻在远未来时 TTL 要照它算（实测 2209587794 量级）: " + farTtl);
+            send(socket, "EXPIREAT", "w:nope", "4102444800");
+            assertEquals(":0", readReply(in), "不存在的键回 0");
+            send(socket, "EXPIREAT", "w:future", "abc");
+            assertEquals("-ERR value is not an integer or out of range", readReply(in));
+            send(socket, "EXPIREAT", "w:future", "1e10");
+            assertEquals("-ERR value is not an integer or out of range", readReply(in));
+            send(socket, "EXPIREAT", "w:future", "1", "XX");
+            assertEquals("-ERR wrong number of arguments for 'expireat' command", readReply(in));
+            send(socket, "PEXPIREAT", "w:future", "4102444800000");
+            assertEquals(":1", readReply(in));
+            // 已知偏差一条：4.0.9 在 LLONG_MAX 上自己溢出，答成"已经过期"；本实现饱和到
+            // 远未来。这一例钉的是<b>我们</b>的行为，不是对岸的 —— 差异写进 README 的偏差清单。
+            send(socket, "EXPIREAT", "w:future", "9223372036854775807");
+            assertEquals(":1", readReply(in), "本实现把秒→毫秒饱和，不回对岸的溢出结果");
+            send(socket, "EXISTS", "w:future");
+            assertEquals(":1", readReply(in));
+
+            // LPUSHX / RPUSHX
+            send(socket, "RPUSHX", "w:nolist", "v");
+            assertEquals(":0", readReply(in));
+            send(socket, "EXISTS", "w:nolist");
+            assertEquals(":0", readReply(in), "键不存在时回 0 并且不把键建出来");
+            send(socket, "LPUSHX", "w:nolist", "v");
+            assertEquals(":0", readReply(in));
+            send(socket, "TYPE", "w:nolist");
+            assertEquals("+none", readReply(in));
+            send(socket, "LPUSH", "w:l", "a");
+            assertEquals(":1", readReply(in));
+            send(socket, "LPUSHX", "w:l", "v1", "v2");
+            assertEquals(":3", readReply(in));
+            send(socket, "LRANGE", "w:l", "0", "-1");
+            assertEquals("[v2, v1, a]", readReplyDeep(in), "多值时逐个压头，最后一个在最前");
+            send(socket, "RPUSHX", "w:l", "r1", "r2");
+            assertEquals(":5", readReply(in));
+            send(socket, "LRANGE", "w:l", "0", "-1");
+            assertEquals("[v2, v1, a, r1, r2]", readReplyDeep(in), "RPUSHX 按给定顺序接到尾部");
+            send(socket, "LPUSHX", "w:l");
+            assertEquals("-ERR wrong number of arguments for 'lpushx' command", readReply(in));
+            send(socket, "SET", "w:str", "v");
+            assertEquals("+OK", readReply(in));
+            send(socket, "LPUSHX", "w:str", "x");
+            assertEquals("-WRONGTYPE Operation against a key holding the wrong kind of value", readReply(in));
+            send(socket, "HSTRLEN", "w:l", "f");
+            assertEquals("-WRONGTYPE Operation against a key holding the wrong kind of value", readReply(in));
+        } finally {
+            server.stop();
+            thread.join(DEADLINE_MS);
+        }
+    }
+
     // ==================== helpers ====================
 
     /** 从 CLIENT LIST 的文本里按对端端口取出某条连接那一行；找不到返回 null。 */
@@ -1100,6 +2100,25 @@ class RedisServerProtocolSemanticsTest {
             return sb.append(']').toString();
         }
         return readBody(in, line);
+    }
+
+    /**
+     * 连 RESP 的类型前缀一起读一个值：MONITOR 那类"形状本身就是判据"的用例需要分清
+     * 服务器推的是 {@code +} 还是 {@code $}，而 {@link #readReply} 会把 bulk 的前缀吃掉。
+     */
+    private static String readWireReply(DataInputStream in) throws IOException {
+        String line = readLine(in);
+        if (line.startsWith("$")) {
+            int length = Integer.parseInt(line.substring(1));
+            if (length < 0) {
+                return line;
+            }
+            byte[] payload = new byte[length];
+            in.readFully(payload);
+            in.readFully(new byte[2]);
+            return "$" + new String(payload, StandardCharsets.UTF_8);
+        }
+        return line;
     }
 
     private static String readBody(DataInputStream in, String line) throws IOException {
