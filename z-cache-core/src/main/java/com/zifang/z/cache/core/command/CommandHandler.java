@@ -2414,6 +2414,31 @@ public class CommandHandler {
         return StreamIdFormat.parse(text, 0L, true) == null ? invalidStreamId() : null;
     }
 
+    /**
+     * stream 族自己的类型闸门 —— 上游把这一问摊在<b>每一条</b> stream 命令的取键之后：
+     * {@code XRANGE} :1377、{@code XLEN} :1402、{@code XREAD/XREADGROUP} :1500、
+     * {@code XGROUP} :1830、{@code XACK} :1971、{@code XPENDING} :2043、{@code XDEL} :2417、
+     * {@code XTRIM} :2462、{@code XINFO} :2554，而 {@code XADD} 藏在
+     * {@code streamTypeLookupWriteOrCreate} :1128-1138 里（键已存在且不是 stream 就回
+     * {@code wrongtypeerr}，不会顺手把流建上去）。
+     * <p>
+     * 我们没挂这道闸的代价是量出来的（250 上 {@code battery53} 第 4/5/6 行，对
+     * {@code z-cache-server} 的 jar）：{@code SET t53:str hello} 之后
+     * {@code XADD t53:str 1-1 f v} 回 {@code "1-1"} 成功，紧接着 {@code GET} 仍回
+     * {@code "hello"}、{@code XRANGE} 回那条流条目 —— 同一个键名下并存两种类型，
+     * {@code TYPE} 只报其中一种。这正是 1.3.5 给另外五族补 WRONGTYPE 时要修的那个形状，
+     * stream 族是最后一扇开着的门。
+     * <p>
+     * 判据只问"这枚键名被别的类型占着吗"：{@link MemoryStore#typeOfDb} 看不见 StreamStore，
+     * 所以反方向（{@code GET <stream 键>} 该回 WRONGTYPE 而不是 nil）要先把 stream 接进键空间，
+     * 那是另一件事，见 CHANGELOG 的已知边界。
+     */
+    private RespError streamTypeConflict(String key) {
+        return store.typeOfDb(currentDb, key) == MemoryStore.DataType.NONE
+                ? null
+                : RespError.wrongType("Operation against a key holding the wrong kind of value");
+    }
+
     private Object handleXadd(String[] args) {
         if (streams() == null) return RespError.of("ERR", "Stream not configured");
         if (args.length < 4) return RespError.wrongNumberOfArguments("XADD");
@@ -2460,6 +2485,12 @@ public class CommandHandler {
             id = StreamIdFormat.format(parsedId[0], parsedId[1]);
         }
 
+        // 取键排在参数与 0-0 之后、写入之前（上游 :1300 调
+        // {@code streamTypeLookupWriteOrCreate}，那句 wrongtype 在 :1135）：键已被别的类型占着
+        // 时既不能把流建上去，也不能像之前那样让"参数都合法"这件事骗过闸门。
+        RespError conflict = streamTypeConflict(key);
+        if (conflict != null) return conflict;
+
         Map<String, String> fields = new LinkedHashMap<>();
         while (i + 1 < args.length) {
             fields.put(args[i], args[i + 1]);
@@ -2499,6 +2530,10 @@ public class CommandHandler {
     private Object handleXlen(String[] args) {
         if (streams() == null) return RespError.of("ERR", "Stream not configured");
         if (args.length != 2) return RespError.wrongNumberOfArguments("XLEN");
+        // 键不在回 :0（:1401 的 lookupKeyReadOrReply 给 shared.czero），
+        // 键被别的类型占着回 WRONGTYPE（:1402）。
+        RespError conflict = streamTypeConflict(args[1]);
+        if (conflict != null) return conflict;
         return RespInteger.of((int) streams().xlen(currentDb, args[1]));
     }
 
@@ -2527,6 +2562,11 @@ public class CommandHandler {
             count = intArg(args[5]);
         }
 
+        // 取键排在两端 ID 与 COUNT 都解析完之后（上游 :1376），所以坏 ID 永远比类型先说话，
+        // 而 {@code XRANGE <string 键> - +} 必须是 WRONGTYPE 而不是空表。
+        RespError conflict = streamTypeConflict(key);
+        if (conflict != null) return conflict;
+
         List<StreamEntry> entries = reverse
                 ? streams().xrevrange(currentDb, key, end, start, count)
                 : streams().xrange(currentDb, key, start, end, count);
@@ -2547,6 +2587,10 @@ public class CommandHandler {
         if (args.length < 3) return RespError.wrongNumberOfArguments("XDEL");
         String[] ids = new String[args.length - 2];
         System.arraycopy(args, 2, ids, 0, ids.length);
+        // 取键在 ID 体检之前（:2416 先 lookupKeyWriteOrReply + checkType，:2425 才逐条 parse）：
+        // {@code XDEL <string 键> 坏ID} 上游回 WRONGTYPE，不回"ID 非法"。
+        RespError conflict = streamTypeConflict(args[1]);
+        if (conflict != null) return conflict;
         // 先把每个 ID 都判一遍再动手删（上游 t_stream.c:2420-2427 那段 sanity check）：
         // 否则 "XDEL k 1-1 坏ID" 删掉一半才报错，命令半执行。
         for (String id : ids) {
@@ -2568,6 +2612,10 @@ public class CommandHandler {
     private Object handleXtrim(String[] args) {
         if (streams() == null) return RespError.of("ERR", "Stream not configured");
         if (args.length < 4) return RespError.wrongNumberOfArguments("XTRIM");
+        // 上游 :2461 先取键（不在回 :0、别的类型回 WRONGTYPE），才去解析 MAXLEN 那串选项，
+        // 所以类型这一问排在"策略位认不认得"之前。
+        RespError conflict = streamTypeConflict(args[1]);
+        if (conflict != null) return conflict;
         if (!"MAXLEN".equalsIgnoreCase(args[2])) {
             return RespError.of("ERR", "unsupported XTRIM strategy '" + args[2] + "', only MAXLEN is implemented");
         }
@@ -2616,6 +2664,11 @@ public class CommandHandler {
         for (int k = 0; k < numKeys; k++) {
             keys[k] = args[i + k];
             String text = args[i + numKeys + k];
+            // :1499-1500：解析每一个位置时先 lookupKeyRead + checkType，且 goto cleanup 让整条
+            // 命令作废 —— 类型这一问排在下面那两个特例位之前，所以坏键名不会被"位置写法不对"
+            // 这种无关的抱怨抢答。
+            RespError conflict = streamTypeConflict(keys[k]);
+            if (conflict != null) return conflict;
             Object rejected = rejectStreamIdInRead(text, false);
             if (rejected != null) return rejected;
             // `$` 不是"整条流"，是这条流当前的位置：上游 :1527-1533 取的是 s->last_id，
@@ -2676,6 +2729,10 @@ public class CommandHandler {
         for (int k = 0; k < numKeys; k++) {
             keys[k] = args[i + k];
             positions[k] = args[i + numKeys + k];
+            // 与 XREAD 同一问、同一位置（:1500），只是这里紧跟其后的还有"键或组在不在"那一问，
+            // 顺序是先类型后 NOGROUP。
+            RespError conflict = streamTypeConflict(keys[k]);
+            if (conflict != null) return conflict;
             // 以前这一位一个字都不判：坏 ID 走到 StreamStore 里被当成 0-0，于是
             // "XREADGROUP GROUP g c STREAMS k abc" 回了整段历史（实测 battery50:21）。
             Object rejected = rejectStreamIdInRead(positions[k], true);
@@ -2725,6 +2782,13 @@ public class CommandHandler {
         if (streams() == null) return RespError.of("ERR", "Stream not configured");
         if (args.length < 2) return RespError.wrongNumberOfArguments("XGROUP");
         String sub = args[1].toUpperCase(Locale.ROOT);
+        // :1828-1831：只要键名给到了（argc>=4），就先问一次类型，且这一问排在"键在不在"
+        // 与"组在不在"之前 —— 否则 {@code XGROUP DESTROY <string 键> g} 会被答成 ":0"，
+        // 让客户端以为动过一台其实不相干的键。
+        if (args.length >= 4) {
+            RespError conflict = streamTypeConflict(args[2]);
+            if (conflict != null) return conflict;
+        }
         switch (sub) {
             case "CREATE": {
                 if (args.length < 5) return RespError.wrongNumberOfArguments("XGROUP CREATE");
@@ -2769,6 +2833,12 @@ public class CommandHandler {
         if (args.length < 4) return RespError.wrongNumberOfArguments("XACK");
         String[] ids = new String[args.length - 3];
         System.arraycopy(args, 3, ids, 0, ids.length);
+        // 上游把"取键 → 问类型 → 找组"整段排在逐条 parse ID 之前（:1969-1979 对 :1982 的循环），
+        // 于是键不在、组不在都是干脆的 :0，坏 ID 那句要等到确实要动账了才轮得到说话。
+        RespError conflict = streamTypeConflict(args[1]);
+        if (conflict != null) return conflict;
+        com.zifang.z.cache.core.stream.Stream acked = streams().getStream(currentDb, args[1]);
+        if (acked == null || acked.getGroup(args[2]) == null) return RespInteger.of(0);
         for (String id : ids) {
             if (StreamIdFormat.parse(id, 0L, true) == null) return invalidStreamId();
         }
@@ -2789,6 +2859,11 @@ public class CommandHandler {
         if (args.length > 3) {
             return RespError.of("ERR", "XPENDING detail form (IDLE / start / end / count) is not supported");
         }
+
+        // :2043 的 checkType 排在 :2047 那句 NOGROUP 之前：键被别的类型占着时不能说
+        // "没有这个键或组"，那是把类型错误伪装成不存在。
+        RespError pendingConflict = streamTypeConflict(args[1]);
+        if (pendingConflict != null) return pendingConflict;
 
         Object[] summary = streams().xpending(currentDb, args[1], args[2]);
         if (summary == null) {
@@ -2823,6 +2898,10 @@ public class CommandHandler {
     private Object handleXinfo(String[] args) {
         if (streams() == null) return RespError.of("ERR", "Stream not configured");
         if (args.length < 3) return RespError.wrongNumberOfArguments("XINFO");
+        // :2553-2555 是三个子命令共用的一问（键不在给 nokeyerr，类型不对给 WRONGTYPE），
+        // 所以它必须排在分发之前，而不是散在每个 case 里各自漏一次。
+        RespError infoConflict = streamTypeConflict(args[2]);
+        if (infoConflict != null) return infoConflict;
         String sub = args[1].toUpperCase(Locale.ROOT);
         switch (sub) {
             case "GROUPS": {

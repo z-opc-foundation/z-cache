@@ -1183,6 +1183,155 @@ class RedisServerProtocolSemanticsTest {
     }
 
     /**
+     * stream 族同样守"一个键名只有一种类型"，而且守门的是<b>每一条</b>命令取键的那一问。
+     * <p>
+     * 上游不是一个总闸，而是把 {@code checkType} 摊在十二处（{@code t_stream.c} 5.0.14：
+     * {@code XRANGE} :1377、{@code XLEN} :1402、{@code XREAD/XREADGROUP} :1500、
+     * {@code XGROUP} :1830、{@code XACK} :1970、{@code XPENDING} :2043、{@code XDEL} :2417、
+     * {@code XTRIM} :2462、{@code XINFO} :2554，{@code XADD} 在
+     * {@code streamTypeLookupWriteOrCreate} :1128-1138 里）—— 少一处就开一扇门。
+     * 修之前开的正是 {@code XADD} 那一扇：250 实测 {@code battery53} 第 4/5/6 行，
+     * {@code SET t53:str hello} 之后 {@code XADD t53:str 1-1 f v} 回 {@code "1-1"} 成功，
+     * {@code GET} 仍回 {@code "hello"}、{@code XRANGE} 回那条流条目，同一个键名下两种类型并存。
+     * <p>
+     * 这一族<b>没有参照实例</b>可实测（250 上的 redis 4.0.9 连 {@code XADD} 都不认，每一行都回
+     * {@code -ERR unknown command 'XADD'}），所以判序一律按上面那份源码行号，
+     * 下面每一支断言旁边都写清了是谁先说话。
+     */
+    @Test
+    void streamFamilyHoldsTheSameOneTypeInvariant() throws Exception {
+        int port = freePort();
+        RedisServer server = new RedisServer("127.0.0.1", port, 0);
+        Thread thread = startAndWait(server, port);
+        try (Socket socket = connect(port)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+
+            // 五种类型各占一枚键名，另备一枚真流键 —— 闸门要是只会一律拒绝，下面的阳性对照就红了
+            send(socket, "SET", "sem:ty:string", "hello");
+            assertEquals("+OK", readReply(in));
+            send(socket, "HSET", "sem:ty:hash", "f", "v");
+            assertEquals(":1", readReply(in));
+            send(socket, "LPUSH", "sem:ty:list", "x");
+            assertEquals(":1", readReply(in));
+            send(socket, "SADD", "sem:ty:set", "x");
+            assertEquals(":1", readReply(in));
+            send(socket, "ZADD", "sem:ty:zset", "1", "x");
+            assertEquals(":1", readReply(in));
+
+            send(socket, "XADD", "sem:ty:stream", "1-1", "a", "1");
+            assertEquals("1-1", readReply(in));
+            send(socket, "XGROUP", "CREATE", "sem:ty:stream", "g", "0-0");
+            assertEquals("+OK", readReply(in));
+            send(socket, "XREADGROUP", "GROUP", "g", "c1", "STREAMS", "sem:ty:stream", ">");
+            assertEquals("[[sem:ty:stream, [[1-1, [a, 1]]]]]", readReplyDeep(in));
+
+            // ---- 阳性对照：这些命令在流键上都要真办成事 ----
+            send(socket, "XLEN", "sem:ty:stream");
+            assertEquals(":1", readReply(in));
+            send(socket, "XRANGE", "sem:ty:stream", "-", "+");
+            assertEquals("[[1-1, [a, 1]]]", readReplyDeep(in));
+            send(socket, "XREVRANGE", "sem:ty:stream", "+", "-");
+            assertEquals("[[1-1, [a, 1]]]", readReplyDeep(in));
+            send(socket, "XADD", "sem:ty:stream", "2-2", "b", "2");
+            assertEquals("2-2", readReply(in));
+            send(socket, "XDEL", "sem:ty:stream", "2-2");
+            assertEquals(":1", readReply(in));
+            send(socket, "XTRIM", "sem:ty:stream", "MAXLEN", "10");
+            assertEquals(":0", readReply(in));
+            send(socket, "XACK", "sem:ty:stream", "g", "1-1");
+            assertEquals(":1", readReply(in));
+            send(socket, "XPENDING", "sem:ty:stream", "g");
+            assertFalse(readReplyDeep(in).startsWith("-"), "汇总形态在流键上合法");
+            send(socket, "XINFO", "STREAM", "sem:ty:stream");
+            assertTrue(readReplyDeep(in).contains("length"), "XINFO STREAM 在流键上合法");
+            send(socket, "XINFO", "GROUPS", "sem:ty:stream");
+            assertTrue(readReplyDeep(in).contains("g"), "XINFO GROUPS 在流键上合法");
+            send(socket, "XINFO", "CONSUMERS", "sem:ty:stream", "g");
+            assertTrue(readReplyDeep(in).contains("c1"), "XINFO CONSUMERS 在流键上合法");
+            send(socket, "XGROUP", "CREATECONSUMER", "sem:ty:stream", "g", "c9");
+            assertEquals(":1", readReply(in));
+            send(socket, "XGROUP", "DELCONSUMER", "sem:ty:stream", "g", "c9");
+            assertEquals(":1", readReply(in));
+            send(socket, "XGROUP", "DESTROY", "sem:ty:stream", "g");
+            assertEquals(":1", readReply(in));
+            send(socket, "XREAD", "STREAMS", "sem:ty:stream", "0-0");
+            assertEquals("[[sem:ty:stream, [[1-1, [a, 1]]]]]", readReplyDeep(in));
+
+            // ---- 负判据：12 处取键一处都不许漏，五种类型逐个键名扫一遍 ----
+            for (String family : new String[]{"string", "hash", "list", "set", "zset"}) {
+                String held = "sem:ty:" + family;
+                expectWrongType(socket, in, "XLEN", held);
+                expectWrongType(socket, in, "XRANGE", held, "-", "+");
+                expectWrongType(socket, in, "XREVRANGE", held, "+", "-");
+                expectWrongType(socket, in, "XADD", held, "9-9", "f", "v");
+                expectWrongType(socket, in, "XDEL", held, "1-1");
+                expectWrongType(socket, in, "XTRIM", held, "MAXLEN", "1");
+                expectWrongType(socket, in, "XACK", held, "g", "1-1");
+                expectWrongType(socket, in, "XPENDING", held, "g");
+                expectWrongType(socket, in, "XINFO", "STREAM", held);
+                expectWrongType(socket, in, "XINFO", "GROUPS", held);
+                expectWrongType(socket, in, "XINFO", "CONSUMERS", held, "g");
+                expectWrongType(socket, in, "XGROUP", "CREATE", held, "g", "0-0");
+                expectWrongType(socket, in, "XGROUP", "DESTROY", held, "g");
+                expectWrongType(socket, in, "XGROUP", "CREATECONSUMER", held, "g", "c");
+                expectWrongType(socket, in, "XGROUP", "DELCONSUMER", held, "g", "c");
+                expectWrongType(socket, in, "XREAD", "STREAMS", held, "0-0");
+                expectWrongType(socket, in, "XREADGROUP", "GROUP", "g", "c", "STREAMS", held, "0-0");
+                expectWrongType(socket, in, "XREADGROUP", "GROUP", "g", "c", "STREAMS", held, ">");
+            }
+
+            // 拦下来不等于顺手写进去：五种类型原来的值一个字节都没被 stream 命令动过
+            send(socket, "GET", "sem:ty:string");
+            assertEquals("hello", readReply(in), "XADD 被挡下时不能把流建在 string 键名下");
+            send(socket, "HGET", "sem:ty:hash", "f");
+            assertEquals("v", readReply(in));
+            send(socket, "LLEN", "sem:ty:list");
+            assertEquals(":1", readReply(in));
+            send(socket, "SISMEMBER", "sem:ty:set", "x");
+            assertEquals(":1", readReply(in));
+            send(socket, "ZCARD", "sem:ty:zset");
+            assertEquals(":1", readReply(in));
+
+            // ---- 判序：同一枚坏键名，谁先说话由源码行号定，不是由"哪个检查写在前头"定 ----
+            // XRANGE 的取键排在两端 ID 之后（:1356 解析 → :1377 才 lookup）
+            send(socket, "XRANGE", "sem:ty:string", "not-an-id", "+");
+            assertEquals("-ERR Invalid stream ID specified as stream command argument", readReply(in),
+                    "坏 ID 要先说话，闸门不能抢答成类型问题");
+            // XDEL 正好相反：:2416 取键 → :2425 才逐条体检 ID
+            expectWrongType(socket, in, "XDEL", "sem:ty:string", "not-an-id");
+            // XADD 的 0-0 闸在取键之前（:1293 对 :1300）
+            send(socket, "XADD", "sem:ty:string", "0-0", "f", "v");
+            assertEquals("-ERR The ID specified in XADD must be greater than 0-0", readReply(in));
+            // XTRIM 的取键排在选项解析之前（:2461），所以坏策略位轮不到说话
+            expectWrongType(socket, in, "XTRIM", "sem:ty:string", "MINID", "3");
+            // XPENDING 是先问类型再问组（:2043 对 :2047）：不能把类型错误伪装成"组不存在"
+            expectWrongType(socket, in, "XPENDING", "sem:ty:string", "nosuchgroup");
+            // XREADGROUP 也是先问类型（:1500），那句 "$ 在 XREADGROUP 里没意义" 排在它后面
+            expectWrongType(socket, in, "XREADGROUP", "GROUP", "g", "c", "STREAMS", "sem:ty:string", "$");
+            // 组不在的 XACK 干脆回 :0，坏 ID 那句排在取组之后（:1976 对 :1982）
+            send(socket, "XACK", "sem:ty:stream", "nosuchgroup", "not-an-id");
+            assertEquals(":0", readReply(in));
+
+            // 多键命令里一枚坏键作废整条（:1500 的 goto cleanup）：好键那份结果不许先交出去
+            expectWrongType(socket, in, "XREAD", "STREAMS", "sem:ty:string", "sem:ty:stream", "0-0", "0-0");
+            send(socket, "XREAD", "STREAMS", "sem:ty:stream", "sem:ty:stream", "0-0", "0-0");
+            assertEquals("[[sem:ty:stream, [[1-1, [a, 1]]]], [sem:ty:stream, [[1-1, [a, 1]]]]]",
+                    readReplyDeep(in), "阳性对照：两枚好键确实各回一份，上面那一问不是空跑");
+        } finally {
+            server.stop();
+            thread.join(DEADLINE_MS);
+        }
+    }
+
+    /** 把一条 stream 命令打出去，断言它被取键那一问的类型闸门挡下（同一句 WRONGTYPE 原文）。 */
+    private static void expectWrongType(Socket socket, DataInputStream in, String... cmd)
+            throws IOException {
+        send(socket, cmd);
+        assertEquals("-WRONGTYPE Operation against a key holding the wrong kind of value",
+                readReply(in), "键被别的类型占着时必须挡下: " + String.join(" ", cmd));
+    }
+
+    /**
      * {@code RENAME} 是"目标键整个被源键顶掉"，不是"把源键并进目标键"。
      * <p>
      * {@code handleRename} 的五条类型分支里，只有 String 那一条走 {@code setDb}（会经
