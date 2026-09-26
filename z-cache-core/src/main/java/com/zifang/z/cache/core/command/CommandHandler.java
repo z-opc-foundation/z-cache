@@ -2441,48 +2441,62 @@ public class CommandHandler {
 
     private Object handleXadd(String[] args) {
         if (streams() == null) return RespError.of("ERR", "Stream not configured");
-        if (args.length < 4) return RespError.wrongNumberOfArguments("XADD");
+        // 先吃命令表的 arity：5.0.14 `server.c :314` 是 `{"xadd",xaddCommand,-5,…}`，也就是
+        // **至少五个字**（`XADD key ID f v`），而那句是命令表那一形的 `'xadd' command`。
+        // 手写的 arity 检查（t_stream.c :1283-1287）在 argc ≥ 5 之前根本到不了，所以
+        // `XADD k 5-5 a`（四个字）答的不是那句裸句。
+        if (args.length < 5) return RespError.wrongNumberOfArguments("XADD");
 
         String key = args[1];
+        // 上游的默认是 -1（:1240），我们的 store 那层沿用的是"0 = 不裁剪"（StreamStore.xadd 的
+        // 注释），这一支不动它，只把 MAXLEN 0 的语义差记进 CHANGELOG 的已知边界。
         long maxLen = 0;
-        int i = 2;
-
-        // 解析 MAXLEN [~|=] count —— 与 XTRIM 同一套形状。以前只认 "MAXLEN 5" 和 "MAXLEN ~ 5"，
-        // 于是 Redis 合法的 "MAXLEN = 5" 抛出未捕获的 NumberFormatException，
-        // 客户端拿到的是 "-ERR internal error: For input string: \"=\""；"MAXLEN" 少了 count
-        // 更是直接越界取 args[i]。
-        if ("MAXLEN".equalsIgnoreCase(args[i])) {
-            if (i + 1 >= args.length) return RespError.wrongNumberOfArguments("XADD");
-            i++;
-            if ("~".equals(args[i]) || "=".equals(args[i])) {
-                if (i + 1 >= args.length) return RespError.wrongNumberOfArguments("XADD");
-                i++;
-            }
-            try {
-                maxLen = longArg(args[i]);
-            } catch (NumberFormatException e) {
-                return RespError.notAnInteger();
-            }
-            if (maxLen < 0) return RespError.of("ERR", "MAXLEN requires a non-negative integer");
-            i++;
-            if (i >= args.length) return RespError.wrongNumberOfArguments("XADD");
-        }
-
-        String id = args[i++];
+        String id = null;
         long[] parsedId = null;
-        if (i + 1 > args.length || (args.length - i) % 2 != 0) {
-            return RespError.of("ERR", "XADD needs at least one field value pair");
-        }
-        if (!"*".equals(id)) {
-            // XADD 走 strict（单独的 "-" / "+" 在这里是非法 ID，上游 :1276），缺 seq 补 0；
-            // 交回客户端的写法由数值反推（"05-1" echo 成 "5-1"），和 addReplyStreamID 一致。
-            parsedId = StreamIdFormat.parse(id, 0L, true);
-            if (parsedId == null) return invalidStreamId();
-            if (parsedId[0] == 0L && parsedId[1] == 0L) {
-                // 上游 :1293：提前挡掉 0-0，否则会出现"建了流又插不进去"的空键。
-                return RespError.of("ERR", "The ID specified in XADD must be greater than 0-0");
+
+        // 上游是一圈"要么是选项、要么就是 ID"的扫描（:1248-1280），三件事都由它决定：
+        // `*` 是快路径直接 break（:1251-1254）；MAXLEN **只有后面还跟着字时才算选项**
+        // （:1255 的 moreargs），否则它自己就落进 :1274-1276 那一支被当成 ID 去 strict 解析
+        // （于是 `XADD k MAXLEN bad-id 1` 回的是那句 invalid stream ID）；ID 那一支 break 之后
+        // 才轮到 arity（:1283-1287，**裸句** `wrong number of arguments for XADD`）与 0-0
+        // （:1292-1295）。以前这里是一串按位置写死的 if，于是"ID 坏"排在"字段数不齐"之后说话，
+        // 而 `MAXLEN = n` 与 `MAXLEN ~ n` 的 `=`/`~` 只在恰好那一格才被认。
+        int i = 2;
+        for (; i < args.length; i++) {
+            int moreargs = args.length - 1 - i;
+            if ("*".equals(args[i])) {
+                id = "*"; // 自动 ID 由 store 那层生成
+                break;
             }
-            id = StreamIdFormat.format(parsedId[0], parsedId[1]);
+            if ("MAXLEN".equalsIgnoreCase(args[i]) && moreargs >= 1) {
+                if (moreargs >= 2 && ("~".equals(args[i + 1]) || "=".equals(args[i + 1]))) i++;
+                Long ml = RedisIntegerFormat.parse(args[i + 1]);
+                if (ml == null) return RespError.notAnInteger();
+                // :1268-1271 那句原文（XTRIM :2491-2494 是同一句）。
+                if (ml.longValue() < 0) return RespError.of("ERR", "The MAXLEN argument must be >= 0.");
+                maxLen = ml.longValue();
+                i++;
+            } else {
+                // XADD 走 strict（单独的 "-" / "+" 在这里是非法 ID，上游 :1276），缺 seq 补 0；
+                // 交回客户端的写法由数值反推（"05-1" echo 成 "5-1"），和 addReplyStreamID 一致。
+                parsedId = StreamIdFormat.parse(args[i], 0L, true);
+                if (parsedId == null) return invalidStreamId();
+                id = StreamIdFormat.format(parsedId[0], parsedId[1]);
+                break;
+            }
+        }
+
+        int fieldPos = i + 1;
+        int pairs = args.length - fieldPos;
+        if (pairs < 2 || (pairs % 2) == 1) {
+            // :1284-1286。这一句与上面命令表那句**不同形**：上游这里写的是 `addReplyError(c,
+            // "wrong number of arguments for XADD")`，大写、没有 `'…' command`。
+            return RespError.of("ERR", "wrong number of arguments for XADD");
+        }
+        if (parsedId != null && parsedId[0] == 0L && parsedId[1] == 0L) {
+            // 上游 :1292-1295 排在 arity **之后**（`XADD k 0-0 a 1 b` 吃的是上面那句裸句），
+            // 而且要提前挡掉：否则会出现"建了流又插不进去"的空键。
+            return RespError.of("ERR", "The ID specified in XADD must be greater than 0-0");
         }
 
         // 取键排在参数与 0-0 之后、写入之前（上游 :1300 调
@@ -2492,10 +2506,7 @@ public class CommandHandler {
         if (conflict != null) return conflict;
 
         Map<String, String> fields = new LinkedHashMap<>();
-        while (i + 1 < args.length) {
-            fields.put(args[i], args[i + 1]);
-            i += 2;
-        }
+        for (int f = fieldPos; f + 1 < args.length; f += 2) fields.put(args[f], args[f + 1]);
 
         // 两道单调性闸都排在写入之前（上游 :1304 那句，以及 streamAppendItem 的 EDOM → :1315），
         // 而且只 peek 不 create：新键的表顶是 0-0，而 0-0 在上面就被挡掉了，所以任何收到的
@@ -2631,24 +2642,41 @@ public class CommandHandler {
      */
     private Object handleXtrim(String[] args) {
         if (streams() == null) return RespError.of("ERR", "Stream not configured");
-        if (args.length < 4) return RespError.wrongNumberOfArguments("XTRIM");
-        // 上游 :2461 先取键（不在回 :0、别的类型回 WRONGTYPE），才去解析 MAXLEN 那串选项，
-        // 所以类型这一问排在"策略位认不认得"之前。
-        RespError conflict = streamTypeConflict(args[1]);
+        // 命令表 arity 是 -2（`server.c :327`），所以只有光杆 `XTRIM` 吃那句命令表形状的 arity；
+        // `XTRIM k` 是**能进函数**的，它的下场在下面那一圈之后（:2507-2510）。
+        if (args.length < 2) return RespError.wrongNumberOfArguments("XTRIM");
+
+        String key = args[1];
+        // 取键排在选项解析之前（:2459-2462 的 `lookupKeyWriteOrReply(…, shared.czero)`）：
+        // 键不在回 :0（且不建键），被别的类型占着回 WRONGTYPE —— 两问都排在"这个字认不认得、
+        // 值对不对"之前，所以 `XTRIM <不在> MAXLEN abc` 与 `XTRIM <string 键> FOO` 也各自先答。
+        RespError conflict = streamTypeConflict(key);
         if (conflict != null) return conflict;
-        if (!"MAXLEN".equalsIgnoreCase(args[2])) {
-            return RespError.of("ERR", "unsupported XTRIM strategy '" + args[2] + "', only MAXLEN is implemented");
+        if (streams().getStream(currentDb, key) == null) return RespInteger.of(0);
+
+        long maxLen = -1;
+        boolean trimmed = false;
+        for (int i = 2; i < args.length; i++) {
+            int moreargs = args.length - 1 - i;
+            if ("MAXLEN".equalsIgnoreCase(args[i]) && moreargs >= 1) {
+                if (moreargs >= 2 && ("~".equals(args[i + 1]) || "=".equals(args[i + 1]))) i++;
+                Long ml = RedisIntegerFormat.parse(args[i + 1]);
+                if (ml == null) return RespError.notAnInteger();
+                if (ml.longValue() < 0) return RespError.of("ERR", "The MAXLEN argument must be >= 0.");
+                maxLen = ml.longValue();
+                trimmed = true;
+                i++;
+            } else {
+                // :2497-2499：认不得的字一律 `ERR syntax error`（以前这里回的是自己编的
+                // "unsupported XTRIM strategy …"，而 arity 句抢在了它前面）。
+                return RespError.syntaxError();
+            }
         }
-        int idx = "~".equals(args[3]) || "=".equals(args[3]) ? 4 : 3;
-        if (idx != args.length - 1) return RespError.syntaxError();
-        long maxLen;
-        try {
-            maxLen = longArg(args[idx]);
-        } catch (NumberFormatException e) {
-            return RespError.notAnInteger();
+        if (!trimmed) {
+            // :2507-2510：一个裁剪选项都没给，而键是在的。
+            return RespError.of("ERR", "XTRIM called without an option to trim the stream");
         }
-        if (maxLen < 0) return RespError.of("ERR", "MAXLEN requires a non-negative integer");
-        return RespInteger.of((int) streams().xtrim(currentDb, args[1], maxLen));
+        return RespInteger.of((int) streams().xtrim(currentDb, key, maxLen));
     }
 
     /**

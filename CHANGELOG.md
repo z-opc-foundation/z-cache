@@ -459,6 +459,83 @@ All notable changes to z-cache will be documented in this file.
   `internal error: Cannot load from long array because "startId" is null`，见 `CommandHandler.java:481-483`）
   —— 这两道闸同时是"不漏 JVM 文本"那一族的闸，与前面 stream ID 那一节同源。
 
+#### XADD / XTRIM 的那一圈扫描：`XADD` 有**两种** arity 句，而 `XTRIM` 的取键排在选项**之前**
+
+- **先说哪一形 arity 句**（`src/server.c :314`、`:327`，从官方 `redis-5.0.14.tar.gz` 里读的，
+  md5 `3b67522ee336aec9c6e26441a30194e0` 那份 `t_stream.c` 同一棵树）：命令表写的是
+  `{"xadd",xaddCommand,-5,…}` 与 `{"xtrim",xtrimCommand,-2,…}`。`-5` 意味着
+  `XADD key ID f v` 是**最短的能进函数的一形**，四个字（`XADD k 5-5 a`）在进函数之前就被命令表
+  拦下，答的是表那一形 `-ERR wrong number of arguments for 'xadd' command`；进得了函数之后，
+  `t_stream.c :1284-1286` 那句 `addReplyError(c,"wrong number of arguments for XADD")` 是
+  **裸句、大写、没有 `'…' command`**。`xtrim` 的 `-2` 反过来：`XTRIM k` 进得来，它的下场是
+  :2507-2510 那句 `XTRIM called without an option to trim the stream`，只有光杆 `XTRIM` 吃表那一形。
+  我们改前把这两种形状混成了一个（`battery58` 的 `:9 :32 :35 :38 :39 :42` 六行都回
+  `for 'xadd' command` / `for 'xtrim' command`），而且自造了一句 `XADD needs at least one field value
+  pair` 顶在裸句的位置上。
+- **XADD 的那一圈**（:1248-1280）决定三件事，都不是按位置写死的：`*` 是快路径直接 break
+  （:1251-1254）；**`MAXLEN` 只在后面还有字时才算选项**（:1255 的 `&& moreargs`），否则它自己
+  落进 :1274-1276 那一支被当成 ID 去 strict 解析 —— 于是 `XADD k MAXLEN bad-id 1` 答的是
+  invalid stream ID 而不是别的；`~` / `=` 只在 `moreargs >= 2` 才被吃掉那一格（:1259-1264），
+  所以 `XTRIM k MAXLEN ~` 的 `~` 在字数耗尽时**不被吃**，直接拿去 `getLongLongFromObjectOrReply`
+  （:1265/:2488）而回那句 not-an-integer（`battery58:40` 改前后正是反的）。圈结束后才是
+  `field_pos = i+1`（:1281）→ arity（:1284）→ **0-0 那一问（:1292-1295）**→ 取键
+  （:1300 的 `streamTypeLookupWriteOrCreate`，WRONGTYPE 在 :1135）。
+  **所以 0-0 排在 arity 之后**：`XADD k 0-0 a 1 b 2 3` 字段数是 3（奇数），:1284 先答，
+  而 `XADD k 0-0 a 1` 才轮到那句 must be greater than 0-0。这两行各钉一条断言（`:2991`、`:2994`）。
+- **XTRIM 是反的，别顺手统一**：`lookupKeyWriteOrReply(c, argv[1], shared.czero)` + `checkType`
+  排在选项解析**之前**（:2461-2462）。于是"键不在"根本问不着值 ——
+  `XTRIM <不在> MAXLEN abc`、`XTRIM <不在> FOO`、`XTRIM <不在> MAXLEN -1` 一律 `:0`
+  （那是 :2461 的第三个实参 `shared.czero`，语义是"删了 0 条"）；被 String 占着的键
+  `XTRIM <str> FOO` 一律 WRONGTYPE。改前这五行（`battery58:33 :34 :35 :38` 与 `:31` 的光杆）
+  全都先吃了参数那一问。同一圈的 `MAXLEN` 那一支与 XADD 逐字同形（:2477-2496，同一句
+  `The MAXLEN argument must be >= 0.` 在 :2491-2494），认不得的字一律 `shared.syntaxerr`
+  （:2498）—— 我们改前在这里回的是自造的 `unsupported XTRIM strategy. Use MAXLEN`。
+- **改前逐行实测**（`battery58.pre` 对 `battery58.post`，46 行）翻 **16** 行：
+  `:9 :10 :11 :12 :13`（arity 两形与那句自造裸句、`bad-id a 1 b` 的判序）、`:16 :19`
+  （MAXLEN 负数那句原文，XADD 两侧）、`:32`（`XTRIM k` 退成 arity 句）、`:33 :34 :35`
+  （键不在该 `:0` 而各自答了值错/arity）、`:38`（`XTRIM <str> FOO` 该 WRONGTYPE）、
+  `:39 :40 :41 :42`（`MAXLEN` 裸尾该 syntax error、`MAXLEN ~` 该 not-an-integer、
+  负数该原文、`FOO` 该 syntax error）。两侧各 `wrote=46 lost=none`（`battery58_replay.log`）。
+  **没动的 30 行是这一支的对照组**：`:1-:8` 的正常写入与 `MAXLEN = 2` 真裁一刀（`:27` 仍 `:2`）、
+  `:14 :15 :17 :18`（0-0 那一句、`MAXLEN 5` 的正常收）、`:28 :29`（`MAXLEN 0`，见下面那条已知边界）、
+  `:36 :37`（键不在 + `~ 1`、String 键 + 合法选项）、`:43`（`MAXLEN 2 5` 的多余字）、
+  `:44 :45 :46`（真裁一刀 `:1`、`XLEN :2`、`GET` 仍 `hello` —— 闸门不改写字节）。
+- **收口时我先错过一次**：多 field 条目的答复形状我按"每对再套一层"写了期望，当场红。
+  读上游 `:985-1009` 才确认 `addReplyMultiBulkLen(c, numfields*2)`（:1000）交的是**平铺的 2n 个数**，
+  红的是断言不是代码，我们的字节本来是对的那一方（`RedisServerProtocolSemanticsTest.java:3033-3037`
+  把这段记在注释里）。
+- **回归**：`xaddAndXtrimOptionCircleAnswersInUpstreamOrder`
+  （`RedisServerProtocolSemanticsTest.java:2935-3044`）—— 两组阳性对照（多 field 收、`MAXLEN = 2` 真裁到
+  `XLEN :2`）、arity 两形四行、MAXLEN 值三行（负数原文 ×2、`abc`）、"被拒的 XADD 不建键"
+  （:2981-2984 的 `XLEN sem:xcnew` → `:0`，就是上游 :1289-1291 那段注释要防的事）、
+  XADD 判序三行、XTRIM 取键四行、XTRIM 三种"认不得"五行、收尾真裁一刀加 `GET`。
+  全量 `mvn -o -B clean test`：**358 + 381 + 134 + 2 = 875，failures/errors/skipped 全 0**
+  （`b58_full2.log`，core 一档从 380 抬到 381）。
+  **第一遍是红的，而且红的不是新用例**（`b58_full.log`：`Tests run: 381, Failures: 2`）——
+  两处红都在 1.3.5 那轮《XADD / XTRIM 的 MAXLEN 参数形状不合 Redis》写的断言上
+  （下面两处行号取自 `b58_full.log` 的栈，属重钉前那份文件）：
+  `xtrimTakesTheRedisArgumentShape:322` 钉的是 `XTRIM k MAXLEN` 回 arity 句（上游回 syntax err），
+  `errorRepliesCannotForgeAnExtraLine:1680` 钉的是 `XTRIM <从未创建的键> <怪 token>` 回错误
+  （上游取键在先，那一格是 `:0`）。**旧断言把旧行为钉成了"不许改回去"**，所以这一支必须连它
+  一起重钉（见上面那条已知边界里的重钉记录），不能靠删断言变绿：四条重钉后各自仍断"要么错要么原文"，
+  而且给那个报错载体补了一条阳性对照（先 `XADD err:trim 1-1 a 1` 必须回 `1-1` ——
+  判"报错形状不能劈帧"的那一格不能落在一个根本不存在的键上，否则它量的不是同一件事）。
+- **13 支具名变异，13 支全部点名判红**（`code_mut.py R`，R1-R13；打之前先在干净树上跑阳性对照，
+  `b58_test1.log` 里 `Tests run: 1, Failures: 0`，快照 `7f335e12df7d6cab175c0e38cee40505` 逐支还原对账）。
+  R1 入口 arity 松到四个字、R2 XTRIM 入口摘到 `< 1`、R3 裸句退成命令表那一形、
+  R4 XTRIM 的 `moreargs` 闸摘掉、R5 XADD 不吃 `~`/`=`、R6/R7 两处的 MAXLEN 负数句各退成自造句、
+  R8 0-0 挪到 arity 之前、R9 字段数奇偶不查、R10 无选项退成 arity 句、R11 认不得的字退成自造句、
+  R12 取键两问整块挪到选项之后、R13 类型闸与键不在互换。
+  三条要说清楚：
+  - **R2/R4 的红消息是兜底 catch 的 JVM 文本**（`-ERR internal error: Index …out of bounds…`），
+    与上一节 Q5/Q10 同源 —— 这两道入口闸同时是"不漏 JVM 文本"那一族的闸。
+  - **R5 红的位置与我预期的不同**：我以为摘掉 `~`/`=` 那一行会让 `XADD k MAXLEN = 2 6-6 d 4`
+    把 `=` 当 ID 解析而回 invalid stream ID，实测回的是 `-ERR value is not an integer or out of
+    range`（`=` 落进了 `MAXLEN` 的**值**那一格）。两支都该红，但 CHANGELOG 只按实测的这句写。
+  - **R13 证明"取键那一问"内部也有可观测的先后**：被 String 占着的键在 store 那一层
+    `getStream` 同样返回 null，所以"键不在"与"类型不对"换一下顺序就会把 WRONGTYPE 答成 `:0`
+    —— 这一对不是那种"结构上等价的变异"，是独立可观测的（`battery58:38` 也翻这一行）。
+
 ### Added
 - `RedisServer.serverScope()`：只读拿到本台那一份，测试与嵌入式据此判断作用域边界。
 - `StreamIdFormat`（z-cache-common）：stream ID 的唯一文法（uint64 两段、`-` / `+` 两种位置、
@@ -575,6 +652,18 @@ All notable changes to z-cache will be documented in this file.
   由 jar `4e447b61…`（工作树）量得，两侧各 `wrote=27 lost=none` 记在 `count_replay.log`，
   且与更早的 `pre3` / `post3` 逐字节相同（同一对 jar 重放两遍一致才算数）。
   两份 jar 都留了副本（`jar_postfix.whl`、`jar_countfix`），因为 `mvn clean` 会删掉 `target` 里那枚。
+- `XADD / XTRIM` 这一支的电池 `battery58.txt` 46 行（`:1` PING、`:2-:4` 建流、`:5-:44` 判据、
+  `:45 :46` 收尾核 `XLEN`/`GET` 的副作用）：
+  改前 `battery58.pre`、改后 `battery58.post`，翻 16 行；本轮又把两侧各重放了一遍做可复现核对
+  （`battery58.pre2` 与 `pre` 逐字节同、`battery58.post2` 与 `post` 逐字节同，两侧仍各
+  `wrote=46 lost=none`，读数在 `b58_replay2.log`）。用的两枚 jar 都留了副本：
+  `jar_countfix`（整包 `4e447b61…`、`CommandHandler.class` 的 md5 `b9a459b4…` = HEAD `c50b7a4` 那棵树，
+  即本轮的改前面）与 `jar_xaddtrim`（整包 `7f579dc5…`、class `51b20f9a…` = 工作树
+  `7f335e12…`）。**整包 md5 只作参照不作身份**：这枚 shaded jar 不是字节可复现的（zip 时间戳会漂），
+  跨重建判同一律取 class 级 md5。
+- 量具 `code_mut.py` 从 25 支涨到 **38 支**（新增 XADD/XTRIM 那一族 R1-R13，`python3 code_mut.py R`
+  分族跑；`anchors` 现为 38 支 / 39 个锚点）。分族不换快照文件，所以 R 族打的仍是本轮工作树那份
+  （`7f335e12…`），13 支的还原行逐支回读都对得上。
 
 ### 已知边界（这一版没动，说清楚）
 - RESP3 / `HELLO`、`EVAL` / `EVALSHA` / `SCRIPT` 依旧没有服务端实现，客户端 `DistributedLock`
@@ -601,13 +690,38 @@ All notable changes to z-cache will be documented in this file.
     - ~~`XRANGE t55:ok - + COUNT 0` 与 `XREVRANGE … COUNT 0` 交出整表~~ —— **本轮已闭**
       （见上面《XRANGE 的 `COUNT` 有三种答复形状》，`battery57` 27 行实测翻 9 行）。
       那一处 `battery55:5 :7` 的读数留在这里，是为了记改前形状从哪量来的。
-    - `XADD` 的 arity 三行 `battery55:27 :28 :31` 全回 `wrong number of arguments for 'xadd' command`，
-      `:29`（`XADD t55:ok 5-5 a`，落单的值）回我们自己的 `XADD needs at least one field value pair`；
-      上游 :1284-1286 把这些都归到同一句**裸句** `wrong number of arguments for XADD`
-      （不是命令表形式的 `'xadd' command`）。
-    - `MAXLEN` 非负那一栏 `battery55:30`（XADD）与 `:34`（XTRIM）都回
+    - ~~`XADD` 的 arity 三行 `battery55:27 :28 :31` 全回 `wrong number of arguments for 'xadd' command`，
+      `:29`（`XADD t55:ok 5-5 a`，落单的值）回我们自己的 `XADD needs at least one field value pair`~~
+      —— **本轮已闭**（见上面《XADD / XTRIM 的那一圈扫描》，`battery58` 46 行实测翻 16 行）。
+      **顺带更正我上一版写在这条里的推导**：原文是"上游 :1284-1286 把这些都归到同一句**裸句**
+      `wrong number of arguments for XADD`"，这句不对 —— 读了命令表才分清，`xadd` 的 arity 是
+      `-5`（`server.c :314`），四个字的 `XADD k 5-5 a` **进不了函数**，答的是命令表那一形
+      `for 'xadd' command`；只有六个字以上（`XADD k 5-5 a 1 b`、`XADD k MAXLEN 2 5-5 a`）
+      才轮到 :1284-1286 的裸句。两种形状都存在，分界是字数，不是"哪一句更正版"。
+    - ~~`MAXLEN` 非负那一栏 `battery55:30`（XADD）与 `:34`（XTRIM）都回
       `MAXLEN requires a non-negative integer`；上游是 `The MAXLEN argument must be >= 0.`
-      （XADD :1268-1270 / XTRIM :2492）。
+      （XADD :1268-1270 / XTRIM :2492）~~ —— **本轮已闭**，两处各自换回原文并各有一支变异
+      （`code_mut.py R6` / `R7`，两支红的是不同方法里的不同断言）。
+      这一句最初是本机 1.3.5 那轮《XADD / XTRIM 的 MAXLEN 参数形状不合 Redis》引进来的，
+      本轮把那一轮的四处旧断言一起重钉（`xtrimTakesTheRedisArgumentShape` 的 `:326`、`:332`、`:337`，
+      加上 `errorRepliesCannotForgeAnExtraLine` 里那条 XTRIM 载体 `:1698`）—— 旧断言钉的是当时的行为，
+      不是上游，留着就会把修好的东西又"修"回去。
+    - **`XADD … MAXLEN 0` 与 `XTRIM … MAXLEN 0` 现在语义相反，本轮没动**（本机实测
+      `battery58:28 :29`：`XADD t58:cap3 MAXLEN 0 5-6 e 5` 回 `5-6`，紧跟的 `XLEN` 回 `:1`）。
+      上游把"没给 MAXLEN"与"给了 0"分成两个值：`maxlen` 的默认是 **-1**（:1240，注释原文
+      "If left to -1 no trimming is performed"），:1268 只挡负数，裁剪那一跳的条件是
+      `if (maxlen >= 0)`（:1327，在 :1321 答复**之后**才裁）—— 所以 0 是一个真实的裁剪值，
+      上游这条 XADD 会先交出新 ID 再把整条流清空。我们 `StreamStore.xadd` 用的是
+      `if (maxLen > 0)`（`StreamStore.java:87`，形参注释 :81 写着"0 = 不裁剪"），把 0 当成了
+      "不裁剪"的哨兵；而 `xtrim(db,key,0)` 走的是另一条路（`StreamStore.java:127` 直接
+      `stream.trim(0)`），1.3.5 那轮还专门为它写过一条"MAXLEN 0 在 Redis 里是清空"的断言。
+      **这一条是同一族里的两个哨兵没对齐**：修它要把 `xadd` 的形参换成三态（-1 = 没给 /
+      0..n = 裁剪到 n），生产侧只有一个调用点（`CommandHandler.java:2531`），但
+      `StreamTest` 里有 **7 处** 直接把 0 当"不裁剪"传进来
+      （`StreamTest.java:187 :195 :196 :205 :206 :233 :234`，逐处都要判它本意是哪个），
+      够单独一次提交，所以留到下一轮。
+      （注意依据档次：我们答 `:1` 是本机实测；"上游答 `:0`"是 :1240/:1268/:1327 的源码推导，
+      参照实例 4.0.9 根本不认 stream，这一支没有可对拍的真值。）
     - `XGROUP CREATE t55:nokey g9 0-0` 回 `+OK`（`battery55:14`）；上游 :1837-1845 要求键必须存在
       （除非带 MKSTREAM），那句是
       `The XGROUP subcommand requires the key to exist. Note that for CREATE you may want to use the MKSTREAM option…`。

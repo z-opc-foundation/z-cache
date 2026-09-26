@@ -319,13 +319,21 @@ class RedisServerProtocolSemanticsTest {
             send(socket, "XTRIM", "sem:trim", "3");
             assertTrue(readReply(in).startsWith("-"), "裸计数不是 Redis 的语法，不能裁成功");
             send(socket, "XTRIM", "sem:trim", "MAXLEN");
-            assertTrue(readReply(in).startsWith("-ERR wrong number"), "缺 count 要报 arity");
+            // 1.3.6 重钉：这一行原先断的是 "-ERR wrong number of arguments for 'xtrim' command"。
+            // 上游 xtrim 的 arity 是 -2（server.c :327），`XTRIM k MAXLEN` 进得了函数；圈的判定是
+            // `!strcasecmp(opt,"maxlen") && moreargs`（:2477），这里 moreargs=0 不成立，落进
+            // :2498 的 else 即 `shared.syntaxerr`。两句都是错，但只有 syntax error 是上游那句。
+            assertEquals("-ERR syntax error", readReply(in), "缺 count 时 moreargs 不成立，落 syntax err");
             send(socket, "XTRIM", "sem:trim", "MAXLEN", "3", "4");
             assertEquals("-ERR syntax error", readReply(in));
             send(socket, "XTRIM", "sem:trim", "MAXLEN", "-1");
-            assertEquals("-ERR MAXLEN requires a non-negative integer", readReply(in));
+            // 1.3.6 重钉：原来自造的 "MAXLEN requires a non-negative integer" 换成上游原文
+            // （XTRIM :2491-2494，XADD :1268-1271 是同一句）。
+            assertEquals("-ERR The MAXLEN argument must be >= 0.", readReply(in));
             send(socket, "XTRIM", "sem:trim", "MINID", "3");
-            assertTrue(readReply(in).startsWith("-ERR unsupported XTRIM strategy"),
+            // 1.3.6 重钉：5.0.14 根本没有 MINID 这一策略，认不得的字一律 syntax err（:2498），
+            // 而不是我们那句自造的 "unsupported XTRIM strategy"。意图不变：不能被当成 MAXLEN 蒙过去。
+            assertTrue(readReply(in).startsWith("-ERR syntax error"),
                     "没实现的策略不能当成 MAXLEN 蒙过去");
 
             // XADD 的 MAXLEN 是同一套语法。以前只认 "MAXLEN 5" / "MAXLEN ~ 5"，
@@ -1674,13 +1682,20 @@ class RedisServerProtocolSemanticsTest {
             // 走到这里说明整行是一次读干净的：文本还在同一行里，只是 CRLF 被换成了空格
             assertTrue(first.contains("+FORGED"), "只换掉 CRLF，不截断文本，实得 " + first);
 
-            // 另一个载体：XTRIM 的策略位也在报错文本里
+            // 另一个载体：XTRIM 的选项位。1.3.6 重钉 —— 上游把取键排在选项解析之前
+            // （:2461-2462 的 lookupKeyWriteOrReply(…, shared.czero)），所以这里**必须先有这枚键**，
+            // 否则 `err:trim` 不在就直接答 `:0`（那是"删了 0 条"，不是报错），这一段的载体就没意义了。
+            send(socket, "XADD", "err:trim", "1-1", "a", "1");
+            assertEquals("1-1", readReply(in), "载体要落在能报错的那一格上");
             send(socket, "XTRIM", "err:trim", "MAXLENX\r\n+FORGED2\r\n", "3");
             String second = readReply(in);
             assertTrue(second.startsWith("-"), "不认识的裁剪策略要报错，实得 " + second);
             send(socket, "PING");
             assertEquals("+PONG", readReply(in), "XTRIM 那条报错若劈开了帧，这里对不上");
-            assertTrue(second.contains("+FORGED2"), "文本保留、只洗 CRLF，实得 " + second);
+            // 1.3.6 起这一格回的是上游那句固定文本 `ERR syntax error`（:2498），**不再回显客户端
+            // 输入**，所以"文本里还带着 +FORGED2"这一问在这里没有载体了 —— 回显那一问仍由上面
+            // 那条 unknown command（消息里有命令名）钉着（:1670、:1675）。这里只留"帧不劈开"。
+            assertEquals("-ERR syntax error", second);
 
             // 数字解析的报错走的是 e.getMessage()，那串文本里带着客户端的输入。
             // 但反过来：bulk 是二进制安全的，member 里带换行完全合法，清洗只能做在
@@ -2903,6 +2918,125 @@ class RedisServerProtocolSemanticsTest {
             assertEquals(":3", readReply(in));
             send(socket, "GET", "sem:cnt:str");
             assertEquals("hello", readReply(in));
+        } finally {
+            server.stop();
+            thread.join(2000);
+        }
+    }
+
+    /**
+     * XADD / XTRIM 的那一圈"要么是选项、要么就是 ID"的扫描（上游 t_stream.c :1248-1287 与
+     * :2461-2510）。两件事在这一支里各自钉住：<b>哪一形的 arity 句</b>（命令表的
+     * {@code 'xadd' command}，对 手写的裸句 {@code for XADD}，分界是 arity -5 / -2），
+     * 以及<b>谁先说话</b>（XADD：ID → arity → 0-0；XTRIM：取键 → 选项）。
+     * 改前实测（{@code battery58.pre}，46 行）翻 <b>16</b> 行：9-13、16、19、32-35、38-42；
+     * 其余 30 行是这一支的对照组（两侧各 {@code wrote=46 lost=none}，见 {@code battery58_replay.log}）。
+     */
+    @Test
+    void xaddAndXtrimOptionCircleAnswersInUpstreamOrder() throws Exception {
+        int port = freePort();
+        RedisServer server = new RedisServer("127.0.0.1", port, 0);
+        Thread thread = startAndWait(server, port);
+        try (Socket socket = connect(port)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+
+            send(socket, "XADD", "sem:xc", "1-1", "a", "1");
+            assertEquals("1-1", readReply(in));
+            send(socket, "XADD", "sem:xc", "2-2", "b", "2");
+            assertEquals("2-2", readReply(in));
+
+            // ---- 阳性对照：合法的三种形状照旧收 ----
+            send(socket, "XADD", "sem:xc", "3-3", "c", "3", "d", "4");
+            assertEquals("3-3", readReply(in), "两组 field/value 是合法的");
+            send(socket, "XADD", "sem:capa", "1-1", "a", "1");
+            readReply(in);
+            send(socket, "XADD", "sem:capa", "2-2", "b", "2");
+            readReply(in);
+            send(socket, "XADD", "sem:capa", "3-3", "c", "3");
+            readReply(in);
+            send(socket, "XADD", "sem:capa", "MAXLEN", "=", "2", "6-6", "d", "4");
+            assertEquals("6-6", readReply(in), "MAXLEN = n 是上游认的精确裁剪写法（:1262-1264）");
+            send(socket, "XLEN", "sem:capa");
+            assertEquals(":2", readReply(in), "裁到 2 条，剩下最新的两条");
+
+            // ---- arity 的两种形状，分界是命令表的 -5（server.c :314） ----
+            send(socket, "XADD", "sem:xc");
+            assertEquals("-ERR wrong number of arguments for 'xadd' command", readReply(in),
+                    "四个字都到不了手写的 arity 检查（:1283），先吃命令表那句");
+            send(socket, "XADD", "sem:xc", "5-5", "a");
+            assertEquals("-ERR wrong number of arguments for 'xadd' command", readReply(in));
+            send(socket, "XADD", "sem:xc", "5-5", "a", "1", "b");
+            assertEquals("-ERR wrong number of arguments for XADD", readReply(in),
+                    "六个字进得来，:1284-1286 那句是裸句、大写、没有 '…' command");
+            send(socket, "XADD", "sem:xc", "MAXLEN", "2", "5-5", "a");
+            assertEquals("-ERR wrong number of arguments for XADD", readReply(in),
+                    "MAXLEN 吃掉一个位置之后字段数不足，同样是裸句");
+
+            // ---- MAXLEN 的值：负数是那一句原文 ----
+            send(socket, "XADD", "sem:xc", "MAXLEN", "-1", "5-5", "a", "1");
+            assertEquals("-ERR The MAXLEN argument must be >= 0.", readReply(in), ":1268-1271");
+            send(socket, "XADD", "sem:xc", "MAXLEN", "abc", "5-5", "a", "1");
+            assertEquals("-ERR value is not an integer or out of range", readReply(in));
+            // 被拒的 XADD 不建键（上游 :1292 那句注释就是为了这个）。
+            send(socket, "XADD", "sem:xcnew", "MAXLEN", "-1", "5-5", "a", "1");
+            assertEquals("-ERR The MAXLEN argument must be >= 0.", readReply(in));
+            send(socket, "XLEN", "sem:xcnew");
+            assertEquals(":0", readReply(in));
+
+            // ---- XADD 的判序：ID 先于 arity，arity 先于 0-0 ----
+            send(socket, "XADD", "sem:xc", "bad-id", "a", "1", "b");
+            assertEquals("-ERR Invalid stream ID specified as stream command argument",
+                    readReply(in), "六个字里字段数也是不齐的（3 个），而 ID 在那一圈里就先解析了（:1276）");
+            send(socket, "XADD", "sem:xc", "0-0", "a", "1", "b", "2", "3");
+            assertEquals("-ERR wrong number of arguments for XADD", readReply(in),
+                    "字段数不齐时轮不到 :1292 的 0-0 那一问");
+            send(socket, "XADD", "sem:xc", "0-0", "a", "1");
+            assertEquals("-ERR The ID specified in XADD must be greater than 0-0", readReply(in),
+                    " arity 过了之后才是 0-0");
+
+            // ---- XTRIM：取键排在选项之前（:2461-2462） ----
+            send(socket, "XTRIM", "sem:ghost", "MAXLEN", "abc");
+            assertEquals(":0", readReply(in), "键不在就不在，值对不对根本问不着");
+            send(socket, "XTRIM", "sem:ghost", "FOO");
+            assertEquals(":0", readReply(in));
+            send(socket, "XTRIM", "sem:ghost", "MAXLEN", "-1");
+            assertEquals(":0", readReply(in));
+            send(socket, "SET", "sem:xcstr", "hello");
+            assertEquals("+OK", readReply(in));
+            send(socket, "XTRIM", "sem:xcstr", "FOO");
+            assertEquals("-WRONGTYPE Operation against a key holding the wrong kind of value",
+                    readReply(in), "类型那一问也在选项之前");
+
+            // ---- XTRIM 的三种"认不得"，各回各的 ----
+            send(socket, "XTRIM");
+            assertEquals("-ERR wrong number of arguments for 'xtrim' command", readReply(in),
+                    "命令表 arity 是 -2（server.c :327），只有光杆吃这句");
+            send(socket, "XTRIM", "sem:xc");
+            assertEquals("-ERR XTRIM called without an option to trim the stream", readReply(in),
+                    ":2507-2510 —— 键在而没给策略，不是 arity 错");
+            send(socket, "XTRIM", "sem:xc", "MAXLEN");
+            assertEquals("-ERR syntax error", readReply(in), ":1255/:2477 的 moreargs 不成立");
+            send(socket, "XTRIM", "sem:xc", "FOO");
+            assertEquals("-ERR syntax error", readReply(in));
+            send(socket, "XTRIM", "sem:xc", "MAXLEN", "~");
+            assertEquals("-ERR value is not an integer or out of range", readReply(in),
+                    "波浪号要吃掉，值那一格才是 ~ 后面的字");
+            send(socket, "XTRIM", "sem:xc", "MAXLEN", "-1");
+            assertEquals("-ERR The MAXLEN argument must be >= 0.", readReply(in),
+                    ":2491-2494，与 XADD 同一句");
+
+            // ---- 真的裁一刀，字节还在 ----
+            send(socket, "XTRIM", "sem:xc", "MAXLEN", "1");
+            assertEquals(":2", readReply(in));
+            send(socket, "XLEN", "sem:xc");
+            assertEquals(":1", readReply(in));
+            // 这一条顺手钉住多 field 条目的形状：上游 :1000 是 `addReplyMultiBulkLen(c,
+            // numfields*2)`，即**平铺的 2n 个数**，不是 n 个二元对。我先按"每对再套一层"写了期望，
+            // 当场红 —— 红的是这条断言而不是代码，上游读下来才确认我们的字节本来就是对的那一方。
+            send(socket, "XRANGE", "sem:xc", "-", "+");
+            assertEquals("[[3-3, [c, 3, d, 4]]]", readReplyDeep(in));
+            send(socket, "GET", "sem:xcstr");
+            assertEquals("hello", readReply(in), "被闸门拦下的 XRANGE/XTRIM 不改写别的键");
         } finally {
             server.stop();
             thread.join(2000);
