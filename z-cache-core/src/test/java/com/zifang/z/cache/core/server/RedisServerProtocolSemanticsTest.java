@@ -4006,6 +4006,14 @@ class RedisServerProtocolSemanticsTest {
             assertEquals("[kt:string, kt:hash, kt:list, kt:set, kt:zset, kt:stream]", readReplyDeep(in));
             send(socket, "SCAN", "0", "COUNT", "100");
             assertEquals("[0, [kt:hash, kt:list, kt:set, kt:stream, kt:string, kt:zset]]", readReplyDeep(in));
+            // 第四把尺：INFO 的 keyspace 一行。改之前它是"第五把尺" —— 五张表各自 size() 相加，
+            // 既不算流键、也不判过期，于是这六枚键在 DBSIZE 里是 6、在 INFO 里是 5，谁都不报错。
+            send(socket, "INFO", "keyspace");
+            String keyspace = readReply(in);
+            java.util.regex.Matcher ks = java.util.regex.Pattern.compile("db0:keys=(\\d+)").matcher(keyspace);
+            assertTrue(ks.find(), "INFO 里连 db0:keys= 这一行都没有，实际: " + keyspace);
+            assertEquals(6, Integer.parseInt(ks.group(1)),
+                    "INFO 报的键数必须与 DBSIZE 是同一个数（少的那一枚是流键），实际: " + keyspace);
             // 六枚一起 DEL：改之前这一句只回 :5，流那枚既删不掉也不算数
             send(socket, "DEL", "kt:string", "kt:hash", "kt:list", "kt:set", "kt:zset", "kt:stream");
             assertEquals(":6", readReply(in));

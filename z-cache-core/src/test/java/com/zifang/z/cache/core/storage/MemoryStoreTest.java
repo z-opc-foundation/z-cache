@@ -666,4 +666,37 @@ class MemoryStoreTest {
         assertNull(fresh.getStringStore(0).get("lp:k"),
                 "值也要真的没掉（直接摸那张表，绕开所有会顺手清理的读路）");
     }
+
+    /**
+     * 枚举键的三家（DBSIZE / KEYS / SCAN）必须给同一个数。上游之所以只能给一个数：
+     * 一个键名在 {@code db->dict} 里就是一条目，{@code keysCommand} 遍历它、逐键问一句
+     * {@code keyIsExpired}（{@code db.c:552}）。
+     * <p>
+     * 以前这三家各有自己的尺：{@code dbsizeDb} 是"String 支路自己判活 + 四张表 dbsize() 加总"，
+     * 于是一枚并存键名被数两次；{@code keysDb} 不去重，同一键名回两条；而 {@code SCAN}
+     * 用 HashSet 去重，偏偏它又是活的。三种写法三个答案，谁都没被钉过。
+     */
+    @Test
+    void theThreeEnumerationsAgreeOnEveryShapeOfKeySet() throws InterruptedException {
+        MemoryStore s = new MemoryStore();
+        byte[] v = "v".getBytes(StandardCharsets.UTF_8);
+        // 旧数据形状：同一键名两张表并存（1.3.4 及之前写得出来，绕过闸门直接摆）
+        s.getStringStore(0).put("en:both", new MemoryStore.ValueWrapper(v));
+        s.getHashStore(0).hset("en:both", "f", v);
+        s.getListStore(0).rpush("en:list", v);
+        assertEquals(2L, s.dbsizeDb(0), "一枚键名只数一个，不论它落在几张表里");
+        assertEquals(2, s.keysDb(0, "*").size(), "KEYS 与 DBSIZE 必须同一个数");
+        assertEquals(2, ((java.util.List<?>) s.scan(0, "0", "*", 100)[1]).size(), "SCAN 也是同一个数");
+
+        // 到点的键：三家一起不数它，而且不许任何一家先替另一家清理
+        s.psetex("en:gone", 1, v);
+        assertEquals(3L, s.dbsizeDb(0), "前提：三枚键都还算数");
+        Thread.sleep(30);
+        assertEquals(2L, s.dbsizeDb(0), "DBSIZE 这一问自己就要把到点的键摘掉");
+        assertEquals(2, s.keysDb(0, "*").size(), "KEYS 不许还留着它");
+        assertEquals(2, ((java.util.List<?>) s.scan(0, "0", "*", 100)[1]).size(), "SCAN 也一样");
+        java.util.List<String> live = s.keysDb(0, "*");
+        assertTrue(live.contains("en:list"), "正面对照：没到点的键三家还得数得着");
+        assertFalse(live.contains("en:gone"), "到点的键不许还留在 KEYS 里");
+    }
 }

@@ -1208,15 +1208,13 @@ public class CommandHandler {
 
     private Object handleKeys(String[] args) {
         if (args.length != 2) return RespError.wrongNumberOfArguments("KEYS");
-        String pattern = args[1];
-        Set<String> allKeys = new LinkedHashSet<>(store.keysDb(currentDb, pattern));
-        allKeys.addAll(store.getHashStore(currentDb).keys());
-        allKeys.addAll(store.getListStore(currentDb).keys());
-        allKeys.addAll(store.getSetStore(currentDb).keys());
-        allKeys.addAll(store.getSortedSetStore(currentDb).keys());
-        String regex = globToRegex(pattern);
+        // 只问 store.keysDb 一把尺。以前它拿 keysDb 的结果当底，再把四张集合表**原样**加回去 ——
+        // 那四句绕过了判活那一道闸（LinkedHashSet 只去重、不筛过期），于是"到点的集合键在 KEYS
+        // 里躲不掉"。上游 keysCommand 遍历的是原始 dict，但它逐键问了一句 keyIsExpired
+        // （db.c:552）—— 两边给出的键集从此一致，且不再需要这里第二把尺。
+        Set<String> allKeys = new LinkedHashSet<>(store.keysDb(currentDb, args[1]));
         List<RespBulkString> result = new ArrayList<>();
-        for (String k : allKeys) if (k.matches(regex)) result.add(RespBulkString.of(k));
+        for (String k : allKeys) result.add(RespBulkString.of(k));
         return RespArray.of(result.stream().map(k->(Object)k).toArray());
     }
 
@@ -2001,9 +1999,10 @@ public class CommandHandler {
         if (sec == null || "KEYSPACE".equals(sec)) {
             sb.append("# Keyspace\r\n");
             for (int i = 0; i < store.getDbCount(); i++) {
-                long keys = store.getHashStore(i).dbsize() + store.getListStore(i).dbsize()
-                        + store.getSetStore(i).dbsize() + store.getSortedSetStore(i).dbsize()
-                        + store.getStringStore(i).size();
+                // 与 DBSIZE 同一把尺（store.dbsizeDb -> liveKeys）。以前这里是第五把尺：
+                // 五张表各自 size() 相加，既不算 stream 键、也不判过期，于是"INFO 说 db0 有 3 个键、
+                // DBSIZE 回 2"这种同一事实两个数的情况可以一直活着。
+                long keys = store.dbsizeDb(i);
                 if (keys > 0) {
                     sb.append("db").append(i).append(":keys=").append(keys).append("\r\n");
                 }

@@ -1266,6 +1266,59 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   补它要把 `ZCHRDB` 的 `RDB_VERSION`（`RdbPersistence.java:65`、`:70`，载入端 `:569` 版本不符直接拒读）
   抬到 2 并先定旧档怎么办。
 
+#### 枚举那四家合成一把尺 `liveKeys`；而 `INFO keyspace` 一直是第五把，它连流键都没数
+
+- `MemoryStore.liveKeys(db)` 新增：先把六张表的键名**抄**进一个 `LinkedHashSet`（顺序仍是
+  string→hash→list→set→zset→stream，所以 `KEYS` 那串的条序一个字没动），再逐个问 `typeOfDb`
+  那一把尺。两阶段是故意的 —— 反过来"一边遍历某张表一边 `remove`"就要吃"各 store 交回的是不是
+  快照"这个未知数，现在不吃。`keysDb` / `scan` / `dbsizeDb` 三家改为共用它。
+- `CommandHandler.handleKeys` 不再自己并表。以前它拿 `keysDb` 的结果当底，再把 hash / list / set /
+  zset 四张表**原样** `addAll` 回去（`LinkedHashSet` 只去重、不筛过期），那四句绕过了判活那道闸；
+  模式匹配也在协议层又做了一遍。
+- **`INFO keyspace` 是这一格里唯一"今天就数得错"的那一个**：它把五张表各自 `size()` 相加，
+  既不算流表、也不判过期。上一格把流键接成"键是键"时接了四把尺，没接这一把，于是六枚键（含一枚
+  `XADD` 出来的流键）在 `DBSIZE` 里是 6、在 `INFO` 里是 5，谁都不报错。现在它问
+  `store.dbsizeDb(i)`。
+- 权威，以及一处**有意跟上游不一致**：上游 `keysCommand` 遍历的是原始 `dict`，但逐键问一句
+  `keyIsExpired`（`db.c:552`）；`dbsizeCommand` 就是 `dictSize(c->db->dict)`（`db.c:808-810`），
+  INFO 的 `keys=` 同样是原始计数（`server.c:3681`）—— 即上游允许把"到点还没被碰"的键**暂时**数进去，
+  因为 `serverCron` 推着 `activeExpireCycle`（`expire.c:97`）在扫。我们**没有**那个扫刷
+  （实测：`z-cache-core/src/main` 里唯一的定时清刷是 `ZCache.cleanupExpired`（`ZCache.java:363`），
+  那是嵌入式客户端缓存自己的 `ConcurrentHashMap`，服务器侧的 `MemoryStore` 一处都没有），
+  所以照抄"原始计数"在不是暂时错，是**一直错**。这一格选的是一致性优先：四把尺永远同一个数。
+- 代价也写清楚，别让它藏在"重构"两个字里：`DBSIZE` 从"每库几个计数"变成一次 O(该库键数) 的遍历
+  （改之前它至少已经在 `stringStores` 上是 O(该表键数)，**量级没升、常数升了**），
+  `INFO keyspace` 从 O(库数) 变成 O(总键数)，而上游这两个都是 O(1)。今天没有性能门禁钉这个数。
+  真要抬回去，出路是补后台扫刷（下面"还没做的"①），不是把尺拆回去。
+- 全量 `895 → 897`（`358 + 402 + 135 + 2`，`logs/keyspace_full.log`，判据字节就是上一条那两个 md5）。
+  对外的行为差只有两处：`INFO keyspace` 那个数（流键从数不到变成数得到，N3 钉的就是它），
+  以及 `KEYS` / `SCAN` / `DBSIZE` 三者对"同一枚键名落在几张表里"的口径统一成一枚。
+- 判据与牙（`~/.cache/zcache_gauges/ttl_mut/keyspace_teeth.py`；基线在同一份字节上绿，
+  两个被改文件各记各的 md5，每支还原后对账 `match=True`；被量字节
+  `MemoryStore.java 018e4e84e0d1262079c407b313e9c2b0`、`CommandHandler.java 96a31e63ef13b0bec1db3d57bb55716d`）：
+  - N1 `liveKeys` 摘掉判活那一句 → 3 红，含
+    `MemoryStoreTest.theThreeEnumerationsAgreeOnEveryShapeOfKeySet:695 DBSIZE 这一问自己就要把到点的键摘掉 ==> expected: <2> but was: <3>`；
+  - N2 `dbsizeDb` 退回"六张表各自加总" → 3 红，含
+    `:687 一枚键名只数一个，不论它落在几张表里 ==> expected: <2> but was: <3>`
+    （并存键名那一问和 `testDbsizeIgnoresExpired:444` 同时红）；
+  - N3 `INFO` 退回"五张表各自 size() 相加" → 1 红，
+    `RedisServerProtocolSemanticsTest.streamsAreOrdinaryKeysForKeyspaceCommands:4015 INFO 报的键数必须与 DBSIZE 是同一个数（少的那一枚是流键）... expected: <6> but was: <5>`。
+    这一支的判据**必须加在网线层**：单测层那三个裸 `new CommandHandler(store)` 用的是进程级 static
+    的 stream store 兜底，`MemoryStore.streamKeys(db)` 根本看不见它 —— 钉不到这一层就等于没钉。
+  - N4（`handleKeys` 退回"再原样并四张集合表"）**整套 core 402 例全绿，这是预期而不是漏网**：
+    那四句加回来的键与 `keysDb` 交的今天逐字相同，因为集合键还拿不到时刻行（`expireDb` 那五支
+    只看 `stringStores`）。它是等价变异；翻完 fence 要把这一支重跑一遍，那时它才该红。
+- 顺手验过两件事，都没靠推断：`CommandHandler.globToRegex` 与 `MemoryStore.globToRegex` 把空白和
+  变量名抹掉后**逐字符相同**，所以"模式匹配挪进 `keysDb`"没有偷换 glob 语义；
+  `handleRandomkey`（`CommandHandler.java:1299-1305`）本来就只问 `keysDb` 一把尺，这一格之后它抽的
+  是判过活的键集，权重仍然均等。
+- 对岸那一侧这一格没有实测：250 现在拒绝 ssh（`kex_exchange_identification` 直接 reset），
+  `_doc/battery*.txt` 那批原文真值因此无法复跑，本格的权威只有 5.0.14 源码行号。
+- 还没做的：①②③ 与上一格同样三条（翻 fence、集合键的时刻行、快照里的过期栏），另加
+  ④ 服务器侧没有 active expire cycle ⇒ 到点又没人碰的键既不释放内存也不从时刻表里退，
+  `liveKeys` 的顺带回收只覆盖"有人来枚举"的情况；⑤ `INFO keyspace` 这一行仍然只有 `keys=`，
+  上游是 `keys=,expires=,avg_ttl=`（`server.c:3686`），补它要先定义得清 `avg_ttl` 在我们这里是什么。
+
 ### Added
 - `RedisServer.serverScope()`：只读拿到本台那一份，测试与嵌入式据此判断作用域边界。
 - `StreamIdFormat`（z-cache-common）：stream ID 的唯一文法（uint64 两段、`-` / `+` 两种位置、

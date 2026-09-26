@@ -7,8 +7,6 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
@@ -862,49 +860,42 @@ public class MemoryStore {
         return keysDb(0, pattern);
     }
 
+    /**
+     * 这个库里当前还活着的键名，一枚键名只出现一次 —— 判活只问 {@link #typeOfDb} 那一把尺。
+     * <p>
+     * 上游之所以只有一把尺：一个键名在 {@code db->dict} 里就是一条目（{@code db.c}），
+     * 过期挂在同库的 {@code db->expire} 里，"能不能看见"从来不是按类型分头问的。
+     * <p>
+     * 两阶段是有意的：先把六张表的键名**抄进**一个集合，再逐个问尺。反过来的写法
+     * （一边遍历 {@code hashStores[db].keys()} 一 {@code remove}）就要吃各 store 是否返回快照
+     * 这个未知数了 —— 现在不吃。{@code typeOfDb} 会顺手做惰性删除，这是它作为唯一尺的职责。
+     */
+    public Set<String> liveKeys(int db) {
+        Set<String> names = new java.util.LinkedHashSet<>();
+        names.addAll(stringStores[db].keySet());
+        names.addAll(hashStores[db].keys());
+        names.addAll(listStores[db].keys());
+        names.addAll(setStores[db].keys());
+        names.addAll(sortedSetStores[db].keys());
+        names.addAll(streamKeys(db));
+        Set<String> live = new java.util.LinkedHashSet<>();
+        for (String key : names) {
+            if (typeOfDb(db, key) != DataType.NONE) {
+                live.add(key);
+            }
+        }
+        return live;
+    }
+
     public List<String> keysDb(int db, String pattern) {
         List<String> result = new ArrayList<>();
         if (pattern == null) {
             return result;
         }
         String regex = globToRegex(pattern);
-
-        // 扫描 string store
-        for (Map.Entry<String, ValueWrapper> entry : stringStores[db].entrySet()) {
-            ValueWrapper wrapper = entry.getValue();
-            if (wrapper != null && !isExpiredDb(db, entry.getKey()) && entry.getKey().matches(regex)) {
-                result.add(entry.getKey());
-            } else if (wrapper != null && isExpiredDb(db, entry.getKey())) {
-                stringStores[db].remove(entry.getKey(), wrapper);
-                keyTypeMaps[db].remove(entry.getKey());
-                clearExpireAtDb(db, entry.getKey());
-            }
-        }
-
-        // 扫描其他类型 store
-        for (String hk : hashStores[db].keys()) {
-            if (hk.matches(regex)) {
-                result.add(hk);
-            }
-        }
-        for (String lk : listStores[db].keys()) {
-            if (lk.matches(regex)) {
-                result.add(lk);
-            }
-        }
-        for (String sk : setStores[db].keys()) {
-            if (sk.matches(regex)) {
-                result.add(sk);
-            }
-        }
-        for (String zk : sortedSetStores[db].keys()) {
-            if (zk.matches(regex)) {
-                result.add(zk);
-            }
-        }
-        for (String tk : streamKeys(db)) {
-            if (tk.matches(regex)) {
-                result.add(tk);
+        for (String key : liveKeys(db)) {
+            if (key.matches(regex)) {
+                result.add(key);
             }
         }
         return result;
@@ -913,7 +904,8 @@ public class MemoryStore {
     // ==================== SCAN 迭代器 ====================
 
     /**
-     * 游标扫描键，基于 HashSet 实现增量迭代。
+     * 游标扫描键：键集取自 {@link #liveKeys}（与 KEYS / DBSIZE 同一把尺），游标走的是
+     * 排序之后的那一份。
      *
      * @param db      数据库编号
      * @param cursor  游标，0 表示开始扫描
@@ -922,19 +914,9 @@ public class MemoryStore {
      * @return [nextCursor, matchedKeys]
      */
     public Object[] scan(int db, String cursor, String pattern, int count) {
-        Set<String> allKeys = new HashSet<>();
-        // 收集所有有效键
-        for (Map.Entry<String, ValueWrapper> entry : stringStores[db].entrySet()) {
-            ValueWrapper wrapper = entry.getValue();
-            if (wrapper != null && !isExpiredDb(db, entry.getKey())) {
-                allKeys.add(entry.getKey());
-            }
-        }
-        allKeys.addAll(hashStores[db].keys());
-        allKeys.addAll(listStores[db].keys());
-        allKeys.addAll(setStores[db].keys());
-        allKeys.addAll(sortedSetStores[db].keys());
-        allKeys.addAll(streamKeys(db));
+        // 与 KEYS / DBSIZE 共用 {@link #liveKeys} 一把尺：以前这三家各自遍历六张表，
+        // 于是 SCAN 用 HashSet 去重而 KEYS 不去重 —— 同一枚并存键名两句给出两个条数。
+        Set<String> allKeys = liveKeys(db);
 
         String regex = pattern == null ? null : globToRegex(pattern);
         List<String> sorted = new ArrayList<>(allKeys);
@@ -975,25 +957,10 @@ public class MemoryStore {
     }
 
     public long dbsizeDb(int db) {
-        long count = 0;
-        // String DB
-        Iterator<String> it = stringStores[db].keySet().iterator();
-        while (it.hasNext()) {
-            String key = it.next();
-            ValueWrapper wrapper = stringStores[db].get(key);
-            if (wrapper != null && !isExpiredDb(db, key)) {
-                count++;
-            } else if (wrapper != null && isExpiredDb(db, key)) {
-                it.remove();
-                clearExpireAtDb(db, key);
-            }
-        }
-        count += hashStores[db].dbsize();
-        count += listStores[db].dbsize();
-        count += setStores[db].dbsize();
-        count += sortedSetStores[db].dbsize();
-        count += streamKeys(db).size();
-        return count;
+        // 一枚键名算一个键，不论它落在几张表里、不论它是六种类型中的哪一种 —— 与 KEYS / SCAN
+        // 同一个口径，判活只问 liveKeys 里那把尺（以前这里是 String 支路自己判活、
+        // 其余四支直接拿各 store 的 dbsize() 加总，既不去重也不过期）。
+        return liveKeys(db).size();
     }
 
     public void flush() {

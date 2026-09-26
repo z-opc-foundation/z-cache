@@ -403,6 +403,28 @@ class CommandHandlerJunit5Test {
         assertEquals("B", ((RespBulkString) handler.handle(cmd("GET", "gs:k"))).getString());
     }
 
+    /**
+     * INFO 的 {@code # Keyspace} 一行与 DBSIZE 必须是同一个数。以前 INFO 是"第五把尺"：
+     * 五张表各自 {@code size()/dbsize()} 相加，既不判过期、也不算第六张 stream 表，所以
+     * "一枚刚到点的键：DBSIZE 数不到、INFO 还报 db0:keys=1" 是做得出来的。
+     * 上游只有一份事实可读：{@code dbsizeCommand} 就是 {@code dictSize(c->db->dict)}
+     * （{@code db.c:808-810}），keyspace 那段读的也是同一张 dict。
+     */
+    @Test
+    void testInfoKeyspaceAndDbsizeNeverDisagree() throws InterruptedException {
+        handler.handle(cmd("SETEX", "ik:k", "100", "v"));
+        assertEquals(1L, ((RespInteger) handler.handle(cmd("DBSIZE"))).getValue());
+        String live = ((RespBulkString) handler.handle(cmd("INFO"))).getString();
+        assertTrue(live.contains("db0:keys=1"), "前提：INFO 报得出这一枚键，否则下面全是空跑");
+
+        handler.handle(cmd("PSETEX", "ik:k", "1", "v"));
+        Thread.sleep(30);
+        assertEquals(0L, ((RespInteger) handler.handle(cmd("DBSIZE"))).getValue(), "键到点了");
+        String after = ((RespBulkString) handler.handle(cmd("INFO"))).getString();
+        assertFalse(after.contains("db0:keys="),
+                "同一个事实不许两句两答：DBSIZE 数不到它，INFO 就不许还报一行 db0");
+    }
+
     @Test
     void testMillisecondExpirationAndInfo() {
         handler.handle(cmd("SET", "short", "value"));
