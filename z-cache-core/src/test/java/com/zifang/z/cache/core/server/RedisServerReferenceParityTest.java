@@ -238,7 +238,7 @@ class RedisServerReferenceParityTest {
                 // 最远一档（贴顶），所以钉的是量级而不是逐位相同 —— 键活着、时刻在未来、不被截成 int。
                 long farTtl = Long.parseLong(readReply(in).substring(1));
                 assertTrue(farTtl > 9_000_000_000_000_000L,
-                        "TTL 必须还在"远得摸不到"那一档，实际 " + farTtl);
+                        "TTL 必须还在「远得摸不到」那一档，实际 " + farTtl);
                 send(s, "GET", "p35:k");
                 assertEquals("$2\r\nv9", readReply(in), "远未来的 EX 不许把键删掉");
 
@@ -247,7 +247,7 @@ class RedisServerReferenceParityTest {
                 send(s, "SET", "p35:k", "v", "EX", "9223372036854776");
                 assertEquals("-ERR invalid expire time in set", readReply(in), "battery35:6 的有意偏差");
                 send(s, "GET", "p35:k");
-                assertEquals("$1\r\nv", readReply(in), "溢出这一档必须保住键，对岸是把键删了");
+                assertEquals("$2\r\nv9", readReply(in), "溢出这一档必须原样保住上一次的写入，对岸是把键删了");
             } catch (IOException e) {
                 throw new RuntimeException(e);
             }
