@@ -88,6 +88,44 @@ All notable changes to z-cache will be documented in this file.
   全是 `"ZADD"` 这种大写；`CLIENT` / `DEBUG` 那类"未知子命令"文案要保留原文大写，所以清洗
   只在各自出口做一次，不铺到几十个调用点）。
 
+#### 位族命令整族缺席：五支按实测判序补齐，而 BITOP 答复的单位是字节
+- `_doc/001_arch/01-module-structure.md:62,210-212` 把 `SETBIT / GETBIT / BITCOUNT / BITPOS /
+  BITOP / BITFIELD` 六支写进展品清单，1.3.5 的 `CommandHandler` 里
+  `handleBitcount` / `handleGetbit` / `handleSetbit` / `handleBitpos` / `handleBitop`
+  **一个都不存在**（拿 `git show a1a744b:` 取那一棵树来 grep，命中 0），这五支当时一律回
+  `unknown command`。BITFIELD 到这一版仍然没做，见下面"已知边界"。
+- 位族不是一条共用管线，**谁先开口是每支命令各自的实测**（250 上 redis-server 4.0.9 的一次性实例
+  6391-6394，电池 39-48 共 429 行逐行对拍，两侧 `DIFF=0`）：
+  - `BITCOUNT`：查键 → 类型 → 计数区间文法 → 整数文法。
+  - `GETRANGE`：整数文法 → 查键 → 类型 —— 和 `BITCOUNT` 正好反着，所以"抽一个共用前置检查"
+    的写法必然在其中一支上红。
+  - `SETBIT`：offset 文法 → bit 文法 → 类型。
+  - `BITPOS`：arity → bit 文法 → bit 是否 ∈ {0,1} → 查键 → 类型 → `argc>5` 的 syntax →
+    start/end 整数文法；`BITPOS k 2 …` 回 `-ERR The bit argument must be 1 or 0.`，
+    越界下标按参考实现的形状折叠（`MAX_BIT_OFFSET = 1L << 32`）。
+  - `BITOP`：arity（`argc<4`）→ 操作名 syntax → `NOT` 只能单源那一句话 → 各源类型检查。
+    `BITOP FOO d k` 与 `BITOP SET d k` 都是 `-ERR syntax error`；
+    `BITOP NOT d k1 k2` 是 `-ERR BITOP NOT must be called with a single source key.`
+    （`Not` / `nOt` 同命）。
+- **BITOP 是这一族里唯一不数位的成员，它按字节答复**：`BITOP AND d hello world` → `:5`
+  而不是 `:40`（`battery45:16`）。`GETBIT / SETBIT / BITPOS / BITCOUNT` 都按位说话，
+  第一版就是按那一族类推写了 `max * 8`，25 行判红才把它纠正过来；
+  现在这条既有真值行、也有把 `*8` 种回去的变异探针（`expected: <:5> but was: <:40>`）。
+- 语义面实测到的形状（逐条钉在 `bitopRepliesBytesAndFollowsTheMeasuredPrecedence` 里）：
+  一个字节内位序是 MSB 优先；短源右端补零、结果长度取最长源；最长源长度为 0 时
+  **删掉**目标键而不是留一个空串（`BITOP AND d <missing>` → `:0` 且 `EXISTS d` → `:0`）；
+  非零长度但全零的结果照样写进去；目标键无条件被覆写且**不做类型检查**（目标键是 list 时
+  `BITOP AND list-dest …` 仍回 `:5`，随后 `TYPE` 回 `+string`、`LRANGE` 才回 WRONGTYPE，
+  `battery46:33`）；某个源类型不对则在写任何东西之前就中止（目标键留着原值）；
+  目标键的 TTL 被清掉（`PSETEX` 之后跑 `BITOP` → `TTL` 回 `:-1`）。
+- 顺手抓到一条**不会红的**缺陷：`SETBIT` 从加进来那天起就不在 `WRITE_COMMANDS` 里 ——
+  值进内存、当场 `GET` 得到、测试全绿，只有进程换过一代之后才看得出 AOF 里一行都没有、
+  停机快照里也没有。`SETBIT` 与 `BITOP` 现在都在这张表里。
+- `bumpWatchedKeys` 的通用形状是"键名在下标 1"，对 `BITOP` 不成立（下标 1 是
+  `AND/OR/XOR/NOT`，被改写的目标键在下标 2）：照通用形状走，会给一个名叫 `AND` 的键抬版本号、
+  真正改掉的那个键不动。现在 `BITOP` 单独一支，只 bump 目标键 —— 于是 `WATCH` 一个源键、
+  别人对它跑 `BITOP`，`EXEC` 照样交出结果（源是只读的），而 `WATCH` 目标键必须中止。
+
 ### Added
 - `RedisServer.serverScope()`：只读拿到本台那一份，测试与嵌入式据此判断作用域边界。
 - `RedisServerProtocolSemanticsTest` 增加 2 条端到端回归（`streamKeyspaceIsScopedToOneServerInstance`
