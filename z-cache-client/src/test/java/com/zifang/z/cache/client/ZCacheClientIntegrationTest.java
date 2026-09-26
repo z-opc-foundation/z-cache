@@ -66,10 +66,36 @@ class ZCacheClientIntegrationTest {
         }
     }
 
+    /** 探测用的端口窗口：只在操作系统**出站**区间之下取，见 {@link #freePort()}。 */
+    private static final int PORT_BASE = 20000, PORT_SPAN = 10000;
+    private static final java.util.concurrent.atomic.AtomicInteger PORT_CURSOR =
+            new java.util.concurrent.atomic.AtomicInteger(new java.util.Random().nextInt(PORT_SPAN));
+
+    /**
+     * 挑一枚测试用的端口：在一个固定的低位窗口里顺着一个游标找一枚真能 bind 上的号码。
+     * <p>
+     * 不能再写 {@code new ServerSocket(0)} —— 那样"探到再放开"的号码出自操作系统的**出站**
+     * 派发区间（macOS 49152-65535、Linux 默认 32768-60999），探针一关那个号码立刻重新可派，
+     * 而本机常驻代理一直在起出站连接：实测 9 遍全量里撞红 2 遍（64088 与 51981，红的用例
+     * 还各不相同），{@code lsof -nP -iTCP:64088} 当场抓到它挂在一条 {@code FIN_WAIT_2} 的
+     * 出站连接上 —— 也就是"这个号码在探完之后被派给了别人"，不是本仓哪个测试没关服务器。
+     * 窗口之下的号码操作系统不派给出站连接，"探得到"和"bind 得上"之间就没有那道窗口了；
+     * 窗口里撞上别人的常驻服务照常换下一枚。下面 {@code awaitListening} 里那句"临时端口在
+     * 放开后可能被别的进程占走"防的是同一段窗口的另一头，两半都要在。
+     */
     private static int freePort() throws IOException {
-        try (ServerSocket probe = new ServerSocket(0)) {
-            return probe.getLocalPort();
+        for (int tries = 0; tries < PORT_SPAN; tries++) {
+            int port = PORT_BASE + PORT_CURSOR.getAndIncrement() % PORT_SPAN;
+            try (ServerSocket probe = new ServerSocket()) {
+                probe.setReuseAddress(true);
+                probe.bind(new InetSocketAddress("127.0.0.1", port));
+            } catch (IOException taken) {
+                continue;
+            }
+            return port;
         }
+        throw new IOException("窗口 " + PORT_BASE + "-" + (PORT_BASE + PORT_SPAN - 1)
+                + " 里找不出一枚可 bind 的端口");
     }
 
     private static void awaitListening(int port) throws Exception {

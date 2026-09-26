@@ -1049,6 +1049,55 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
 
 
 
+#### 测试取号压在操作系统出站区间之下：9 遍全量里 2 遍的假红（量具侧，不是服务器行为）
+
+- **现象**：`RedisServerLifecycleTest` 每隔两三遍就有一遍在 `startAndWait` 抛
+  `IllegalStateException: server thread died before listening on <port>` +
+  `java.net.BindException: Address already in use`，而红的用例不固定
+  （`b68_full4.log` 是 `saveWithoutDataDirFailsHonestly:478`、`b68_full8.log` 是
+  `blpopPopsOnlyRequestedKeyWithoutFreezingPeers:123`）。分母：上一格那轮改动期间全量跑 9 遍、红 2 遍。
+- **归因**（不是"运气不好"，也不是上一格改坏了）：`freePort()` 写的是 `new ServerSocket(0)` ——
+  探一个号码、关掉、再交给服务器去 bind。`bind(0)` 交回的号码出自操作系统的**出站**派发区间
+  （macOS 49152-65535、Linux 默认 32768-60999），探针一关，这个号码立刻重新可派给一条新起的出站
+  连接，而本机常驻代理一直在起。`lsof -nP -iTCP:64088` 在红过之后当场抓到那枚号码挂在 `verge-mih`
+  的一条 `FIN_WAIT_2` 出站连接上 —— 服务器要 bind 的时候，那个号码已经是别人的一条客户端连接了。
+  **下面那条守卫顺带把这个机制复现了一次**：把 `freePort()` 原样退回旧写法，它第一次取样就拿回
+  `61194`。
+- **修法**：在一个固定的低位窗口 `[20000, 30000)` 里，顺着一个随机起点的游标找一枚真能 bind 上的
+  号码。窗口之下的号码操作系统不派给出站连接，"探得到"与"bind 得上"之间那道窗口就不存在了；
+  窗口里撞上别人的常驻服务照常换下一枚（本轮 `lsof -nP -iTCP -sTCP:LISTEN` 实测窗口内确有一枚
+  `*:25170`，它占着的是 LISTEN 而非出站连接，换号即可）。改前四份 `freePort()` 是**逐字相同**的
+  （各 169 字节，md5 四份同为 `35f332c3799bf2edd8a50280de161a8d`，`git show HEAD:<路径>` 逐一量过），
+  所以一起换：
+  `RedisServerLifecycleTest`、`RedisServerProtocolSemanticsTest`、`RedisServerReferenceParityTest`
+  加上 client 侧的 `ZCacheClientIntegrationTest`。**改后只有三份逐字相同**
+  （`890c90f3b675009ecb32471828edcee2`），client 那份是 `3918efcef7aeed75a5e008f592ef766b`，
+  与前三份的差别只在一处限定名 —— 那个文件 import 了 `InetSocketAddress`，所以 bind 那一行
+  不带包名前缀。这句话要说清，否则"四份相同"在改后就不成立、下一个人按它去核对会核不出。
+- **为什么还要单独测一层**：`startAndWait` 里早就写着"先 bind 一个临时端口再放开"这段窗口的注释，
+  可它只把**就绪判据**从"连得上"改成"答的必须是 RESP 形状" —— 那一半挡的是"读到别人家的响应"，
+  没挡"自己根本 bind 不上"。两半都要在，注释里点明了这一层。
+- **结构守卫**：`RedisServerLifecycleTest.probePortsComeFromBelowTheEphemeralRange` 连取 20 枚，
+  两问都断言 —— 号码要落在 `[PORT_BASE, PORT_BASE + PORT_SPAN)`，还要低于两侧最小出站区间的下界
+  32768。断言的是**取号方式**而不是"这枚端口能 bind"：后者新旧两版都成立，挡不住退回。
+  双向实测过：注入旧写法 ⇒ 红在
+  `取号窗口要一眼看得出来：61194 不在 [20000,30000) 里`（`logs/portguard_revert.log`，rc=1，
+  1 例 1 红）；还原是从 `/tmp/RLT.orig.java` 按字节 `cp` 回来并 md5 对账
+  （`bf1691d117ae4f3cfe1476b53784b521`，注入前后逐字相同）—— **不走 `git checkout`**，
+  这些文件上还有我没提交的改动，HEAD 不是"我开始测量那一刻"。
+- **这层守卫只护得住一份**：它读的是本类的 `freePort()`，另外三份是各自独立的私有静态方法，
+  退回旧写法时这一支不会红。跨模块没有可行的接缝（core 的测试看不见 client 的类，也不想为此
+  造一个生产侧的取号工具），所以那三份目前只有"改后 12 遍全绿"这一条统计证据 + 上面那组 md5
+  记账。记在**未覆盖**里。
+- **改后重测**：全量**连跑 12 遍，12 绿 0 红**，`Address already in use` 在 12 份日志里合计 0 命中
+  （`logs/portfix_p1.log` … `portfix_p12.log`，每遍都是 `358 + 392 + 134 + 2 = 886`，
+  core 从 391 抬到 392 = 那条形守卫）。统计口径要摊开说：改前 2/9 ≈ 22%，若抖动仍是 22%，
+  12 遍一次不中的概率是 `0.78^12 ≈ 4.6%` —— 这是强证据，**不是证明**。
+- **同一个来路还剩一处，这一票没做**：`ZCachePoolTest.startEmbeddedServer`（client 模块）自己写了
+  第五份 `new ServerSocket(0)`（它那份不叫 `freePort()`，所以前面那批逐字相同的漏了它），探完关掉
+  再让 Netty 去 bind 同一个号码；而它 catch 里的退路是 `testPort = 16379` —— 一枚**写死端口**，
+  跨跑互撞时的表现是"起不来"或"读到上一轮残留"。已登记为下一票。
+
 ### Added
 - `RedisServer.serverScope()`：只读拿到本台那一份，测试与嵌入式据此判断作用域边界。
 - `StreamIdFormat`（z-cache-common）：stream ID 的唯一文法（uint64 两段、`-` / `+` 两种位置、
@@ -1418,7 +1467,9 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   **出站**连接上 —— `freePort()` 的写法是"bind(0) 探一个端口、关掉、再交给服务器去 bind"，
   中间那道空隙里操作系统会把同一个号码派给一条新的出站连接（本机常驻代理，出站端口消耗快）。
   9 遍里中 2 遍 ≈ 两成（按"提交字节那 5 遍"算是 1/5），**这一条另立一票修**（测试侧，四个类里各有一份逐字相同的
-  `freePort()`），不许读成"本轮改坏了"。上一条 `883` 的读数是上一轮那棵树的，留着记账。
+  `freePort()`），不许读成"本轮改坏了"。**那一票已经跑完并闭合**：见上面《测试取号压在操作系统出站区间之下》
+  那一格（改后 12 遍全绿、基线抬到 886，同一来路还剩 `ZCachePoolTest` 一处已登记为下一票）。
+  上一条 `883` 的读数是上一轮那棵树的，留着记账。
 - 变异自证与提交树的字节对账：Z 族那 15 支跑完之后，四本 TARGET 又各量一次 md5，与快照
   逐字相同（CH `bde83a2252efb01f73d8fa7ed8703e93`、MS `35bb2d879b816b74607d3ad7af9a2ec7`、
   SS `832816457d9567fa19f324193174709d`、RS `13ae0ecda5a537be2f3305d24c2c6fd6`），
@@ -1581,15 +1632,19 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   `ZCacheServerMain` 的命令行面：`--password` / `--password-file`（33/39 行）确实实现了，
   但全仓库测试树 grep 它只有一处注释提到 —— 参数解析、鉴权开关、`HealthCheck`
   全部零回归，于是"默认值不够硬"那一条至今没有兜底。
-- 测试端口仍是"先探一个空闲端口再 bind"，存在被抢占的窗口。**本轮把这一扇窗口的成因量出来了**：
+- 测试端口"先探一个空闲端口再 bind"的窗口**已按号码段规避**（见上面《测试取号压在操作系统出站区间之下》
+  那一格：四份 `freePort()` 换进低位窗口，另有 `ZCachePoolTest` 自己那份尚未换）。
+  **本轮把这一扇窗口的成因量出来了**：
   红的那一格报 `server thread died before listening on 63670 —— BindException: Address already in use`，
   事后 `lsof -nP -iTCP:63670` 抓到占着它的是**本机代理**的一条出向连接
   （`verge-mih … 127.0.0.1:7897->127.0.0.1:63670 (FIN_WAIT_2)`）—— 代理客户端把
   `freePort()` 刚放掉的临时端口拿去当了本地端口，而我们探到的号正好落在
   `net.inet.ip.portrange.first/last = 49152/65535` 这一段里，与它抢的是同一个池。
   同一支两例选取器在**未变异的树**上连跑 8 次：`rc=0` × 8、`BindException` 计数 0（`portflake.log`）。
-  彻底做法是
-  `RedisServer` 支持 `port 0` 并回读实际端口，改动面覆盖两个测试类约 25 处，本轮没做。
+  还有一条没做：彻底做法是
+  `RedisServer` 支持 `port 0` 并回读实际端口，改动面覆盖两个测试类约 25 处。低位窗口只保证
+  "探针放掉的号码不会被派给出站连接"，不保证"不会撞上本机另一个常驻服务"（实测窗口里已有一枚
+  被 `*:25170` 占着）—— 撞上就换下一枚，而 `port 0` 是让内核自己挑、根本没有那道窗口。
 
 ## [1.3.5] - 2026-09-26
 
