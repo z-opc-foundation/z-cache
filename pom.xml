@@ -87,6 +87,43 @@
     </dependencyManagement>
 
 
+    <build>
+        <plugins>
+            <!-- 常开（不挂 central profile）：挂 profile 时 `mvn install` 不带 -P central，
+                 装进本地仓的 pom 仍然带着 com.zifang:z-opc:1.0.0-SNAPSHOT 这个永不存在的
+                 parent ⇒ 本机消费者读到的还是废 pom。对照实测（同目录形状、只换 flatten 位置）：
+                 挂 profile 一侧每个入库 pom 都带 <parent> 且聚合 pom 的 parent 悬空，常开一侧为 0。
+                 版本钉 1.5.0：门禁机 250（Maven 3.6.0）实测 1.5.0 rc=0，
+                 1.6.0/1.7.2 rc=1 “requires Maven version 3.6.3”。 -->
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>flatten-maven-plugin</artifactId>
+                <version>1.5.0</version>
+                <inherited>true</inherited>
+                <configuration>
+                    <updatePomFile>true</updatePomFile>
+                    <flattenMode>oss</flattenMode>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>flatten</id>
+                        <phase>process-resources</phase>
+                        <goals>
+                            <goal>flatten</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>flatten.clean</id>
+                        <phase>clean</phase>
+                        <goals>
+                            <goal>clean</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+
     <profiles>
         <profile>
             <id>central</id>
@@ -115,32 +152,6 @@
                          等于构件全废。flatten 在 process-resources 生成去掉 parent、
                          并把继承来的版本全部写死的 pom，install/deploy 用它替换（updatePomFile）。
                          本地 monorepo 构建链不受影响：不带 -P central 时不执行。 -->
-                    <plugin>
-                        <groupId>org.codehaus.mojo</groupId>
-                        <artifactId>flatten-maven-plugin</artifactId>
-                        <version>1.6.0</version>
-                        <inherited>true</inherited>
-                        <configuration>
-                            <updatePomFile>true</updatePomFile>
-                            <flattenMode>oss</flattenMode>
-                        </configuration>
-                        <executions>
-                            <execution>
-                                <id>flatten</id>
-                                <phase>process-resources</phase>
-                                <goals>
-                                    <goal>flatten</goal>
-                                </goals>
-                            </execution>
-                            <execution>
-                                <id>flatten.clean</id>
-                                <phase>clean</phase>
-                                <goals>
-                                    <goal>clean</goal>
-                                </goals>
-                            </execution>
-                        </executions>
-                    </plugin>
 
                     <!-- 中央发布场景下，禁用 maven-deploy-plugin 的 default-deploy，
                          改由 central-publishing-maven-plugin 接管（不会重复 deploy 到 snapshotRepository） -->
