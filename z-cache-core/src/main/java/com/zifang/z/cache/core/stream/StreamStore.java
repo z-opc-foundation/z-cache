@@ -178,8 +178,9 @@ public class StreamStore {
      * 找不到就明着交回 {@code [id, nil]}（t_stream.c:1098-1109），而不是悄悄少一条。
      *
      * @param fromId 闭区间起点；调用方传进来的已经是"所要位置的下一个 ID"
-     * @return 条目 ID 升序列表；空列表 = 这个消费者手上没东西。<b>null</b> 专指键或组不在，
-     *         这一支今天还不回 NOGROUP（见 CHANGELOG 的已知边界），所以不能和空历史混成一件事
+     * @return 条目 ID 升序列表；空列表 = 这个消费者手上没东西。<b>null</b> 专指键或组不在 ——
+     *         命令层已经在 :1505 那一问（{@code -NOGROUP … in XREADGROUP with GROUP option}）
+     *         挡过一次，所以这一支只覆盖"两次读之间被并发删掉"这种窗口，不能和空历史混成一件事
      */
     public List<String> xreadgroupHistory(int db, String key, String group, String consumer,
                                           String fromId, int count) {

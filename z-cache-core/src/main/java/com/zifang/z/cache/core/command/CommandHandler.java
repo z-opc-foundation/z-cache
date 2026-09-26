@@ -2733,6 +2733,16 @@ public class CommandHandler {
             // 顺序是先类型后 NOGROUP。
             RespError conflict = streamTypeConflict(keys[k]);
             if (conflict != null) return conflict;
+            // :1505-1514 紧跟在类型那一问之后、两个特例位（:1518 的 `$` / :1535 的 `>`）之前：
+            // 键或组不在就回 -NOGROUP 并 goto cleanup —— **整条命令作废**，后面那些合法位置
+            // 一个都不交。改前三句都答 `*-`（实测 battery54:16 :18 :20 :21），客户端把
+            // "组根本没建过"读成"暂时没有新消息"，于是轮询永远不会停。
+            com.zifang.z.cache.core.stream.Stream positionOwner =
+                    streams().getStream(currentDb, keys[k]);
+            if (positionOwner == null || positionOwner.getGroup(group) == null) {
+                return RespError.of("NOGROUP", "No such key '" + keys[k] + "' or consumer group '"
+                        + group + "' in XREADGROUP with GROUP option");
+            }
             // 以前这一位一个字都不判：坏 ID 走到 StreamStore 里被当成 0-0，于是
             // "XREADGROUP GROUP g c STREAMS k abc" 回了整段历史（实测 battery50:21）。
             Object rejected = rejectStreamIdInRead(positions[k], true);
@@ -2796,7 +2806,10 @@ public class CommandHandler {
                     return invalidStreamId();
                 }
                 boolean ok = streams().xgroupCreate(currentDb, args[2], args[3], args[4]);
-                return ok ? RespSimpleString.of("OK") : RespError.of("ERR", "BUSYGROUP Consumer Group name already exists");
+                // :1888-1889 那句是 addReplySds("-BUSYGROUP …")，码就是 BUSYGROUP 本身；
+                // 多包一层 ERR 会让按码分支的客户端把"组重名"读成未知错误（实测 battery55:17）。
+                return ok ? RespSimpleString.of("OK")
+                        : RespError.of("BUSYGROUP", "Consumer Group name already exists");
             }
             case "DESTROY": {
                 if (args.length < 4) return RespError.wrongNumberOfArguments("XGROUP DESTROY");
@@ -2897,21 +2910,24 @@ public class CommandHandler {
      */
     private Object handleXinfo(String[] args) {
         if (streams() == null) return RespError.of("ERR", "Stream not configured");
-        if (args.length < 3) return RespError.wrongNumberOfArguments("XINFO");
+        // 上游把"只给了子命令没给键名"排在查表之后、分发之前，用的是 :2543 那一句，
+        // 不是通用 arity（键名到位但子命令不认识的，走 :2640 另一条路，本版没实现那一支）。
+        if (args.length < 2) return RespError.wrongNumberOfArguments("XINFO");
+        if (args.length == 2) return RespError.of("ERR", "syntax error, try 'XINFO HELP'");
         // :2553-2555 是三个子命令共用的一问（键不在给 nokeyerr，类型不对给 WRONGTYPE），
         // 所以它必须排在分发之前，而不是散在每个 case 里各自漏一次。
         RespError infoConflict = streamTypeConflict(args[2]);
         if (infoConflict != null) return infoConflict;
+        com.zifang.z.cache.core.stream.Stream infoStream = streams().getStream(currentDb, args[2]);
+        if (infoStream == null) return RespError.noSuchKey();
         String sub = args[1].toUpperCase(Locale.ROOT);
         switch (sub) {
             case "GROUPS": {
-                com.zifang.z.cache.core.stream.Stream stream = streams().getStream(currentDb, args[2]);
-                if (stream == null) return RespArray.nullArray();
-                java.util.Set<String> names = stream.groupNames();
+                java.util.Set<String> names = infoStream.groupNames();
                 Object[] result = new Object[names.size()];
                 int i = 0;
                 for (String name : names) {
-                    com.zifang.z.cache.core.stream.ConsumerGroup cg = stream.getGroup(name);
+                    com.zifang.z.cache.core.stream.ConsumerGroup cg = infoStream.getGroup(name);
                     result[i++] = RespArray.of(
                             RespBulkString.of("name"), RespBulkString.of(name),
                             RespBulkString.of("consumers"), RespInteger.of(cg != null ? cg.getConsumers().size() : 0),
@@ -2921,22 +2937,20 @@ public class CommandHandler {
                 return RespArray.of(result);
             }
             case "STREAM": {
-                com.zifang.z.cache.core.stream.Stream stream = streams().getStream(currentDb, args[2]);
-                if (stream == null) return RespArray.nullArray();
                 return RespArray.of(
-                        RespBulkString.of("length"), RespInteger.of((int) stream.length()),
-                        RespBulkString.of("groups"), RespInteger.of(stream.groupNames().size())
+                        RespBulkString.of("length"), RespInteger.of((int) infoStream.length()),
+                        RespBulkString.of("groups"), RespInteger.of(infoStream.groupNames().size())
                 );
             }
             case "CONSUMERS": {
                 // 文档注释里一直写着这条，但 switch 从来没有这个 case：
                 // XINFO CONSUMERS 拿回去的永远是 -ERR syntax error。
                 if (args.length < 4) return RespError.wrongNumberOfArguments("XINFO CONSUMERS");
-                com.zifang.z.cache.core.stream.Stream target = streams().getStream(currentDb, args[2]);
-                com.zifang.z.cache.core.stream.ConsumerGroup group =
-                        target == null ? null : target.getGroup(args[3]);
+                com.zifang.z.cache.core.stream.ConsumerGroup group = infoStream.getGroup(args[3]);
                 if (group == null) {
-                    return RespError.of("ERR", "NOGROUP No such consumer group '" + args[3]
+                    // :2562 那句以 "-" 开头，所以漏到网上是 -NOGROUP 而不是 -ERR NOGROUP：
+                    // 客户端是按**错误码**分支的，多套一层 ERR 就把"组不存在"读成"未知错误"。
+                    return RespError.of("NOGROUP", "No such consumer group '" + args[3]
                             + "' for key name '" + args[2] + "'");
                 }
                 Map<String, Long> pendingByConsumer = group.perConsumerPending();

@@ -865,10 +865,22 @@ class RedisServerProtocolSemanticsTest {
             assertTrue(rows.contains("pending, :1"), "待确认数要取真值: " + rows);
             assertTrue(rows.contains("idle, "), "idle 字段要在: " + rows);
 
+            // 键不在排在组不在之前（:2553 的 lookup 先于 :2560 的 streamLookupCG）：
+            // 抱怨一个没建过的组，等于让客户端以为键是好的。
             send(socket, "XINFO", "CONSUMERS", "sem:no-such-stream", "pool");
-            assertTrue(readReply(in).startsWith("-ERR NOGROUP"), "不存在的流要如实报 NOGROUP");
+            assertEquals("-ERR no such key", readReply(in), "不存在的键要说键");
+            send(socket, "XINFO", "CONSUMERS", "sem:consumers", "nosuchgroup");
+            assertEquals("-NOGROUP No such consumer group 'nosuchgroup' for key name 'sem:consumers'",
+                    readReply(in), "码必须是 NOGROUP：多包一层 ERR，按码分支的客户端就把它读成未知错误");
             send(socket, "XINFO", "CONSUMERS", "sem:consumers");
             assertTrue(readReply(in).startsWith("-ERR wrong number"), "缺组名要报 arity");
+            // 三个子命令共用这一问，谁都不许回"空表"糊过去（改前三条分别回 *-、*-、-ERR NOGROUP）
+            send(socket, "XINFO", "STREAM", "sem:no-such-stream");
+            assertEquals("-ERR no such key", readReply(in));
+            send(socket, "XINFO", "GROUPS", "sem:no-such-stream");
+            assertEquals("-ERR no such key", readReply(in));
+            send(socket, "XINFO", "STREAM");
+            assertEquals("-ERR syntax error, try 'XINFO HELP'", readReply(in));
         } finally {
             server.stop();
             thread.join(DEADLINE_MS);
@@ -1317,6 +1329,76 @@ class RedisServerProtocolSemanticsTest {
             send(socket, "XREAD", "STREAMS", "sem:ty:stream", "sem:ty:stream", "0-0", "0-0");
             assertEquals("[[sem:ty:stream, [[1-1, [a, 1]]]], [sem:ty:stream, [[1-1, [a, 1]]]]]",
                     readReplyDeep(in), "阳性对照：两枚好键确实各回一份，上面那一问不是空跑");
+        } finally {
+            server.stop();
+            thread.join(DEADLINE_MS);
+        }
+    }
+
+    /**
+     * -NOGROUP / -BUSYGROUP 的<b>码本身</b>就是契约：上游那两句都不是普通 ERR ——
+     * {@code t_stream.c:1509} 是 {@code addReplyErrorFormat(c, "-NOGROUP …")}（串自带前导
+     * "-"，所以不再叠 ERR），{@code :1888-1889} 干脆是
+     * {@code addReplySds(c, sdsnew("-BUSYGROUP Consumer Group name already exists\r\n"))}。
+     * 我们原先写成 {@code -ERR NOGROUP …} / {@code -ERR BUSYGROUP …}（实测 battery55:10 :11 :17），
+     * 按码分支的客户端一律落到"未知错误"：消费组的两个最常见判断（组不存在要先建、重名要跳过）
+     * 就此失效，而 {@code XPENDING} 那一支早就在发正确的 {@code -NOGROUP}（battery54:22），
+     * 同一个码在同一族里两种写法。
+     */
+    @Test
+    void streamErrorCodesTravelAsTheirOwnCode() throws Exception {
+        int port = freePort();
+        RedisServer server = new RedisServer("127.0.0.1", port, 0);
+        Thread thread = startAndWait(server, port);
+        try (Socket socket = connect(port)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+
+            send(socket, "XADD", "sem:code", "1-1", "a", "1");
+            assertEquals("1-1", readReply(in));
+            send(socket, "XGROUP", "CREATE", "sem:code", "g", "0-0");
+            assertEquals("+OK", readReply(in));
+            send(socket, "XGROUP", "CREATE", "sem:code", "g", "0-0");
+            assertEquals("-BUSYGROUP Consumer Group name already exists", readReply(in),
+                    "重名的码是 BUSYGROUP，不是 ERR");
+
+            // 键在组不在、键在组在位置是 ">"、键根本不在 —— :1505-1514 三种情形同一句原文
+            String noGroupSem = "-NOGROUP No such key '%s' or consumer group '%s' "
+                    + "in XREADGROUP with GROUP option";
+            send(socket, "XREADGROUP", "GROUP", "nosuch", "c", "STREAMS", "sem:code", "0-0");
+            assertEquals(String.format(noGroupSem, "sem:code", "nosuch"), readReply(in));
+            send(socket, "XREADGROUP", "GROUP", "nosuch", "c", "STREAMS", "sem:code", ">");
+            assertEquals(String.format(noGroupSem, "sem:code", "nosuch"), readReply(in),
+                    "\">\" 也要先问组在不在，回 *-1 等于让客户端以为在轮询等消息");
+            send(socket, "XREADGROUP", "GROUP", "g", "c", "STREAMS", "sem:nokey", ">");
+            assertEquals(String.format(noGroupSem, "sem:nokey", "g"), readReply(in));
+
+            // 整条命令作废（:1513 的 goto cleanup）：第二枚键才犯错的，第一枚那份合法结果也不许先交。
+            // 判据是"这一问拿回来的第一个响应就是错误" —— 先交了第一键的数组就会读成数组而红。
+            send(socket, "XADD", "sem:code2", "1-1", "a", "1");
+            readReply(in);
+            send(socket, "XREADGROUP", "GROUP", "g", "c", "STREAMS", "sem:code", "sem:code2", "0-0", "0-0");
+            assertEquals(String.format(noGroupSem, "sem:code2", "g"), readReply(in),
+                    "sem:code2 上没有组 g，第二问要作废整条");
+            // 作废要作废在**动手之前**：第一枚键上的 c 手上不该多出任何账
+            send(socket, "XREADGROUP", "GROUP", "g", "c", "STREAMS", "sem:code", "0-0");
+            assertEquals("[[sem:code, []]]", readReplyDeep(in),
+                    "上一问如果先投递再报错，这里就会看到 1-1");
+            send(socket, "XREAD", "STREAMS", "sem:code", "0-0");
+            assertEquals("[[sem:code, [[1-1, [a, 1]]]]]", readReplyDeep(in),
+                    "作废之后这条连接还能正常应答（没留下第二个响应错位）");
+
+            // 这一问只属于 XREADGROUP：XREAD 读不存在的键仍是"整个 *-1"（:1505 的 if (groupname)）
+            send(socket, "XREAD", "STREAMS", "sem:nokey", "0-0");
+            assertEquals("*-1", readReply(in));
+
+            // 判序：:1505 的组问排在 :1518 的 `$` 之前，所以组不在时报的是组，不是"位置写法不对"
+            send(socket, "XREADGROUP", "GROUP", "nosuch", "c", "STREAMS", "sem:code", "$");
+            assertEquals(String.format(noGroupSem, "sem:code", "nosuch"), readReply(in),
+                    "组不存在要先说话，不能让 `$` 那句抢答");
+            // 而组在的时候 `$` 仍回它自己那句（另一条用例钉句子原文，这里只要码不被牵连）
+            send(socket, "XREADGROUP", "GROUP", "g", "c", "STREAMS", "sem:code", "$");
+            assertTrue(readReply(in).startsWith("-ERR The $ ID is meaningless"),
+                    "组在的时候才轮到 `$` 那一句");
         } finally {
             server.stop();
             thread.join(DEADLINE_MS);
