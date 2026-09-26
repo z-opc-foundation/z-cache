@@ -1,5 +1,7 @@
 package com.zifang.z.cache.core.stream;
 
+import com.zifang.z.cache.common.protocol.StreamIdFormat;
+
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Iterator;
@@ -58,11 +60,31 @@ public class ConsumerGroup {
     public long getLastDeliveredSeq() { return lastDeliveredSeq; }
 
     /**
+     * 把组的"最后投递位"整段搬到给定位置 —— 上游 {@code t_stream.c:1898} 的
+     * {@code cg->last_id = id} 就是这一件事，两段一起换。
+     * <p>
+     * 只换毫秒段会让 {@code XGROUP SETID k g 7} 这种"没写 seq"的位置停在旧 seq 上：
+     * 上游的解析器在那里补的是 {@code missing_seq}（:1199），交回来已经是 {@code 7-0}。
+     */
+    public void setLastDelivered(long ms, long seq) {
+        this.lastDeliveredId = ms;
+        this.lastDeliveredSeq = seq;
+    }
+
+    /**
      * 这条 entry ID 是否比组里"最后投递"的位置更新。entry ID 是 {@code ms-seq} 二元组，
      * 必须两段一起比。
+     * <p>
+     * 两段一律带着位模式比，不许先拼成字符串再解析回去：这里的字段是 uint64，
+     * {@code 18446744073709551615} 在 Java 只能存成 {@code -1}，拼出来就是 {@code "-1--1"}，
+     * 而 {@link StreamIdFormat#parse} 按上游 {@code string2ll} 的口径把负数当越界拒收
+     * （{@code "-1"} 恰好是上游"带空格才收、裸写反倒不收"的那一支），退成 {@code {0,0}}
+     * 之后组顶变成了流起点 —— {@code XGROUP SETID k g +} 之后 {@code XREADGROUP … >}
+     * 会把整个流重投一遍，而对岸一条都不投。
      */
     public boolean isNewerThanLastDelivered(String entryId) {
-        return StreamEntry.compareIds(entryId, lastDeliveredId + "-" + lastDeliveredSeq) > 0;
+        long[] parsed = StreamEntry.parseId(entryId);
+        return StreamIdFormat.compare(parsed[0], parsed[1], lastDeliveredId, lastDeliveredSeq) > 0;
     }
 
     /**

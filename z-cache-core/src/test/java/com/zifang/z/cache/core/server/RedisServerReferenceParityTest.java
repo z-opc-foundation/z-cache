@@ -967,6 +967,17 @@ class RedisServerReferenceParityTest {
                 assertTrue(help.startsWith("["), "HELP 得是数组，实际: " + help);
                 assertTrue(help.contains("sleep"), "HELP 要列出真做得到的子命令，实际: " + help);
                 assertFalse(help.contains("segfault"), "不许照抄对岸那份清单去承诺危险操作");
+                // 形状本身也是判据：addReplyHelp 逐项 addReplyStatus，对岸实测每一项以 + 起头
+                // （battery32.zref:11 的 *["+DEBUG <subcommand>…;+segfault …"]），
+                // 我们改前是 *[$"…"]（battery32.zloc:11）—— 按 RESP 类型分支的客户端会走错那支。
+                send(s, "DEBUG", "HELP");
+                assertEquals("*5", readLine(in), "deferred multibulk 的个数头");
+                assertTrue(readLine(in).startsWith("+DEBUG <subcommand>"),
+                        "第一项是表头，且是状态串而不是 bulk");
+                for (int i = 0; i < 4; i++) {
+                    assertTrue(readLine(in).charAt(0) == '+',
+                            "第 " + (i + 1) + " 项的类型字节要是 +，不能是 $");
+                }
             } catch (IOException e) {
                 throw new RuntimeException(e);
             }

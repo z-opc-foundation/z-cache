@@ -2207,9 +2207,9 @@ public class CommandHandler {
         switch (sub) {
             case "HELP": {
                 if (args.length != 2) return unknownDebugSubcommand(args[1]);
-                Object[] lines = new Object[DEBUG_HELP.size()];
-                for (int i = 0; i < lines.length; i++) lines[i] = RespBulkString.of(DEBUG_HELP.get(i));
-                return RespArray.of(lines);
+                // 形状走 addReplyHelp 那一支（状态串数组）：battery32.zref:11 对岸实测就是 *[+…;+…]，
+                // 我们此前渲染成 *[$"…"]，每一项的类型字节都差一个。清单内容仍是本实现那五条。
+                return helpStatusArray(DEBUG_HELP);
             }
             case "SLEEP": {
                 if (args.length != 3) return unknownDebugSubcommand(args[1]);
@@ -2858,8 +2858,19 @@ public class CommandHandler {
      * <p>有意超出对岸的一条：{@code CREATECONSUMER} 是 6.2 才有的（5.0.14 没有这一支，
      * 拿它去问分派会落回"认不得的子命令"），这里保留它并让它共用上面三道闸；
      * "消费者已存在就回 :0" 那一档我手上没有尺，未动。
-     * 尚未兑现的两条：{@code SETID}（闸门已同上游，分派仍落回"认不得的子命令"）与
-     * {@code HELP}（见 {@code handleDebug} 里那份"HELP 只列真做得到的"的既有口径）。
+     *
+     * <p>本轮补上分派表里缺的两支：
+     * <ul>
+     *   <li>{@code SETID}（:1891-1901）只认五个字，答复 {@code +OK}。它取 ID 用的是
+     *       {@code streamParseIDOrReply}（<b>非严格</b>），与 {@code CREATE} 那一支的
+     *       {@code streamParseStrictIDOrReply}（:1869）差一个标志位：同一个 {@code -} / {@code +}，
+     *       CREATE 判非法 ID、SETID 照收并展开成 {@code 0-0} / {@code MAX-MAX}。</li>
+     *   <li>{@code HELP}（:1921-1922）在分派表里<b>不带个数条件</b>，所以 {@code XGROUP HELP extra}
+     *       仍回整份清单；但清单是 {@code addReplyHelp} 渲染的，每一项都是状态串而不是 bulk
+     *       （见 {@link #helpStatusArray}）。另有一条反直觉的顺序：:1826 那行注释写着
+     *       "Everything but the HELP option requires a key"，而代码实际只看 {@code argc>=4}，
+     *       所以 {@code XGROUP HELP <不在的键>} 吃的是"键必须存在"那句 —— 我们按代码，不按注释。</li>
+     * </ul>
      */
     private Object handleXgroup(String[] args) {
         if (streams() == null) return RespError.of("ERR", "Stream not configured");
@@ -2907,6 +2918,24 @@ public class CommandHandler {
                 return ok ? RespSimpleString.of("OK")
                         : RespError.of("BUSYGROUP", "Consumer Group name already exists");
             }
+            case "SETID": {
+                if (args.length != 5) return unknownXgroupSubcommand(typed);
+                String start = args[4];
+                long[] id;
+                if ("$".equals(start)) {
+                    // :1893-1894 取的是 s->last_id，而走到这里键必然在（闸门刚问过），
+                    // 所以不像 CREATE 那样还需要"流不在就当 0-0"的那一支。
+                    id = groupHost.lastId();
+                } else {
+                    // :1895 用的是 streamParseIDOrReply（非严格），与 :1869 CREATE 那一支的
+                    // streamParseStrictIDOrReply 差一个标志位：同一个 '-' / '+'，CREATE 判非法、
+                    // SETID 照收（:1179-1191 那一问只在 strict 时才拦）。missing_seq 两支都传 0。
+                    id = StreamIdFormat.parse(start, 0L, false);
+                    if (id == null) return invalidStreamId();
+                }
+                group.setLastDelivered(id[0], id[1]);
+                return RespSimpleString.of("OK");
+            }
             case "DESTROY": {
                 if (args.length != 4) return unknownXgroupSubcommand(typed);
                 return RespInteger.of(streams().xgroupDestroy(currentDb, args[2], args[3]) ? 1 : 0);
@@ -2922,10 +2951,45 @@ public class CommandHandler {
                 if (args.length != 5) return unknownXgroupSubcommand(typed);
                 return RespInteger.of(group.destroyConsumer(args[4]));
             }
+            case "HELP":
+                // :1921-1922 那一支不数参数：XGROUP HELP extra 照样回整份清单。
+                return helpStatusArray(XGROUP_HELP);
             default:
                 return unknownXgroupSubcommand(typed);
         }
     }
+
+    /**
+     * {@code addReplyHelp}（networking.c:604-617）：一个数组，<b>每一项都是状态串</b>（{@code +} 起头），
+     * 第一项是表头那一行。表头文案各版本不一样，所以由调用方连表头一起给：
+     * 对岸 4.0.9 的 {@code DEBUG HELP} 实测是 {@code "… Subcommands:"}（{@code battery32.zref:11}），
+     * 而 5.0.14 的模板是 {@code "… Subcommands are:"}，硬套一个模板就会把另一侧的量错。
+     * 我们此前把 HELP 渲染成 {@code *[$"…"]}，差的正是类型那一个字节 ——
+     * 按 RESP 类型分支的客户端会把这一支走错。
+     */
+    private static RespArray helpStatusArray(List<String> headerPlusLines) {
+        Object[] out = new Object[headerPlusLines.size()];
+        for (int i = 0; i < out.length; i++) {
+            out[i] = RespSimpleString.of(headerPlusLines.get(i));
+        }
+        return RespArray.of(out);
+    }
+
+    /**
+     * {@code XGROUP} 的 {@code help[]} 表原文（{@code t_stream.c:1800-1805}，六个字，
+     * 连 {@code CREATE} 那一条的续行一起算），前面加 5.0.14 那侧的表头。
+     * 本轮之后这五条确实都做得到，所以照抄不再违反"HELP 只列真做得到的"那条口径；
+     * {@code CREATECONSUMER} 是我们自己超出 5.0.14 的那一支，不写进来 ——
+     * 列出去就等于对 5.0.14 的用户承诺一个它没有的子命令。
+     */
+    private static final List<String> XGROUP_HELP = Collections.unmodifiableList(Arrays.asList(
+            "XGROUP <subcommand> arg arg ... arg. Subcommands are:",
+            "CREATE      <key> <groupname> <id or $> [opt] -- Create a new consumer group.",
+            "            option MKSTREAM: create the empty stream if it does not exist.",
+            "SETID       <key> <groupname> <id or $>  -- Set the current group ID.",
+            "DESTROY     <key> <groupname>            -- Remove the specified group.",
+            "DELCONSUMER <key> <groupname> <consumer> -- Remove the specified consumer.",
+            "HELP                                     -- Prints this help."));
 
     /**
      * :1923-1924 的 {@code addReplySubcommandSyntaxError}，句子在 networking.c:623-630。

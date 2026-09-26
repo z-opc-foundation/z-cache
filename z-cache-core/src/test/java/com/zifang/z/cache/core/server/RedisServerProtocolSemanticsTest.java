@@ -3207,6 +3207,166 @@ class RedisServerProtocolSemanticsTest {
         }
     }
 
+    /**
+     * {@code XGROUP SETID} 与 {@code XGROUP HELP}（上游 {@code t_stream.c:1891-1901}、
+     * {@code :1921-1922}，HELP 的线形在 {@code networking.c:604-617}）。
+     * 前一支钉的是"搬得动、且两段一起搬"，后一支钉的是每一项的类型字节。
+     *
+     * <p>改前实测（{@code battery60.pre}，33 行）里 SETID 那 12 行全部落在"认不得的子命令"，
+     * HELP 那 3 行落在同一句；补上分派后翻 15 行（{@code :6 :7 :8 :10 :11 :12 :13 :14 :16 :23
+     * :24 :25 :26 :32 :33}），其中一条顺带照出一个更早的病：
+     * 组的"最后投递位"是两个 uint64，而 {@code 18446744073709551615} 在 Java 里只能存成
+     * {@code -1}，旧代码把它拼回字符串再解析（{@code "-1--1"}）会被 {@code string2ll} 的
+     * "负数即越界"拒收、退成 {@code 0-0}，于是顶格位置读起来像流起点 —— 一条都不该投的
+     * 变成整条流重投。{@code battery61} 在新旧两版 jar 上逐行相同，证明这一条与 SETID 无关，
+     * 光用 {@code XGROUP CREATE k g 18446744073709551615-…} 就已经能踩到（{@code :1147}）。
+     */
+    @Test
+    void xgroupSetidMovesThePositionAndHelpRepliesStatusStrings() throws Exception {
+        int port = freePort();
+        RedisServer server = new RedisServer("127.0.0.1", port, 0);
+        Thread thread = startAndWait(server, port);
+        try (Socket socket = connect(port)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+
+            // ---- 阳性对照：三条目的流 + 一个从 0-0 起步的组 ----
+            send(socket, "SET", "si:str", "hello");
+            assertEquals("+OK", readReply(in));
+            send(socket, "XADD", "si:s", "1-1", "a", "1");
+            assertEquals("1-1", readReply(in));
+            send(socket, "XADD", "si:s", "2-2", "b", "2");
+            assertEquals("2-2", readReply(in));
+            send(socket, "XADD", "si:s", "3-3", "c", "3");
+            assertEquals("3-3", readReply(in));
+            send(socket, "XGROUP", "CREATE", "si:s", "g1", "0-0");
+            assertEquals("+OK", readReply(in));
+
+            // ---- 位置确实搬得动，答复是 +OK（:1900）----
+            send(socket, "XGROUP", "SETID", "si:s", "g1", "2-2");
+            assertEquals("+OK", readReply(in), "改前是\"认不得的子命令\"");
+            send(socket, "XREADGROUP", "GROUP", "g1", "c1", "STREAMS", "si:s", ">");
+            assertEquals("[[si:s, [[3-3, [c, 3]]]]]", readReplyDeep(in), "停在 2-2 之后只剩 3-3");
+            send(socket, "XGROUP", "SETID", "si:s", "g1", "$");
+            assertEquals("+OK", readReply(in));
+            send(socket, "XREADGROUP", "GROUP", "g1", "c2", "STREAMS", "si:s", ">");
+            assertEquals("*-1", readReplyDeep(in),
+                    ":1893-1894 取的是 s->last_id，比它更新的一条都没有；:1575-1585 不 serve，落 :1664 的 nullmultibulk");
+            send(socket, "XGROUP", "SETID", "si:s", "g1", "0-0");
+            assertEquals("+OK", readReply(in));
+            send(socket, "XREADGROUP", "GROUP", "g1", "c3", "COUNT", "5", "STREAMS", "si:s", ">");
+            assertEquals("[[si:s, [[1-1, [a, 1]], [2-2, [b, 2]], [3-3, [c, 3]]]]]", readReplyDeep(in),
+                    "搬回起点，整条流又是新的");
+
+            // ---- 两段一起换：bare "3" 补的是 missing_seq=0（:1199），不是停在旧 seq 上 ----
+            send(socket, "XGROUP", "SETID", "si:s", "g1", "3-3");
+            assertEquals("+OK", readReply(in));
+            send(socket, "XGROUP", "SETID", "si:s", "g1", "3");
+            assertEquals("+OK", readReply(in));
+            send(socket, "XREADGROUP", "GROUP", "g1", "c4", "STREAMS", "si:s", ">");
+            assertEquals("[[si:s, [[3-3, [c, 3]]]]]", readReplyDeep(in),
+                    "只换毫秒段会停在 3-3 什么也不投；两段一起换才退回 3-0，于是 3-3 又算新的");
+
+            // ---- SETID 用非严格解析（:1895），CREATE 用严格的那一支（:1869）----
+            String invalidId = "-ERR Invalid stream ID specified as stream command argument";
+            send(socket, "XGROUP", "CREATE", "si:s", "g9", "-");
+            assertEquals(invalidId, readReply(in));
+            send(socket, "XGROUP", "CREATE", "si:s", "g9", "+");
+            assertEquals(invalidId, readReply(in), ":1179-1180 那一问只在 strict 时拦");
+            send(socket, "XGROUP", "SETID", "si:s", "g1", "-");
+            assertEquals("+OK", readReply(in), "同一个 '-'，SETID 收并展开成 0-0");
+            send(socket, "XREADGROUP", "GROUP", "g1", "c5", "COUNT", "5", "STREAMS", "si:s", ">");
+            assertEquals("[[si:s, [[1-1, [a, 1]], [2-2, [b, 2]], [3-3, [c, 3]]]]]", readReplyDeep(in),
+                    "位置真的落在 0-0，不是 +OK 之后什么也没动");
+            send(socket, "XGROUP", "SETID", "si:s", "g1", "+");
+            assertEquals("+OK", readReply(in), "'+' 展开成 MAX-MAX");
+            send(socket, "XREADGROUP", "GROUP", "g1", "c6", "STREAMS", "si:s", ">");
+            assertEquals("*-1", readReplyDeep(in),
+                    "改前这一行交出整条流：MAX-MAX 拼成 \"-1--1\" 后解析失败、退成 0-0");
+            send(socket, "XREADGROUP", "GROUP", "g1", "c6", "STREAMS", "si:s", "0-0");
+            assertEquals("[[si:s, []]]", readReplyDeep(in), "c6 名下的历史也是空的，不是投了没记");
+
+            // ---- 同一个坑不在 SETID 这一侧：从 CREATE 起步的顶格位置一样要拦得住 ----
+            send(socket, "XGROUP", "CREATE", "si:s", "gmax", "18446744073709551615-18446744073709551615");
+            assertEquals("+OK", readReply(in), "uint64 顶格上游收（string2ull 退到 strtoull，:1147）");
+            send(socket, "XREADGROUP", "GROUP", "gmax", "r1", "STREAMS", "si:s", ">");
+            assertEquals("*-1", readReplyDeep(in), "battery61:5 改前是整条流");
+            send(socket, "XGROUP", "CREATE", "si:s", "gmid", "9223372036854775808-0");
+            assertEquals("+OK", readReply(in), "跨过 2^63 不是边界，无符号比才认得它");
+            send(socket, "XREADGROUP", "GROUP", "gmid", "r2", "STREAMS", "si:s", ">");
+            assertEquals("*-1", readReplyDeep(in));
+            send(socket, "XGROUP", "CREATE", "si:s", "gseq", "1-18446744073709551615");
+            assertEquals("+OK", readReply(in));
+            send(socket, "XREADGROUP", "GROUP", "gseq", "r4", "STREAMS", "si:s", ">");
+            assertEquals("[[si:s, [[2-2, [b, 2]], [3-3, [c, 3]]]]]", readReplyDeep(in),
+                    "seq 段顶格而 ms 段还在 1：只有 ms 更大的算新（改前 1-1 也被投出去）");
+
+            // ---- SETID 的 arity 与闸门的先后 ----
+            String unknown = "Unknown subcommand or wrong number of arguments";
+            send(socket, "XGROUP", "SETID", "si:s", "g1");
+            assertEquals("-ERR " + unknown + " for 'SETID'. Try XGROUP HELP.", readReply(in),
+                    ":1891 把 SETID 钉在 argc==5，改前这一行是假的 arity 句");
+            send(socket, "XGROUP", "SETID", "si:s", "g1", "0-0", "EXTRA");
+            assertEquals("-ERR " + unknown + " for 'SETID'. Try XGROUP HELP.", readReply(in));
+            send(socket, "XREADGROUP", "GROUP", "g1", "c7", "STREAMS", "si:s", ">");
+            assertEquals("*-1", readReplyDeep(in),
+                    "g1 仍在 MAX-MAX：被 arity 拒掉的那两次没有半途把位置搬走");
+            send(socket, "XGROUP", "SETID", "si:s", "nosuch", "0-0", "EXTRA");
+            assertEquals("-NOGROUP No such consumer group 'nosuch' for key name 'si:s'", readReply(in),
+                    ":1848 那一问不看个数，所以组存在性排在 SETID 的 arity 之前");
+            send(socket, "XGROUP", "SETID", "si:s", "g1", "bad-id");
+            assertEquals(invalidId, readReply(in), ":1895 非严格不等于不检查");
+            send(socket, "XGROUP", "SETID", "si:str", "g1", "0-0");
+            assertEquals("-WRONGTYPE Operation against a key holding the wrong kind of value",
+                    readReply(in));
+            send(socket, "GET", "si:str");
+            assertEquals("hello", readReply(in), "SETID 不碰别的键");
+
+            // ---- HELP：七项，且每一项都是状态串而不是 bulk ----
+            final String[] lines = {
+                    "XGROUP <subcommand> arg arg ... arg. Subcommands are:",
+                    "CREATE      <key> <groupname> <id or $> [opt] -- Create a new consumer group.",
+                    "            option MKSTREAM: create the empty stream if it does not exist.",
+                    "SETID       <key> <groupname> <id or $>  -- Set the current group ID.",
+                    "DESTROY     <key> <groupname>            -- Remove the specified group.",
+                    "DELCONSUMER <key> <groupname> <consumer> -- Remove the specified consumer.",
+                    "HELP                                     -- Prints this help."};
+            String[][] helpCalls = {{"HELP"}, {"help"}, {"HELP", "extra"}, {"HELP", "si:ghost"}};
+            for (String[] call : helpCalls) {
+                String[] argv = new String[call.length + 1];
+                argv[0] = "XGROUP";
+                System.arraycopy(call, 0, argv, 1, call.length);
+                send(socket, argv);
+                assertEquals("*7", readWireReply(in),
+                        ":1921 那一支不数参数；且三个字（含命令名）够不着 :1827 那道 argc>=4 的闸");
+                String[] onWire = new String[lines.length];
+                for (int i = 0; i < lines.length; i++) {
+                    onWire[i] = readWireReply(in);
+                    assertEquals("+" + lines[i], onWire[i],
+                            "第 " + i + " 项：addReplyHelp（:610-612）逐项 addReplyStatus，类型字节是 + 而不是 $");
+                }
+                // 判的是服务器交回来的那七行，不是测试自己写的那份常量
+                assertFalse(String.join("|", onWire).contains("CREATECONSUMER"),
+                        "那是我们超出 5.0.14 的一支，列出去等于向 5.0.14 的用户承诺它没有的子命令");
+            }
+            // 不列 ≠ 不兑现：这一支照样做得动，只是不对外写
+            send(socket, "XGROUP", "CREATECONSUMER", "si:s", "g1", "cX");
+            assertEquals(":1", readReply(in));
+
+            // 闸门不会因为"它是 HELP"就跳过：:1826 的注释写着 HELP 不要键，而 :1837 的代码
+            // 只看 argc>=4，没有给 HELP 豁免 —— 按代码，不按注释。
+            send(socket, "XGROUP", "HELP", "si:ghost", "g1");
+            assertEquals("-ERR The XGROUP subcommand requires the key to exist. Note that for CREATE"
+                    + " you may want to use the MKSTREAM option to create an empty stream automatically.",
+                    readReply(in), "四个字（含命令名）就够着了那道闸");
+            send(socket, "XGROUP", "HELP", "si:str", "g1");
+            assertEquals("-WRONGTYPE Operation against a key holding the wrong kind of value",
+                    readReply(in), "同一道闸里的类型那一问（:1830）也照样管着 HELP");
+        } finally {
+            server.stop();
+            thread.join(2000);
+        }
+    }
+
     /** 只解析测试用到的一层 RESP 形状：+/-/: 单行，$ bulk 按声明长度读满。 */
     private static String readReply(DataInputStream in) throws IOException {
         String line = readLine(in);

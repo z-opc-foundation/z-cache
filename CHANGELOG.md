@@ -624,13 +624,73 @@ All notable changes to z-cache will be documented in this file.
   - **S7 证明"类型 vs 键存在"在 XGROUP 这一族也可观测**：被 String 占着的键在 store 那一层
     `getStream` 同样返回 null，顺序一换就会把 WRONGTYPE 答成"键必须存在"那句
     （`battery59:13 :23` 钉的是同一对，S7 两支红分别落在新旧两个方法里）。
-- **仍差一层，没修**（不是漏网，是单独一次提交的面）：`XGROUP SETID` 的分派（闸门已经同上游，
-  `argc==5` 那一支会把上一步的键、组两问答对，然后落回"认不得的子命令"）与 `XGROUP HELP`
-  （同样落回那一句，且那句自指）。HELP 那一条要先解决"清单里能列哪几条"：本仓在 `DEBUG HELP`
-  那里立的口径是"只列真做得到的，照抄对岸那份等于对外承诺实现 segfault"
-  （`CommandHandler.java:2198`），而把 SETID 列进 XGROUP HELP 就正好违反这条。
+- **当时记为"仍差一层"的那两格已在本节闭合**：`XGROUP SETID` 与 `XGROUP HELP` 的分派。
+  上一轮之所以不敢顺手补，是因为 HELP 要先定"清单里能列哪几条"：本仓在 `DEBUG HELP` 那里立的
+  口径是"只列真做得到的，照抄对岸那份等于对外承诺实现 segfault"（`CommandHandler.java:2269`），
+  而把 SETID 列进 XGROUP HELP 就正好违反那条 —— 所以顺序必须是先兑现 SETID，再谈照抄清单。
   另有 `CREATECONSUMER` 是有意超出 5.0.14 的那一条（6.2 才有），本轮只让它共用闸门，
   "已存在的消费者回 :0" 仍未动 —— 我手上没有 6.2 的尺。
+
+#### `XGROUP SETID` 兑现，以及 `HELP` 交回来的每一项是什么类型
+
+- 权威仍是上游 5.0.14 的 `t_stream.c`（这一族没有参考实例：4.0.9 根本不认 stream 类型）。
+  分派表里 `SETID`（:1891-1901）与 `HELP`（:1921-1922）两支本轮之前整条不兑现：闸门（上一轮）
+  已经把键、组、类型三问答对，走到分派才落回"认不得的子命令"。
+- **`SETID` 取 ID 用的是非严格解析**，本轮最实在的一条：:1895 是 `streamParseIDOrReply`，
+  而 :1869 的 CREATE 是 `streamParseStrictIDOrReply`，两支只差 `strict` 那一个标志位
+  （:1179-1180 那一问只在 strict 时才拦）。于是同一个 `-`：`XGROUP CREATE k g -` 回
+  `Invalid stream ID specified as stream command argument`，`XGROUP SETID k g -` 回 `+OK`
+  并把位置放到 `0-0`；`+` 同理展开成 `MAX-MAX`。`missing_seq` 两支都传 0，所以
+  `XGROUP SETID k g 3` 是 `3-0`，不是"只换毫秒段、seq 停在旧值"——T5（只搬毫秒段）正是红在这里。
+  `$` 那一支取 `s->last_id`（:1893-1894），且不像 CREATE 还需要"流不在就当 0-0"那一步：
+  走到 SETID 时键必然在，闸门刚问过。
+- **`HELP` 的每一项是状态串（`+`），不是 bulk（`$`）**。这一条不是从 5.0.14 读出来的，是在
+  *有实例* 的那一侧量出来的：`addReplyHelp`（`networking.c:604-617`）交的是 deferred multibulk
+  而逐项 `addReplyStatus`，实测对岸 4.0.9 的 `DEBUG HELP` 是
+  `*["+DEBUG <subcommand> …;+segfault …]`（`battery32.zref:11`），而同一格我们一直是
+  `*[$"…"]`（`battery32.zloc:11`）—— 差的正是类型那一个字节，按 RESP 类型分支的客户端会走错那支。
+  也就是说这条漂移早在 string 族那几轮就该照出来，只是当时的断言只比了"是不是数组、有没有 sleep"，
+  没比类型；本轮把它做成 `helpStatusArray` 一处渲染、两个 HELP 共用，并在对岸那一侧的
+  `debugSubcommandGrammarMatchesTheReference` 里补钉 `*5` 与逐项 `+`。
+  表头文案两边不同（4.0.9 实测 `… Subcommands:`，5.0.14 的模板是 `… Subcommands are:`），
+  所以表头由调用方随清单一起给，不套同一个模板 —— 套一个就会把另一侧量错。
+- 清单内容按 `t_stream.c:1800-1805` 那七行逐字钉住（含 `CREATE` 一条的续行），
+  而 `CREATECONSUMER` **不列**：那是我们超出 5.0.14 的一支，列出去等于向 5.0.14 的用户承诺它没有的
+  子命令。"只列真做得到的"那条口径到这里不再与照抄冲突，因为清单上那五条现在确实都做得到。
+- **HELP 不躲取键那道闸**：:1826 的注释写着 "Everything but the HELP option requires a key"，
+  而 :1837 的代码只看 `argc>=4`，没给 HELP 豁免。所以 `XGROUP HELP <不在的键>`（连命令名三个字）
+  回清单，`XGROUP HELP <不在的键> <组>`（四个字）回"键必须存在"那句。按代码，不按注释。
+- **顺带照出一个比 SETID 更早的病**：组的"最后投递位"是两个 uint64，而
+  `18446744073709551615` 在 Java 里只能存成 `-1`。`ConsumerGroup.isNewerThanLastDelivered`
+  过去先把两段拼成字符串、再让 `StreamEntry.compareIds` 解析回去，`"-1--1"` 在 `string2ll`
+  那一步被"负数即越界"拒收（正是 `StreamIdFormat` 里"裸 `-1` 不收、带空格的 ` -1` 才收"那对
+  不对称的下游），解析退成 `0-0` ⇒ 顶格位置读起来像流起点，**一条都不该投的变成整条流重投**。
+  修法：两段带着位模式直接比（`StreamIdFormat.compare`），不再经过字符串。同一族的
+  `Stream.java:205` 用的本来就是 `Long.toUnsignedString`，是对的 —— 全仓只有这一处在拼。
+- **`>` 无可投时是 `*-1`，不是空表**：:1570-1585 判定不 serve，落 :1662-1664 的 `nullmultibulk`；
+  而"读历史"（ID 不是 `>`）必给 `[[key, []]]`。两条判据在同一次测量里形成对照，
+  这样"顶格位置之后没东西"不会被写成"整个请求被吞掉"。
+
+- 量具与判红：
+  - `battery60`（33 行：八格 SETID 写 + 六格跟随的 `>` 读 + 三格 HELP + 闸门/WRONGTYPE/对照）
+    改前 `battery60.pre`、补分派后 `battery60.post` —— 翻 **15 行**
+    （`:6 :7 :8 :10 :11 :12 :13 :14 :16 :23 :24 :25 :26 :32 :33`）。
+  - 顶格那一处的修法单独量：`battery61`（13 行，四个组分别起步于 `MAX-MAX`、`2^63-0`、`0-0`、
+    `1-MAX`）在**改 SETID 之前与之后逐行相同**（`battery61.pre` 与 `battery61.post` diff 为空），
+    这一条把病因钉在 SETID 之外 —— 光 `XGROUP CREATE k g 18446744073709551615-…` 就能踩到。
+    修完之后 `battery61` 翻 4 行（`:5 :7 :11 :12`），`battery60` 再翻 1 行（`:13`）。
+  - 一处必须写下来的巧合：`battery60:13`（`SETID +` 之后读 `>`）在**改前的树上恰好与上游一致**
+    （`*-1`）—— 那是两处错互相抵消的结果：SETID 未兑现 ⇒ 位置没动，位置本来就停在 `0-0` 之后
+    又被上一轮读满。补了 SETID 而没修顶格比较时它反而变成"整条流"。所以"这一行改前就对了"
+    不能当不动的理由，也不能拿它当这条修法的证据。
+  - 协议层：`RedisServerProtocolSemanticsTest.xgroupSetidMovesThePositionAndHelpRepliesStatusStrings`
+    把上面每一条走一遍（含七行清单逐项 `+`、`XGROUP help` / `HELP extra` 的同答复、
+    四个字时的那道闸、以及 `1-MAX` 起步只投 ms 更大的那两格）。
+  - 具名变异：`code_mut.py` 的 T 族 9 支（T1 分派、T2 arity、T3 严格/非严格、T4 的 `$`、
+    T5 两段一起换、T6 HELP 分派、T7 渲染器类型、T8 闸前抢答、T9 把改前那一行原样装回），
+    9/9 KILLED。T8 第一遍是 SURVIVED，因为插入点本来就在两道闸之后 —— 那是等价变异，
+    换成真把 HELP 提到闸之前才红在那句"键必须存在"上。探针池 52→**61 支 / 62 个锚点**。
+
 
 ### Added
 - `RedisServer.serverScope()`：只读拿到本台那一份，测试与嵌入式据此判断作用域边界。
@@ -780,6 +840,37 @@ All notable changes to z-cache will be documented in this file.
   加 S 族时 `anchors` 当场 FAIL：P2（XREADGROUP 的 NOGROUP）那 1 行锚点被我新写的 :1852 那一句
   撞成了两处 —— 上游两处本就是同一句话，把 P2 的锚点扩到含 `// :2562 …` 那两行注释才唯一。
   **这次 FAIL 是量具自己先红，不是被测代码红**，且在建任何 jar 之前就被抓住。
+- 新公开面两处：`ConsumerGroup.setLastDelivered(ms, seq)`（SETID 与 XREADGROUP 推进位置共用的
+  那一步，两段一起换）与 `CommandHandler.helpStatusArray(...)`（`addReplyHelp` 的线形，
+  `DEBUG HELP` 与 `XGROUP HELP` 共用一个渲染器）。
+- 本轮的电池 `battery60.txt` 33 行（`:1` PING、`:2-:5` 建三条目的流与一个组、`:6-:16` SETID 的
+  写读交替（`2-2` / `$` / `-` / `+` / `5` / `bad-id`）、`:17-:21` 组不在 / 键不在 / arity 三格、
+  `:22` 与 `:27 :28 :29` 拿 `CREATE` 的严格解析和 String 键当对照、`:23` 有效写、
+  `:24-:26` HELP 三格、`:30-:33` 收尾核副作用）。三侧各 `wrote=33 lost=none`：
+  改前 `battery60.pre` 由 `jar_setid_pre`（整包 `ebb0ce4c…`、`CommandHandler.class` `0828479e…`
+  = HEAD `26e0daa` 那棵树）量得；补分派后 `battery60.post` 由 `jar_setid_post`（整包 `e910cff9…`、
+  CH `c08cfcd6…`、`ConsumerGroup.class` `282370ec…`）量得；修顶格比较后 `battery60.cgfix`
+  由 `jar_cgfix`（整包 `4e08f52f…`、CH 同一枚 `c08cfcd6…`、CG `be8d543f…`）量得 ——
+  两枚 jar 的 CH 相同是因为那一步只动了 `ConsumerGroup`。
+  提交前又用**提交树重建**的那枚（`jar_committed`，整包 `c0953be0…`、CH `26e5ff49…`、
+  CG `be8d543f…`）把三侧各重放了一遍：读数与 `battery60.cgfix` / `battery61.cgfix` /
+  `battery62.post` **逐行相同**（三行各 `wrote=33 / 13 / 10`、`lost=none`）。
+  CH 的 class md5 会漂是因为后面只加了注释（行号表跟着动），行为字节没变 ——
+  这正是"整包 md5 只作参照、身份看 class、而 class 相同也不等于源码相同"的那一条。
+- `battery61.txt` 13 行是**为了给一个病定年代而写的**：四个组分别起步于 `MAX-MAX` / `2^63-0` /
+  `0-0` / `1-MAX`，每个组后面紧跟一次 `>` 读。它在 `jar_setid_pre` 与 `jar_setid_post` 上
+  **逐行相同**（`battery61.pre` 与 `battery61.post` diff 为空），因此"顶格位置读起来像流起点"
+  不是 SETID 带进来的；修完才翻 4 行。`battery62.txt` 10 行是下一轮的改前面
+  （XPENDING 摘要那两处形状，见下面的已知边界）。
+- `code_mut.py` 涨到 **61 支 / 62 个锚点**（新增 T1-T9，`python3 code_mut.py T` 分族跑）。
+  T 族的选取器必须同时带上新方法与对岸那一侧的 `debugSubcommandGrammarMatchesTheReference`，
+  因为 `helpStatusArray` 是两个 HELP 共用的渲染器 —— 只跑 XGROUP 那侧等于没量 DEBUG 那侧的读者。
+  脚本的"族名前缀"判断里原本没有 `T`，不加 `code_mut.py T` 会被当成一支未知探针而 FATAL。
+  快照换成本轮工作树的 `CommandHandler.java` `78c90f1a…` 与 `ConsumerGroup.java` `93c86d99…`，
+  9 支逐支回读还原 md5 与副本相同（T8 那一支改写过一次，见上面那一节的记录）。
+- 全量反应堆：**877 例全绿，连跑两遍**（`358 + 383 + 134 + 2`，四个模块各自 0 失败 0 错 0 跳过，
+  `b60_full.log` 与 `b60_full2.log` 尾都是 `BUILD SUCCESS`），core 从上一轮的 382 抬到 383
+  （本轮新增一条协议用例）。第二遍是在测试文件又加了一格（`XGROUP HELP <不在的键>`）之后跑的。
 
 ### 已知边界（这一版没动，说清楚）
 - RESP3 / `HELLO`、`EVAL` / `EVALSHA` / `SCRIPT` 依旧没有服务端实现，客户端 `DistributedLock`
@@ -856,6 +947,15 @@ All notable changes to z-cache will be documented in this file.
     - `XPENDING` 的逐条目形式仍明确拒绝：`battery55:39 :40 :41` 三行都回
       `-ERR XPENDING detail form (IDLE / start / end / count) is not supported`；摘要形式 `:45`
       回 `:1 / "1-1" / "1-1" / [[c55,1]]`。
+    - **`XPENDING` 的摘要形式有两处形状不合，本轮新量出来（`battery62` 10 行，
+      改前即现在的树 `battery62.post`）**：
+      一是 PEL 空的时候第 4 项该是 **null 数组**（:2059-2062 连 `start`/`end` 一起答三个 null，
+      实测 `:0;$-;$-;*0`）；二是 PEL 非空时**手上没东西的消费者要被跳过**
+      （:2086 那句 `if (raxSize(consumer->pel) == 0) continue;`，实测 `:1;"2-2";"2-2";[[c1,"0"],[c2,"1"]]`
+      里那个 `c1` 不该出现）。第二条的成因很清楚也很坑：这份行数是
+      `ConsumerGroup.perConsumerPending()` 给的，它按设计**包括 0 条的消费者**，因为
+      `XINFO CONSUMERS` 要的就是那个形状（`battery` 里早就钉过）—— 两个读者要两种形状，
+      共用一个来源就一定有一侧错。这一处与上面的逐条目形式是同一支的活，另开一轮。
     - `XSETID` / `XCLAIM` / `XAUTOCLAIM` 三行（`battery55:36 :37 :38`）都回
       `-ERR unknown command '…'`。
     - **`XGROUP CREATECONSUMER` 没有权威可比**：`battery55:44` 对已存在的消费者回 `:1`。
