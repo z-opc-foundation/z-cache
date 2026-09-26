@@ -238,6 +238,36 @@ class StreamTest {
         assertEquals(1, store.xlen(0, "s1"));
     }
 
+    /**
+     * 表顶（上游的 {@code s->last_id}）与"还活着的最大学 ID"（{@code streamLastValidID}）
+     * 是两件事，XDEL 掉最大那条之后才分得开：前者必须留在原处（XADD 的单调性闸要它那样，
+     * 否则同一个 ID 能重发一遍），后者要退回去（XREAD 拿它判"这个位置之后还有没有条目真交得出去"，
+     * {@code t_stream.c:1586-1593}）。混成一个的两种错法：拿 lastId 去判 XREAD，会给客户端点名
+     * 一个列表为空的键；拿 lastValidId 去判 XADD，等于允许 ID 空间倒退。
+     */
+    @Test
+    void testTopAndLastValidIdDivergeAfterDelete() {
+        assertNull(stream.lastValidId(), "空流没有存活条目");
+        stream.addEntry(Collections.singletonMap("k", "v1"), "100-0");
+        stream.addEntry(Collections.singletonMap("k", "v2"), "200-0");
+        stream.addEntry(Collections.singletonMap("k", "v2b"), "200-5");
+        stream.addEntry(Collections.singletonMap("k", "v3"), "300-0");
+        assertArrayEquals(new long[]{300L, 0L}, stream.lastValidId());
+        assertArrayEquals(stream.lastId(), stream.lastValidId(), "没删过的时候两者相同");
+
+        assertEquals(1L, stream.delete("300-0"));
+        assertArrayEquals(new long[]{200L, 5L}, stream.lastValidId(),
+                "毫秒段相同要比序号段：200-5 才是活着的那条最大值，只比毫秒会停在 200-0");
+        assertArrayEquals(new long[]{300L, 0L}, stream.lastId(), "表顶不许跟着退");
+
+        stream.delete("100-0", "200-0");
+        assertArrayEquals(new long[]{200L, 5L}, stream.lastValidId(),
+                "删掉同 ms 的那条不影响最大值——取列表末位会恰好撞上，取「最大值」不会");
+        stream.delete("200-5");
+        assertNull(stream.lastValidId(), "全删光了就没有存活条目，不是 0-0");
+        assertArrayEquals(new long[]{300L, 0L}, stream.lastId());
+    }
+
     // ==================== StreamEntry ID 解析 ====================
 
     @Test

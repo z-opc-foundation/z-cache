@@ -660,6 +660,10 @@ class RedisServerProtocolSemanticsTest {
             send(socket, "XREAD", "STREAMS", "sem:pos", "1-2");
             assertEquals("[[sem:pos, [[2-0, [a, 3]]]]]",
                     readReplyDeep(in), "读得到的条目仍然读得到——$ 之外没有别的位置被抬高");
+            send(socket, "XREAD", "STREAMS", "sem:pos", "2-0");
+            assertEquals("*-1", readReplyDeep(in),
+                    "2-0 之后已经没有活着的条目：3-0 被 XDEL 带走了，表顶仍停在 3-0 也不该让这个键被点名"
+                            + "（:1590 拿的是 streamLastValidID，不是 s->last_id）");
 
             // ---- XREADGROUP 的历史位：各消费者一份 PEL ----
             send(socket, "XADD", "sem:grp", "1-1", "a", "1");
@@ -684,6 +688,10 @@ class RedisServerProtocolSemanticsTest {
             send(socket, "XREADGROUP", "GROUP", "g", "c1", "STREAMS", "sem:grp", "1-0");
             assertEquals("[[sem:grp, [[1-1, [a, 1]]]]]", readReplyDeep(in),
                     "1-0 的后继正好是 1-1：位置本身排他，加过一之后那一头是闭区间");
+            send(socket, "XREADGROUP", "GROUP", "g", "c1", "STREAMS", "sem:grp", "1-1");
+            assertEquals("[[sem:grp, []]]", readReplyDeep(in),
+                    "历史位也一样排他：1-1 正是 c1 手上那条，位置写它自己也不能把它再交出来"
+                            + "（:1603 加过一，:1093 才按 >= 在 PEL 上 seek）");
             send(socket, "XREADGROUP", "GROUP", "g", "c1", "STREAMS", "sem:grp", "2-0");
             assertEquals("[[sem:grp, []]]", readReplyDeep(in), "2-0 之后的历史是空的，但键仍要点名");
             send(socket, "XREADGROUP", "GROUP", "g", "c1", "STREAMS", "sem:grp", "2-1");
@@ -767,9 +775,15 @@ class RedisServerProtocolSemanticsTest {
             assertEquals(dollar, readReply(in));
             send(socket, "XREAD", "STREAMS", "sem:sp", "sem:sp", "0-0", ">");
             assertEquals(gt, readReply(in));
+            send(socket, "XINFO", "CONSUMERS", "sem:sp", "g");
+            String consumers = readReplyDeep(in);
+            assertTrue(consumers.contains("name, c1"), "c1 是被前面那次 \">\" 真读过的: " + consumers);
+            assertTrue(!consumers.contains("c2"),
+                    "被作废的那两条命令连消费者都不该登记出来: " + consumers);
+
             send(socket, "XREADGROUP", "GROUP", "g", "c2", "STREAMS", "sem:sp", "0-0");
-            assertEquals("[[sem:sp, [[1-1, [a, 1]]]]]", readReplyDeep(in),
-                    "作废的那两次一条都没消费掉，c2 的历史仍是空的？不——c2 从没领过，这里读的是 PEL 起点 0-0");
+            assertEquals("[[sem:sp, []]]", readReplyDeep(in),
+                    "c2 的账上是空的：作废的那两条一条都没投递给它，读历史也就什么都没有");
         } finally {
             server.stop();
             thread.join(DEADLINE_MS);

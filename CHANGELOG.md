@@ -213,6 +213,67 @@ All notable changes to z-cache will be documented in this file.
   M10 表顶比较换回有符号 → `uint64 的最大值本身是合法 ID…==> expected: <18446744073709551615-18446744073709551615> but was: <-ERR …equal or smaller…>`（同一支还把 `XRANGE` 那一条拖红）；
   M11 表顶改读"最后一条条目" → `流都空了也不能把 5-5 重发一遍 ==> expected: <-ERR …equal or smaller…> but was: <5-5>`。
 
+#### XREAD / XREADGROUP 的那个参数是"位置"，不是"范围起点"
+
+- **依据档次先说清楚**：这一族仍然在钉住的参考实例上量不到（redis-server 4.0.9 连 `XADD` 都不认，
+  250 实测每条 stream 行都回 `-ERR unknown command 'XADD'`）。本节每一行的右边全部来自
+  上游 `t_stream.c`（5.0.14）的行号，`battery52` 那 47→55 行是**本机改动前后的自比对**
+  （`zreplay.py` 打的是我们自己那台服务器），不是与参考实例的对拍。改前 47 行里 **17 行答错**，
+  改后逐行与源码推出来的期望一致。
+- **位置排他**：`t_stream.c:1560` 那一行的注释就是 `/* ID must be greater than this. */`，
+  而交给范围查询的 start 是 `streamIncrID` **之后**的值（:1602-1603）。于是
+  `XREAD STREAMS k 1-1` 交回的是 `1-2` 往后，不含 `1-1` 自己；改前把 `1-1` 也交出去，
+  客户端拿着这个答复再问一次 `1-1`，就永远停在同一条上。
+- **"没有条目可交"时整个键不点名**：:1586-1593 先问 `if (s->length)`，再拿**存活条目的最大值**
+  （`streamLastValidID`，:1590）与位置比；一个键都没点名才是 `*-1`（:1664）。为此
+  `Stream` 新增 `lastValidId()`，与上一支的 `lastId()` 明确分家 —— XDEL 掉最大那条之后
+  前者退回去、后者不许退（拿 `lastId()` 去判这一问，会给客户端点名一个列表为空的键，
+  变异探针 M20 就是这个错法，红在"`XREAD … 2-0` 之后已经没有活着的条目"）。
+- **后继会回绕**：`streamIncrID`（:77-89）两段都到顶时回绕成 `0-0`，那个函数没有返回值，
+  不存在"停在 MAX-MAX"这一说。XREAD 这一侧观察不到它（:1591 那道闸先把它挡住），
+  XREADGROUP 读历史**没有**那道闸，所以 `XREADGROUP … MAX-MAX` 交出的是整个历史。
+  这一支只有纯函数层（`StreamIdFormatTest.successorCarriesAndWrapsLikeStreamIncrID`）
+  和历史那一侧钉得住，M15（钳顶）与 M15b（丢掉 ms 进位）两支都在那里判红。
+- **`$` 是"这条流当前的位置"**：:1527-1533 取的是 `s->last_id`，键不在时才折成 `0-0`。
+  改前 `$` 等于整条流。表顶不因 XDEL 后退，所以 `$` 也停在那儿 —— 而"表顶不后退"这件事
+  只影响 `$`，不该顺手把 `XREAD … 2-0` 那一问也抬高（两条都在 `xreadPositions…` 里各钉一行）。
+- **XREADGROUP 带明确 ID 读的是这个消费者自己的 PEL**：:981-984 把查询来源整个换掉，
+  :1083-1120 只按消费者本地 PEL 的序遍历。这一换带来五件各自要钉的事：
+  1. 别的消费者领走的东西不会出现在这里（改前把一个从没领过任何条目的 `c2` 的历史答成整条流）；
+  2. 位置同样排他 —— `raxSeek(">=", 加过一的位置)`（:1093），所以位置写自己手上那条也交不出它；
+  3. **空历史也要点名这个键**（:1596-1598 的 `arraylen` 无条件自增），是 `[[k, []]]` 不是 `*-1`；
+  4. PEL 上还压着、条目却已被 XDEL 的那条，交回 `[id, nil]`（:1101-1109），不是悄悄少一条
+     —— 少一条等于让客户端以为从没领过它，那条就永远不会被重新处理；
+  5. 这次读要顺手把消费者登记出来（:1610-1612 的 `streamLookupConsumer(…, SLC_NONE)` 会建，
+     :1745-1757），于是"读一份空历史"之后 `XINFO CONSUMERS` 看得见 `pending, :0` 的它。
+- 同一句 `STREAMS` 里把同一个键写两遍是**两问**，不是"后者覆盖前者"：上游那一段是数组不是查表。
+  改前位置装在 `LinkedHashMap` 里，重复键被并成一个。
+- `COUNT 0` 在上游是"不限"，不是"一条"（:1441 把负数折成 0，:1063 是
+  `if (count && count == arraylen) break;`）。这一条我一开始记的是"上游钳到 1"，
+  读了那两段才把自己的假设否掉 —— 代码本来就是对的，改的是测试里那句错的注释，
+  没有为了迁就注释去动实现。
+- **两个特例各只属于一个命令，且用错了命令有自己的一句话**（:1519-1525 的 `$`、
+  :1536-1541 的 `>`），并且是 `goto cleanup`：**整条命令作废**，同一条里后面那些合法位置也不交。
+  这两句在上一节里其实已经被钉过 —— 但只钉了**前缀**（`startsWith("-ERR The $ ID is meaningless"…)`），
+  于是句子的后半段、以及"作废是整条作废还是只作废那一个键"这两点结构上无人可验。
+  `eachSpecialPositionIdBelongsToOneCommand` 把它们换成逐字 `assertEquals`，并补上
+  "后面那个位置合法也不许先交结果" 与 "被作废的两次连消费者都不该登记出来"，
+  同时带阳性对照（`$` 在 XREAD 上、`>` 在 XREADGROUP 上都要被收下，否则负判据是空跑）。
+  探针 M24 就是把 `$` 那句的后半段整段删掉：只有前缀那把尺时它必然活下来，现在点名判红。
+- 本轮另跑 **18 支具名变异，18 支全部点名判红、按字节还原并 md5 对账**（脚本
+  `~/.cache/zcache_gauges/read_mut.py`，快照 `read_snapshot/`，日志 `read_mut_all.log`
+  与 `mut_M2*.log`）：摘掉后继那一加、把 `$` 折成 `0-0`、摘掉"存活条目比位置大"那道闸、
+  那道闸改用不退的表顶、空历史不点名键、已删条目渲染成空字段、历史位不加后继、
+  历史起点改成排他、PEL 不分消费者、历史改从流里扫、`successor` 钳顶 / 丢进位、
+  `lastValidId` 只比毫秒段、XREAD 的 strict 位填反、两个特例分支各摘一次、
+  `$` 那句只留前半段（M24）、把"整条作废"降级成"只作废那一个键"（M25）。
+  M6（XREAD 的 strict 位填反）是上一节那支探针的复跑，这一轮把它放到两个测试类上连跑，
+  三处点名判红：旧的那句"`>` 在 XREAD 上要回原文"，加上这一节新用例的"`$` 在 XREAD 上合法"
+  两处 —— "`$` 这一侧看得见"只有新用例给得出。
+- **有意没做的一条**：读历史时上游会给重新交出的条目抬 `delivery_count` / `delivery_time`
+  （:1111-1113）。我们的 PEL 是 `Map<String, String>`（条目 ID → 消费者名），这两个值没有任何读者，
+  所以这一支不引入"写了没人读"的元数据；它归在下面的已知边界里。
+
 ### Added
 - `RedisServer.serverScope()`：只读拿到本台那一份，测试与嵌入式据此判断作用域边界。
 - `StreamIdFormat`（z-cache-common）：stream ID 的唯一文法（uint64 两段、`-` / `+` 两种位置、
@@ -224,6 +285,26 @@ All notable changes to z-cache will be documented in this file.
   `RedisServerProtocolSemanticsTest.xaddRejectsIdsAtOrBelowTheStreamTop` 把三种"不升"
   （等于表顶 / 同 ms 更小 seq / 更小 ms）、两句文案的判序、删空裁空后表顶仍在、
   被拒不留键，以及"最大 ID 写进去之后 `*` 也回用尽"各钉一行。
+- `StreamIdFormat.successor(ms, seq)`：上游 `streamIncrID`（:77-89）那一位，含 ms 进位与
+  MAX-MAX 回绕成 `0-0`。XREAD 与 XREADGROUP 的历史位共用它（上游也是同一处 :1603）。
+  `StreamIdFormatTest.successorCarriesAndWrapsLikeStreamIncrID` 钉纯函数层，
+  历史侧的回绕由协议用例钉（XREAD 那一侧结构上看不见，见上一节）。
+- `Stream.lastValidId()`（上游 `streamLastValidID`，全删光时返回 null 而不是 `0-0`，
+  毫秒段相同还要比序号段）与 `ConsumerGroup.pendingIdsOf(consumer)`（这个消费者手上
+  没 ACK 的条目，按 ID 升序）。
+- `StreamStore.xreadgroup(...)` 拆成 `xreadgroupNew(...)`（按组的位置投新条目并记账）
+  与 `xreadgroupHistory(...)`（只读这个消费者的 PEL；返回 null 专指"键或组不在"，
+  与"空历史"分开，因为这一版还不回 NOGROUP）。
+- `CommandHandler.streamEntryReply(id, fields)`：三处 stream 条目的渲染收成一处，
+  `fields == null` 就是上游 :1109 那个 `addReply(c, shared.nullmultibulk)`（`$-1`），
+  不是空字段列表。
+- `RedisServerProtocolSemanticsTest.xreadPositionsAreExclusiveAndHistoryComesFromTheConsumerPel`
+  把上面这一整套按网线上的原文逐行钉住：严格大于、`COUNT 1` / `COUNT 0`、seq 用尽进 ms、
+  MAX-MAX 两个方向（XREAD 交出 `*-1`、历史交出全份）、`$` 的三种落点、空历史仍点名键、
+  消费者之间的 PEL 隔离、ACK 之后退账、位置排他的两端（`1-0` 交出 `1-1`、`1-1` 不交自己）、
+  重复键名是两问、XINFO 看得见空历史建出来的消费者、被 XDEL 那条交回 `[id, nil]`。
+- `RedisServerProtocolSemanticsTest.eachSpecialPositionIdBelongsToOneCommand`
+  钉 `$` / `>` 那两句原文与"整条命令作废"，两头都带对照。
 - `RedisServerProtocolSemanticsTest` 增加 2 条端到端回归（`streamKeyspaceIsScopedToOneServerInstance`
   两头都量：B 读不到 A 的流，同时 A 读得到自己的流；
   `serverWithoutDataDirDoesNotDisableOtherServersPersistence` 先钉"带 dataDir 这台本来能 SAVE"
@@ -270,8 +351,9 @@ All notable changes to z-cache will be documented in this file.
   脚本 `~/.cache/zcache_gauges/zmut_bitop.sh`。
 
 - 计数只认实测（`tally.py` 从 surefire 报告聚合，空运行会硬 FATAL 而不是打"0 例全绿"）：
-  `mvn clean test` 全量 **357 + 374 + 134 + 2 = 867 例全绿，0 skipped**（1.3.6 内上一次记录是 832；stream ID 那两支一共加进 35 条）。上一版本节写的
-  "96 + 340 + 133 + 2 = 571" 是位族五支进来之前的旧数，一并订正。
+  `mvn clean test` 全量 **358 + 377 + 134 + 2 = 871 例全绿，0 skipped**（1.3.6 内上一次记录是
+  357 + 374 + 134 + 2 = 867；读侧这一支加进 4 条：`successor` 一条、`lastValidId` 一条、
+  协议层两条）。再往前那节写的"832"与"96 + 340 + 133 + 2 = 571"都是旧刻度，一并留档。
 - 这类跨实例作用域缺陷只在"整模块连跑"的形态下现形，所以按 `-Dsurefire.runOrder=random`
   把 common+core 连跑 9 次（3 + 6 两批）：**7 次 324 + 372 全绿，2 次不是**。执行顺序确实
   变了（三批的 md5 `355a02d4…` / `0b99054e…` / `911368ea…` 互不相同，不是只传了个开关）。
@@ -286,15 +368,40 @@ All notable changes to z-cache will be documented in this file.
   因此仍走"GET 校验后 DEL"的非原子路径。
 - Stream 不参与 RDB/AOF；只有 String 键的 TTL 进快照（集合键连 `EXPIRE` 都还不支持，
   所以 `RENAME` 也只搬得动 String 的 TTL）。
-- Stream 这一族的**文法**与 **XADD 的单调性**收了，**读侧语义**没收，三条都在
-  `battery50` 里有实测行：`XREAD STREAMS k 1-1` 把 `1-1` 自己也交出去（上游那一位的注释是
-  `/* ID must be greater than this. */`，:1560）；`XREAD … $` 交回整条流而不是"最后一条之后"；
-  `XREADGROUP` 带明确 ID 的"读历史"是按条目而非按 PEL 给的。
-  这三处是下一支的内容，本轮没有动，也没有把它们写成"已对齐"。
+- Stream 这一族的**文法**、**XADD 的单调性**、**XREAD / XREADGROUP 的位置语义**这一版都收了，
+  剩下的读侧边界在**答复层**与**类型层**，两支各自独立。下面每一条都是刚量出来的现状
+  （`battery53` 25 行，本机 jar，`wrote=25 lost=none`），不是推测：
+  - **NOGROUP**：`XREADGROUP GROUP nosuchg c STREAMS t53:ok 0-0` 与 `… >` 都回 `*-`
+    （`battery53:20`、`battery53:22`、`battery53:23`），读不存在的键也回 `*-`（`:16`）；
+    上游在 :1505-1514 对这三种情形都回
+    `-NOGROUP No such key '%s' or consumer group '%s' in XREADGROUP with GROUP option`
+    并中止整条命令。同族里 `XPENDING` 已经在发 `-NOGROUP No such key … or consumer group …`
+    （`battery53:24` 实测），所以这不是新文案，是把那一支的判据接过来。
+    `xreadgroupHistory(...)` 把"键或组不在"返成 null 而不是空列表，就是给这一支留的口子。
+  - **WRONGTYPE**：对别的类型的键跑 stream 命令，我们一律当"键不存在"答 —— `XLEN <list 键>`
+    回 `:0`（`:10`）、`XRANGE <list 键>` 回 `*[]`（`:11`）、`XINFO GROUPS <hash 键>` 回 `*-`（`:13`）、
+    `XREADGROUP … <hash 键>` 回 `*-`（`:25`）。上游是 `checkType`（:1500）先回
+    `-WRONGTYPE Operation against a key holding the wrong kind of value`。
+    反方向更糟：**`SET t53:str hello` 之后 `XADD t53:str 1-1 f v` 成功**（`:4` 回 `"1-1"`），
+    紧接着 `GET` 仍回 `"hello"`（`:5`）而 `XRANGE` 交出那条 stream 条目（`:6`）——
+    同一个键名下两种类型并存，而这正是 1.3.5 的类型闸门要消灭的状态、
+    1.3.6 的 `RENAME` 刚刚拆掉的那类生产者，stream 命令族是它剩下的现成入口。
 - `XADD` 的 arity 与 `MAXLEN` 文案也还没对齐：上游把 MAXLEN 的整数栏和 ID 的文法都排在
   arity 之前（选项扫描 :1255-1279 早于 :1284），且用的是
   `wrong number of arguments for XADD`（:1285）与 `The MAXLEN argument must be >= 0.`（:1269）
   这两句；我们目前是通用 arity 句 + `MAXLEN requires a non-negative integer`。
+- `XACK` 对一个不存在的组回 `:0`（`battery53:26`）；上游那一句同样是 `-NOGROUP …`，
+  这一条与上面 NOGROUP 那支一起做，先别各自改一半。
+  - **`delivery_count` / `delivery_time`**：上游每次经 PEL 重交条目都会抬这两个值
+    （:1111-1113），`XPENDING` 的逐条目形式与 `XCLAIM` 都读它。我们的 PEL 只有
+    `Map<String, String>`（条目 → 消费者），这两个值没有读者，所以这一支不写；
+    要把 `XPENDING` 的 IDLE / 次数形式或 `XCLAIM` 做对，得先把 PEL 换成带元数据的结构。
+- `XADD` 的 arity 与 `MAXLEN` 文案也还没对齐：上游把 MAXLEN 的整数栏和 ID 的文法都排在
+  arity 之前（选项扫描 :1255-1279 早于 :1284），且用的是
+  `wrong number of arguments for XADD`（:1285）与 `The MAXLEN argument must be >= 0.`（:1269）
+  这两句；我们目前是通用 arity 句 + `MAXLEN requires a non-negative integer`。
+- `XREAD` / `XREADGROUP` 的 `BLOCK` 仍然是明确拒绝而不是实现（`XREAD BLOCK` 回
+  `-ERR XREAD BLOCK is not supported…`）——拒绝是有意的：收下 `BLOCK` 等于对客户端谎称会阻塞。
 - `XCLAIM` / `XSETID` 依旧没有实现（本机实测 `XCLAIM` 回 `-ERR unknown command 'XCLAIM'`）。
 - `MemoryStore.keyVersions` 只增不减。
 - `MemoryStore.keyTypeMaps` 仍只有 String 写路径维护；`existsDb` / `checkKeyType` 这些读它的
