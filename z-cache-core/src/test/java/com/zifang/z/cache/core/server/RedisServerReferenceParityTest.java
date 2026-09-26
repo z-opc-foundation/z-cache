@@ -145,8 +145,8 @@ class RedisServerReferenceParityTest {
     // ==================== SET 的旗标与过期 ====================
 
     /**
-     * 冲突是在扫到第二个 token 的<b>当场</b>回的，排在取值之前，也排在"键在不在"之前
-     * （battery32:22、battery33:4/5）。
+     * 冲突与尾巴排在取值<b>之前</b>，同一个旗标重复出现则<b>不</b>算冲突
+     * （battery32:20/22、battery33:3/4/5/6）。
      */
     @Test
     void setFlagsAreCheckedWhileScanningNotAfter() throws Exception {
@@ -170,14 +170,25 @@ class RedisServerReferenceParityTest {
                 send(s, "SET", "p32:k", "v2", "EX", "10", "PX", "10");
                 assertEquals("-ERR syntax error", readReply(in), "battery32:20");
 
-                send(s, "SET", "p32:k", "v2", "EX", "10", "EX", "20");
-                assertEquals("-ERR syntax error", readReply(in), "同一个旗标出现两次");
-
                 send(s, "SET", "p32:k", "v2", "FOO");
                 assertEquals("-ERR syntax error", readReply(in), "不认识的尾巴要拒，不能默默丢掉");
 
+                // 尾巴这一刀还排在过期时间的范围判断之前：实测对岸回 syntax error，
+                // 而不是 invalid expire time（旧实现在扫旗标时就当场判了 -1，抢答了这一句）。
+                send(s, "SET", "p32:k", "v2", "EX", "-1", "FOO");
+                assertEquals("-ERR syntax error", readReply(in), "battery33:3");
+
                 send(s, "GET", "p32:k");
                 assertEquals("$1\r\nv", readReply(in), "上面那些被拒的 SET 一个字节都不该落下去");
+
+                // 同一个旗标出现两次：对岸照收（battery33:6 实测 +OK），旧实现把它当冲突拒了。
+                send(s, "SET", "p32:k", "v2", "EX", "10", "EX", "20");
+                assertEquals("+OK", readReply(in), "battery33:6");
+                send(s, "GET", "p32:k");
+                assertEquals("$2\r\nv2", readReply(in), "重复的 EX 不是拒的理由，写还是要写");
+                send(s, "TTL", "p32:k");
+                long ttl = Long.parseLong(readReply(in).substring(1));
+                assertTrue(ttl > 15 && ttl <= 20, "后出现的那一枚说了算，实际 TTL " + ttl);
 
                 // 旗标大小写无关（battery33:10：键已存在时小写 nx 回 nil，而不是 +OK）
                 send(s, "SET", "p32:k", "v3", "EX", "10", "nx");
@@ -404,16 +415,141 @@ class RedisServerReferenceParityTest {
                 send(s, "HSET", "p37:h", "f", "+5");
                 assertEquals(":1", readReply(in));
                 send(s, "HINCRBY", "p37:h", "f", "1");
-                String hincrby = readReply(in);
-                assertTrue(hincrby.startsWith("-ERR "),
-                        "hash 字段里的同一种文本也不能当整数用，实际: " + hincrby);
+                // 这句文案也是量出来的：对岸比通用那句短，且不带 "or out of range"
+                // （battery38 第 18/21 行 —— 存进去的 +5 / 05 都算坏值）。
+                assertEquals("-ERR hash value is not an integer", readReply(in), "battery38:18");
+                send(s, "HINCRBY", "p37:h", "f", "+1");
+                assertEquals("-ERR value is not an integer or out of range", readReply(in),
+                        "battery38:19 —— 增量栏坏与字段值坏，两句不同");
             } catch (IOException e) {
                 throw new RuntimeException(e);
             }
         });
     }
 
-    /** 溢出那句没有 "internal error:" 前缀（battery37:10）。 */
+    /**
+     * battery38（42 行，250 一次性实例量出来的）里那些"两把尺给出不同答案"的形状。
+     * 每一档都是<b>顺序</b>判据：谁先说话，而不是说什么。
+     */
+    @Test
+    void checksHappenInTheOrderTheReferenceRunsThem() throws Exception {
+        run(port -> {
+            try (Socket s = connect(port)) {
+                DataInputStream in = new DataInputStream(s.getInputStream());
+
+                // GETRANGE：整数栏先于类型（同一枚坏键名，两种答案）。中央类型闸门跑在分发之前，
+                // 会把这两档做反 —— 所以 GETRANGE/SUBSTR 从闸门表里摘出来了。
+                send(s, "LPUSH", "p38:l", "x");
+                assertEquals(":1", readReply(in));
+                send(s, "GETRANGE", "p38:l", "+0", "-1");
+                assertEquals("-ERR value is not an integer or out of range", readReply(in), "battery38:15");
+                send(s, "GETRANGE", "p38:l", "0", "1");
+                assertEquals("-WRONGTYPE Operation against a key holding the wrong kind of value",
+                        readReply(in), "battery38:14");
+
+                // SET 的 EX 重复：最后一枚才被解析，坏的前一枚根本没人读
+                send(s, "SET", "p38:s", "hello");
+                assertEquals("+OK", readReply(in));
+                send(s, "SET", "p38:s", "v", "EX", "abc", "EX", "10");
+                assertEquals("+OK", readReply(in), "battery38:29");
+                send(s, "TTL", "p38:s");
+                long ttl = Long.parseLong(readReply(in).substring(1));
+                assertTrue(ttl > 5 && ttl <= 10, "解析的是最后一枚，实际 TTL " + ttl);
+                send(s, "SET", "p38:s", "v", "EX", "10", "EX", "-1");
+                assertEquals("-ERR invalid expire time in set", readReply(in), "battery38:27");
+
+                // SCAN：游标与尾巴各一句
+                send(s, "SCAN", "abc");
+                assertEquals("-ERR invalid cursor", readReply(in),
+                        "battery38:33 —— 坏游标不许静默当 0 从头再扫一遍");
+                send(s, "SCAN", "0", "abc");
+                assertEquals("-ERR syntax error", readReply(in), "battery38:35");
+                send(s, "SCAN", "0", "COUNT", "abc");
+                assertEquals("-ERR value is not an integer or out of range", readReply(in),
+                        "battery38:34 —— 这一档不是 syntax error，两句不许合并");
+                send(s, "SCAN", "0", "COUNT");
+                assertEquals("-ERR syntax error", readReply(in), "只有旗标没有值");
+
+                // BITCOUNT 的多余尾巴：无论第 5 枚是什么都是 syntax error（battery38 第 5/6/7/8/10 行）
+                send(s, "BITCOUNT", "p38:s", "1", "2", "9");
+                assertEquals("-ERR syntax error", readReply(in), "battery38:5");
+                send(s, "BITCOUNT", "p38:s", "1", "2", "bit");
+                assertEquals("-ERR syntax error", readReply(in), "battery38:7 —— 大小写都一样");
+                send(s, "BITCOUNT", "p38:s", "1", "2", "3", "4");
+                assertEquals("-ERR syntax error", readReply(in), "battery38:8");
+
+                // TYPE 的多余尾巴走 arity（battery38:36），与上面那一族不同
+                send(s, "TYPE", "p38:s", "extra");
+                assertEquals("-ERR wrong number of arguments for 'type' command", readReply(in));
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        });
+    }
+
+    /**
+     * BITCOUNT 的<b>"键在不在"排在所有语法之争之前</b>（250 实测 battery39 第 2—15 行）。
+     * battery31:23 那行 {@code BITCOUNT <不存在的键> 1 2 9 → :0} 是旧实现与对岸唯一相反的一处
+     * 判序：我们把"尾巴多不多"排在查键之前，于是对不存在的键回了 syntax error。
+     * <p>
+     * 反面对照是 GETRANGE（battery39:16/17）：它先解析下标、后查键，两族顺序<b>相反</b>。
+     * 所以这两道检查不许抽成一个公共闸门 —— 合起来必有一族是错的。
+     */
+    @Test
+    void bitcountLooksUpTheKeyBeforeGrammar() throws Exception {
+        run(port -> {
+            try (Socket s = connect(port)) {
+                DataInputStream in = new DataInputStream(s.getInputStream());
+
+                // 键不在：坏下标、多余尾巴都轮不到说话，一律 :0
+                send(s, "BITCOUNT", "p39:x", "1");
+                assertEquals(":0", readReply(in), "battery39:2 —— 不是 syntax error");
+                send(s, "BITCOUNT", "p39:x", "1", "2", "9");
+                assertEquals(":0", readReply(in), "battery39:3");
+                send(s, "BITCOUNT", "p39:x", "abc");
+                assertEquals(":0", readReply(in), "battery39:4");
+                send(s, "BITCOUNT", "p39:x", "abc", "def");
+                assertEquals(":0", readReply(in), "battery39:5 —— 不是整数那句");
+                send(s, "BITCOUNT", "p39:x", "1", "2", "3", "4");
+                assertEquals(":0", readReply(in), "battery39:6");
+
+                // 键在但类型不对：WRONGTYPE 同样压过 syntax error 与整数那句
+                send(s, "LPUSH", "p39:l", "x");
+                assertEquals(":1", readReply(in));
+                send(s, "BITCOUNT", "p39:l", "1");
+                assertEquals("-WRONGTYPE Operation against a key holding the wrong kind of value",
+                        readReply(in), "battery39:8");
+                send(s, "BITCOUNT", "p39:l", "1", "2", "9");
+                assertEquals("-WRONGTYPE Operation against a key holding the wrong kind of value",
+                        readReply(in), "battery39:9");
+                send(s, "BITCOUNT", "p39:l", "abc", "def");
+                assertEquals("-WRONGTYPE Operation against a key holding the wrong kind of value",
+                        readReply(in), "battery39:10 —— 整数那句排在类型之后");
+
+                // 键在而且是 string：这时才轮到语法两档
+                send(s, "SET", "p39:s", "hello");
+                assertEquals("+OK", readReply(in));
+                send(s, "BITCOUNT", "p39:s", "1");
+                assertEquals("-ERR syntax error", readReply(in), "battery39:13");
+                send(s, "BITCOUNT", "p39:s", "1", "2", "9");
+                assertEquals("-ERR syntax error", readReply(in), "battery39:15");
+                send(s, "BITCOUNT", "p39:s", "abc", "def");
+                assertEquals("-ERR value is not an integer or out of range", readReply(in),
+                        "battery39:14");
+
+                // 对照：GETRANGE 是反过来的那一族
+                send(s, "GETRANGE", "p39:x", "abc", "def");
+                assertEquals("-ERR value is not an integer or out of range", readReply(in),
+                        "battery39:16 —— 键不在也躲不掉整数这一档");
+                send(s, "GETRANGE", "p39:x", "0", "1");
+                assertEquals("$0\r\n", readReply(in), "battery39:17 —— 键不在回空串，不是错");
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        });
+    }
+
+    /** 溢出那一档的取舍见 {@code setExpireTimeGrammarAndRange} 末尾；下面这几支管的是文案与算术。 */
     @Test
     void incrementOverflowIsReportedAsTheReferenceSays() throws Exception {
         run(port -> {
@@ -620,7 +756,8 @@ class RedisServerReferenceParityTest {
                 assertEquals("-ERR syntax error", readReply(in), "battery33:69");
                 send(s, "BITCOUNT", "p33:a", "abc", "1");
                 assertEquals("-ERR value is not an integer or out of range", readReply(in),
-                        "battery33:67 —— 整数这一档排在类型检查之前");
+                        "battery33:67 —— 这一行两侧都是 string 键，量不出整数与类型谁先，"
+                                + "那一档由 battery39 钉（见 bitcountLooksUpTheKeyBeforeGrammar）");
                 send(s, "BITCOUNT", "p33:a", "0", "99999999999999999999");
                 assertEquals("-ERR value is not an integer or out of range", readReply(in),
                         "battery35:33 —— 20 位那一串越出 long，仍是这句");

@@ -529,45 +529,62 @@ public class CommandHandler {
     // ==================== String 命令 ====================
 
     /**
-     * SET —— 修饰位这一段照参考实现的形状实现（battery32/33，250 实测）：
-     * <ul>
-     *   <li>NX/XX 各只许出现一次，且互斥；EX/PX 同理互斥。冲突是<b>扫到第二个 token 时</b>
-     *       当场回的，排在取值之前 —— 实测 {@code SET k v NX XX EX abc} 回 {@code syntax error}
-     *       而不是 {@code value is not an integer}，说明对岸根本没走到解析 "abc"。</li>
-     *   <li>EX/PX 的取值收 Redis 的整数语法（{@code +10}、{@code -0} 都算非法），且必须
-     *       {@code > 0}，否则回 {@code invalid expire time in set}（{@code EX 0}、{@code EX -1}
-     *       实测都是这一句）。</li>
-     *   <li>旗标位大小写都认（实测 {@code SET k v EX 1 nx} 在键已存在时回 nil）。</li>
-     * </ul>
-     * 超出对岸的一条：EX 大到"乘一千再加当前时刻"会绕回时，4.0.9 照样回 {@code +OK} 并把键
-     * 静默删掉（实测 {@code EX 9223372036854776} → TTL 0、{@code EX 9223372036854775807} →
-     * 键当场不见）。我们回错，理由见 {@link #expireMillisOrOverflow}。
+     * SET —— 修饰位这一段照参考实现的形状实现（battery32/33/35，250 实测）。三件事按顺序：
+     * <ol>
+     *   <li><b>扫一遍旗标位</b>：NX/XX/EX/PX 认得，认不得的那一枚起就是尾巴。同一个旗标
+     *       <b>重复出现是不拦的</b>（实测 {@code SET s33 v EX 10 EX 20} 回 {@code +OK}，
+     *       battery33 第 6 行 —— 先前把它当成冲突拒掉是我加的，对岸没这一条），互斥的只有
+     *       {@code NX×XX} 与 {@code EX×PX} 两对。</li>
+     *   <li><b>再判冲突与尾巴</b>：{@code syntax error} 排在取值<b>之前</b> —— 实测
+     *       {@code SET k v NX XX EX abc} 回 syntax error 而不是整数错（battery33 第 4 行），
+     *       {@code SET s33 v EX -1 FOO} 也回 syntax error（第 3 行）而不是过期时间错。</li>
+     *   <li><b>最后只解析"出现的那一枚"</b>：EX/PX 重复出现时，对岸记下的是<b>最后一次</b>的位置，
+     *       解析发生在扫描结束之后 —— 所以 {@code SET s38 v EX abc EX 10} 回 {@code +OK}
+     *       （battery38 第 29 行：坏文本那一枚根本没被读过），而 {@code EX 10 EX -1} 回
+     *       {@code invalid expire time in set}（第 27 行：坏的是最后一枚，它才是被解析的那枚）。
+     *       整数语法走 {@link RedisIntegerFormat}（{@code +10}、{@code -0} 都是
+     *       {@code value is not an integer}），且必须 {@code > 0}。</li>
+     * </ol>
+     * 旗标大小写都认（实测 {@code SET k v EX 1 nx} 在键已存在时回 nil）。
+     * <p>
+     * 超出对岸的一条：EX 大到"乘一千"会溢出时，4.0.9 照样回 {@code +OK} 并把键静默删掉（实测
+     * {@code EX 9223372036854776} → TTL 0、{@code EX 9223372036854775807} → 键当场不见）。
+     * 我们回错，理由见 {@link #expireMillisOrOverflow}。
      */
     private Object handleSet(String[] args) {
         if (args.length < 3) return RespError.wrongNumberOfArguments("SET");
         String key = args[1], value = args[2];
-        Long expireMillis = null;
-        boolean nx = false, xx = false;
-        for (int i = 3; i < args.length; i++) {
+        boolean nx = false, xx = false, ex = false, px = false;
+        String rawExpire = null;
+        boolean expireInSeconds = false;
+        int i = 3;
+        for (; i < args.length; i++) {
             String opt = args[i].toUpperCase(Locale.ROOT);
             if ("EX".equals(opt) || "PX".equals(opt)) {
-                if (expireMillis != null) return RespError.syntaxError();
                 if (i + 1 >= args.length) return RespError.syntaxError();
-                Long raw = RedisIntegerFormat.parse(args[++i]);
-                if (raw == null) return RespError.notAnInteger();
-                Long ms = expireMillisOrOverflow(raw, "EX".equals(opt));
-                if (ms == null || ms.longValue() <= 0) {
-                    return RespError.of("ERR", "invalid expire time in set");
-                }
-                expireMillis = ms;
+                boolean seconds = "EX".equals(opt);
+                if (seconds) ex = true;
+                else px = true;
+                // 重复出现不拦（实测 {@code EX 10 EX 20} → +OK），且只有<b>最后一枚</b>
+                // 会被解析（实测 {@code EX abc EX 10} → +OK）—— 所以这里只记住位置。
+                rawExpire = args[++i];
+                expireInSeconds = seconds;
             } else if ("NX".equals(opt)) {
-                if (nx || xx) return RespError.syntaxError();
                 nx = true;
             } else if ("XX".equals(opt)) {
-                if (nx || xx) return RespError.syntaxError();
                 xx = true;
             } else {
-                return RespError.syntaxError();
+                break;
+            }
+        }
+        if ((nx && xx) || (ex && px) || i != args.length) return RespError.syntaxError();
+        Long expireMillis = null;
+        if (rawExpire != null) {
+            Long parsed = RedisIntegerFormat.parse(rawExpire);
+            if (parsed == null) return RespError.notAnInteger();
+            expireMillis = expireMillisOrOverflow(parsed.longValue(), expireInSeconds);
+            if (expireMillis == null || expireMillis.longValue() <= 0) {
+                return RespError.of("ERR", "invalid expire time in set");
             }
         }
         // NX/XX 问的是"这个键在不在"，不是"string 命名空间里有没有"：同一份判据 EXISTS /
@@ -785,6 +802,10 @@ public class CommandHandler {
         } catch (NumberFormatException e) {
             return RespError.notAnInteger();
         }
+        // 类型检查补在两枚下标解析之后（中央闸门跑在分发之前，会把这一档的顺序做反，
+        // 见 TYPED_COMMANDS 上那段说明）：实测 {@code GETRANGE <list 键> 0 1} 才是 WRONGTYPE。
+        RespError conflict = wrongTypeAfterParse(MemoryStore.DataType.STRING, args[1]);
+        if (conflict != null) return conflict;
         byte[] v = store.getDb(currentDb, args[1]);
         int len = v == null ? 0 : v.length;
         long from = foldRangeIndex(start, len), to = foldRangeIndex(end, len);
@@ -805,9 +826,18 @@ public class CommandHandler {
      * {@code 1 1} 回 4、{@code -1 -1} 回 6、{@code 2 -1} 回 14、{@code -3 -2} 回 8、
      * {@code -100 100} 与 {@code 0 -1} 都回 21）。
      * <p>
-     * 判据顺序也是量出来的：参数个数（{@code BITCOUNT k} 是 arity 错、{@code BITCOUNT k 0}
-     * 是 syntax error）→ 两个下标的整数语法（{@code abc} 与 20 位那一串都是整数那句）→
-     * 键的类型（list 键回 WRONGTYPE）→ 才轮到取值。下标折叠与 GETRANGE 共用
+     * 判据顺序也是量出来的，而且<b>"键在不在"排在所有语法之争前面</b>（250 实测 battery39
+     * 第 1—15 行）：参数个数（少一个 token 就是 arity 错）→ 键不存在一律 {@code :0}
+     * （{@code BITCOUNT nosuch 1}、{@code BITCOUNT nosuch abc def}、
+     * {@code BITCOUNT nosuch 1 2 3 4} 三行实测都是 {@code :0}，多余的尾巴和坏下标都轮不到说话）
+     * → 键存在但类型不对一律 WRONGTYPE（{@code BITCOUNT l 1}、{@code BITCOUNT l 1 2 9}、
+     * {@code BITCOUNT l abc def} 三行实测都是 WRONGTYPE，同样压过 syntax error 和整数那句）
+     * → 参数个数（{@code BITCOUNT k 0} 与 5 个以上都是 syntax error，battery33:86／battery38:5-8）
+     * → 两个下标的整数语法（{@code abc} 与 20 位那一串都是整数那句，battery38:9）。
+     * 也就是说这条命令的<b>个数检查被拆成了两段</b>：一个 token 都没有的 arity 闸在最前
+     * （它由命令表把门，对岸连键名都还没拿到），而"只给一个下标 / 给多了"的 syntax 判定排在
+     * 查键与类型之后 —— 与 GETRANGE（先解析下标再查键，battery39:16/17 实测）正好相反。
+     * 下标折叠与 GETRANGE 共用
      * {@link #foldRangeIndex}，{@code 5 5}（起点越出串尾）、{@code 2 0}、{@code -1 -4}
      * 三档都是 0 而不是负数或错。
      * <p>
@@ -815,10 +845,14 @@ public class CommandHandler {
      * syntax error（实测两样都是），所以这里跟着拒 —— 支持它等于对外承诺一种对岸没有的形状。
      */
     private Object handleBitcount(String[] args) {
-        // 三种个数三种答案（250 实测 battery33 第 85/86/68 行）：少了是 arity 错，
-        // 3 个参数（只给 start 不给 end）和 5 个以上都算 syntax error —— 多余的尾巴不并入
+        // 三种个数三种答案（250 实测 battery33 第 85/86/68 行，键都在的情形）：少了是 arity
+        // 错，3 个参数（只给 start 不给 end）和 5 个以上都算 syntax error —— 多余的尾巴不并入
         // arity 那一句，否则 {@code BITCOUNT k 0 1 BIT} 会被回成"参数个数不对"。
         if (args.length < 2) return RespError.wrongNumberOfArguments("BITCOUNT");
+        // 查键在语法之前：不存在直接 :0，类型不对直接 WRONGTYPE（battery39:2-6、7-11）。
+        if (!keyExists(args[1])) return RespInteger.of(0);
+        RespError conflict = wrongTypeAfterParse(MemoryStore.DataType.STRING, args[1]);
+        if (conflict != null) return conflict;
         if (args.length == 3 || args.length > 4) return RespError.syntaxError();
         long start = 0, end = -1;
         if (args.length == 4) {
@@ -828,8 +862,6 @@ public class CommandHandler {
             start = s;
             end = e;
         }
-        RespError conflict = wrongTypeAfterParse(MemoryStore.DataType.STRING, args[1]);
-        if (conflict != null) return conflict;
         byte[] v = store.getDb(currentDb, args[1]);
         if (v == null || v.length == 0) return RespInteger.of(0);
         long from = foldRangeIndex(start, v.length);
@@ -2639,16 +2671,18 @@ public class CommandHandler {
         MemoryStore.DataType zset = MemoryStore.DataType.ZSET;
 
         for (String c : new String[]{"GET", "SETNX", "GETSET", "APPEND", "STRLEN",
-                "INCR", "DECR", "INCRBY", "DECRBY", "GETRANGE", "SUBSTR", "INCRBYFLOAT"}) {
+                "INCR", "DECR", "INCRBY", "DECRBY", "INCRBYFLOAT"}) {
             typed(c, string, KeyPos.SINGLE);
         }
         typed("MGET", string, KeyPos.ALL);
-        // SETRANGE 不挂中央闸门：实测 {@code SETRANGE <list 键> -5 x} 回的是
-        // "offset is out of range"、{@code ... abc x} 回 "value is not an integer or out of range"，
-        // 都不是 WRONGTYPE —— 参考实现把偏移检查排在 lookupKeyWrite 之前，所以这道类型检查
-        // 必须由 handleSetrange 自己在偏移之后补。
-        // BITCOUNT 同理：实测 {@code BITCOUNT <string 键> abc 1} 回整数那句，
-        // 而 WRONGTYPE 要排在下标检查之后（handleBitcount 自己补这一刀）。
+        // GETRANGE / SUBSTR / SETRANGE 都不挂中央闸门：实测对岸是"整数栏先说话"
+        // （{@code GETRANGE <list 键> +0 -1} → value is not an integer，
+        //  而 {@code GETRANGE <list 键> 0 1} → WRONGTYPE，battery38 第 14/15 行；
+        //  {@code SETRANGE <list 键> -5 x} → offset is out of range）。参考实现把取值
+        //  检查排在 lookupKeyWrite 之前，所以这道类型检查必须由各自的 handler 在解析之后补。
+        // BITCOUNT 同理，但它和 GETRANGE 是<b>反着</b>的两族：实测键不存在一律 :0、类型不对
+        // 一律 WRONGTYPE，两道都过了才轮到 syntax error 与整数那句（battery39 第 2—15 行），
+        // 所以这一刀必须由 handleBitcount 自己在查键之后补，顺序见该方法。
 
         for (String c : new String[]{"HSET", "HGET", "HDEL", "HEXISTS", "HGETALL", "HKEYS", "HVALS",
                 "HMGET", "HMSET", "HLEN", "HSETNX", "HSCAN", "HRANDFIELD", "HINCRBY",
@@ -3046,11 +3080,19 @@ public class CommandHandler {
     private Object handleScan(String[] args) {
         if (args.length < 2) return RespError.wrongNumberOfArguments("SCAN");
         String cursor = args[1];
+        // 游标不合整数语法就是 invalid cursor（实测 battery38 第 33 行）。以前存储层把坏游标
+        // 当 0 从头再扫一遍：客户端的一个拼写错变成一次全库重扫，而且和"这一轮真扫完了"
+        // 的 0 号游标根本分不开。
+        if (RedisIntegerFormat.parse(cursor) == null) return RespError.of("ERR", "invalid cursor");
         String pattern = null;
         int count = 10;
         for (int i = 2; i < args.length; i++) {
             if ("MATCH".equalsIgnoreCase(args[i]) && i + 1 < args.length) pattern = args[++i];
             else if ("COUNT".equalsIgnoreCase(args[i]) && i + 1 < args.length) count = intArg(args[++i]);
+            // 认不得的尾巴、以及只有旗标没有值（COUNT/MATCH 落在末尾）都是 syntax error
+            // （实测 {@code SCAN 0 abc} → syntax error，battery38 第 35 行；
+            //  而 {@code SCAN 0 COUNT abc} 是整数那句，第 34 行 —— 两档不能合并）。
+            else return RespError.syntaxError();
         }
         Object[] scanResult = store.scan(currentDb, cursor, pattern, count);
         String nextCursor = (String) scanResult[0];

@@ -128,7 +128,9 @@ public class HashStore {
                 // 而 HSET h f 05 之后 HINCRBY h f 1 在参考实现里是拒的（它走的是 string2ll）。
                 Long parsed = RedisIntegerFormat.parse(new String(existing, StandardCharsets.UTF_8));
                 if (parsed == null) {
-                    throw new IllegalArgumentException("hash field value is not an integer or out of range");
+                    // 文案是量出来的，不是推的：对岸这一句是 {@code ERR hash value is not an integer}
+                    // （battery38 第 18/21 行，250 实测），比通用那句整数短，也不带 "or out of range"。
+                    throw new IllegalArgumentException("hash value is not an integer");
                 }
                 value = parsed.longValue();
             }
