@@ -14,6 +14,17 @@ public final class RespError {
     public static final RespError SYNTAX_ERROR = new RespError("ERR syntax error");
     public static final RespError NO_SUCH_KEY = new RespError("ERR no such key");
     public static final RespError NOT_AN_INTEGER = new RespError("ERR value is not an integer or out of range");
+    /**
+     * 位族的三句（SETBIT / GETBIT / BITPOS，250 实测 battery41/42 逐字钉住）。它们与普通整数
+     * 那句<b>不同</b>：{@code SETBIT k abc 1} 回的是 "bit offset ..."，而 {@code BITPOS k abc}
+     * 回 "value is not an integer ..." —— 合并成一处文案就会有一族说谎，所以各留一句。
+     */
+    public static final RespError BIT_OFFSET_INVALID =
+            new RespError("ERR bit offset is not an integer or out of range");
+    public static final RespError BIT_VALUE_INVALID =
+            new RespError("ERR bit is not an integer or out of range");
+    public static final RespError BIT_ARG_INVALID =
+            new RespError("ERR The bit argument must be 1 or 0.");
     private final String message;
 
     private RespError(String message) {
@@ -80,6 +91,18 @@ public final class RespError {
      */
     public static RespError notAnInteger() {
         return NOT_AN_INTEGER;
+    }
+
+    public static RespError bitOffsetInvalid() {
+        return BIT_OFFSET_INVALID;
+    }
+
+    public static RespError bitValueInvalid() {
+        return BIT_VALUE_INVALID;
+    }
+
+    public static RespError bitArgInvalid() {
+        return BIT_ARG_INVALID;
     }
 
     public String getMessage() {
