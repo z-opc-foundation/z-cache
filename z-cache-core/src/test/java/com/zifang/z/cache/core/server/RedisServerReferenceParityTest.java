@@ -1052,6 +1052,219 @@ class RedisServerReferenceParityTest {
         });
     }
 
+    /**
+     * BITOP —— 四档判序、回的是<b>字节数</b>、以及目标键的三种命运（覆盖／删掉／一字未动）。
+     * <p>
+     * 这一条里最贵的是那个 {@code :5}：位族的其他成员都按<b>位</b>说话（GETBIT／SETBIT／BITPOS
+     * 数的是位，BITCOUNT 回的也是位），只有 BITOP 回的是结果的<b>字节数</b>。我先按"位数"写完
+     * 再跑对拍，battery45 红 15 行、battery46 红 8 行，而 :40 看上去比 :5 更像位族的回答 ——
+     * 把它掰回来的是 250 上那台 4.0.9（battery45:16 实测 {@code :5}，battery40:44 那把 2^25+1
+     * 字节的伞实测 {@code :33554433}）。下面每一个数都是从真值里抄的，没有一个是我算出来的。
+     */
+    @Test
+    void bitopRepliesBytesAndFollowsTheMeasuredPrecedence() throws Exception {
+        run(port -> {
+            try (Socket s = connect(port)) {
+                DataInputStream in = new DataInputStream(s.getInputStream());
+
+                send(s, "DEL", "p48a", "p48b", "p48c", "p48d", "p48e", "p48f", "p48l", "p48m",
+                        "p48n", "p48t", "p48z");
+                readReply(in);
+                send(s, "SET", "p48a", "hello");
+                assertEquals("+OK", readReply(in));
+                send(s, "SET", "p48b", "world");
+                assertEquals("+OK", readReply(in));
+                send(s, "SET", "p48c", "hi");
+                assertEquals("+OK", readReply(in));
+                send(s, "RPUSH", "p48l", "v");
+                assertEquals(":1", readReply(in));
+
+                // 第一档 arity：少于四个 token 时，操作名对不对都轮不到说话（battery45:7-11）
+                String[][] arityRows = {
+                        {"BITOP"}, {"BITOP", "AND"}, {"BITOP", "AND", "p48d"},
+                        {"BITOP", "FOO"}, {"BITOP", "FOO", "p48d"}, {"BITOP", "XOR"},
+                };
+                for (String[] row : arityRows) {
+                    send(s, row);
+                    assertEquals("-ERR wrong number of arguments for 'bitop' command", readReply(in),
+                            String.join(" ", row) + " —— battery45:7-11／battery46:43-44");
+                }
+
+                // 第二档操作名：不在那四个里就是 syntax error（battery45:12、battery46:41-42）
+                send(s, "BITOP", "FOO", "p48d", "p48a");
+                assertEquals("-ERR syntax error", readReply(in), "battery45:12");
+                send(s, "BITOP", "SET", "p48d", "p48a");
+                assertEquals("-ERR syntax error", readReply(in), "battery46:42 —— SET 也不算操作名");
+
+                // 第三档是 NOT 只许一个源那一句，排在类型之前：源里躺着 list 也轮不到 WRONGTYPE
+                for (String name : new String[]{"NOT", "Not", "nOt"}) {
+                    send(s, "BITOP", name, "p48d", "p48l", "p48a");
+                    assertEquals("-ERR BITOP NOT must be called with a single source key.",
+                            readReply(in), name + " —— battery45:14／battery46:15-17");
+                }
+
+                // 第四档才是源的类型；而类型错的那一次一个字都没落盘（battery46:5-10）
+                send(s, "SET", "p48t", "predata");
+                assertEquals("+OK", readReply(in));
+                send(s, "BITOP", "AND", "p48t", "p48a", "p48l");
+                assertEquals("-WRONGTYPE Operation against a key holding the wrong kind of value",
+                        readReply(in), "battery46:5");
+                send(s, "GET", "p48t");
+                assertEquals("$7\r\npredata", readReply(in), "battery46:7 —— 目标键的旧值原样留着");
+                send(s, "BITOP", "NOT", "p48t", "p48l");
+                assertEquals("-WRONGTYPE Operation against a key holding the wrong kind of value",
+                        readReply(in), "battery46:9");
+                send(s, "GET", "p48t");
+                assertEquals("$7\r\npredata", readReply(in), "battery46:10");
+
+                // 回的是字节数：5 字节的 hello AND world 实测 :5，不是 :40（battery45:16-19）
+                send(s, "BITOP", "AND", "p48d", "p48a", "p48b");
+                assertEquals(":5", readReply(in), "battery45:16 —— 按位数回这里就是 :40");
+                send(s, "BITCOUNT", "p48d");
+                assertEquals(":15", readReply(in), "battery45:17");
+                send(s, "STRLEN", "p48d");
+                assertEquals(":5", readReply(in), "battery45:18");
+                send(s, "GETRANGE", "p48d", "0", "-1");
+                assertEquals(bulk(0x60, 0x65, 0x60, 0x6c, 0x64), readReply(in), "battery45:19");
+                send(s, "BITOP", "OR", "p48d", "p48a", "p48b");
+                assertEquals(":5", readReply(in), "battery45:20");
+                send(s, "BITCOUNT", "p48d");
+                assertEquals(":29", readReply(in), "battery45:21");
+                send(s, "BITOP", "XOR", "p48d", "p48a", "p48b");
+                assertEquals(":5", readReply(in), "battery45:23");
+                send(s, "BITCOUNT", "p48d");
+                assertEquals(":14", readReply(in), "battery45:24");
+
+                // 最长源定长，短的那一个右边补零参与（battery45 第 26—37 行）
+                send(s, "BITOP", "AND", "p48d", "p48a", "p48c");
+                assertEquals(":5", readReply(in), "battery45:26 —— 2 字节的 hi 不缩短结果");
+                send(s, "STRLEN", "p48d");
+                assertEquals(":5", readReply(in), "battery45:27");
+                send(s, "BITCOUNT", "p48d");
+                assertEquals(":6", readReply(in), "battery45:28");
+                send(s, "GETRANGE", "p48d", "0", "-1");
+                assertEquals(bulk(0x68, 0x61, 0, 0, 0), readReply(in), "battery45:29");
+                send(s, "BITOP", "OR", "p48d", "p48a", "p48c");
+                assertEquals(":5", readReply(in), "battery45:30");
+                send(s, "GETRANGE", "p48d", "0", "-1");
+                assertEquals(bulk(0x68, 0x6d, 0x6c, 0x6c, 0x6f), readReply(in), "battery45:33");
+                send(s, "BITCOUNT", "p48d");
+                assertEquals(":22", readReply(in), "battery45:32");
+                send(s, "BITOP", "XOR", "p48d", "p48a", "p48c");
+                assertEquals(":5", readReply(in), "battery45:34");
+                send(s, "GETRANGE", "p48d", "0", "-1");
+                assertEquals(bulk(0, 0x0c, 0x6c, 0x6c, 0x6f), readReply(in), "battery45:37");
+                send(s, "BITCOUNT", "p48d");
+                assertEquals(":16", readReply(in), "battery45:36");
+
+                // NOT：长度就是那一个源的长度，位数跟着反（battery45 第 38—44 行）
+                send(s, "BITOP", "NOT", "p48d", "p48a");
+                assertEquals(":5", readReply(in), "battery45:38");
+                send(s, "STRLEN", "p48d");
+                assertEquals(":5", readReply(in), "battery45:39");
+                send(s, "BITCOUNT", "p48d");
+                assertEquals(":19", readReply(in), "battery45:40 —— 40 位里 hello 占了 21");
+                send(s, "BITOP", "NOT", "p48d", "p48c");
+                assertEquals(":2", readReply(in), "battery45:42");
+                send(s, "BITCOUNT", "p48d");
+                assertEquals(":9", readReply(in), "battery45:44");
+
+                // 一把由 SETBIT 撑出来的伞：NOT 之后逐位反，STRLEN 不变（battery45 第 73—75 行）
+                send(s, "SETBIT", "p48n", "0", "1");
+                assertEquals(":0", readReply(in));
+                send(s, "BITOP", "NOT", "p48d", "p48n");
+                assertEquals(":1", readReply(in), "battery45:73");
+                send(s, "GETRANGE", "p48d", "0", "-1");
+                assertEquals(bulk(0x7f), readReply(in), "battery45:74");
+                send(s, "BITCOUNT", "p48d");
+                assertEquals(":7", readReply(in), "battery45:75");
+
+                // 命运一：最长源为 0 时目标键被<b>删掉</b>，而不是留一个空串（battery45:48-54）
+                send(s, "SET", "p48d", "predata");
+                assertEquals("+OK", readReply(in));
+                send(s, "BITOP", "AND", "p48d", "p48m");
+                assertEquals(":0", readReply(in), "battery45:53 —— 源全不在");
+                send(s, "EXISTS", "p48d");
+                assertEquals(":0", readReply(in), "battery45:54 —— 原有数据的键也被删干净");
+                // 命运二：长度非零、结果全是 0 —— 目标键照写（battery45:45-47）
+                send(s, "BITOP", "AND", "p48d", "p48a", "p48m");
+                assertEquals(":5", readReply(in), "battery45:45");
+                send(s, "STRLEN", "p48d");
+                assertEquals(":5", readReply(in), "battery45:46");
+                send(s, "BITCOUNT", "p48d");
+                assertEquals(":0", readReply(in), "battery45:47 —— 全零也落盘");
+                // 命运三：目标键不做类型检查，list 直接被覆盖成 string（battery46:33-37）
+                send(s, "RPUSH", "p48z", "v");
+                assertEquals(":1", readReply(in));
+                send(s, "BITOP", "XOR", "p48z", "p48a");
+                assertEquals(":5", readReply(in), "battery46:33");
+                send(s, "TYPE", "p48z");
+                assertEquals("+string", readReply(in), "battery46:34");
+                send(s, "LRANGE", "p48z", "0", "-1");
+                assertEquals("-WRONGTYPE Operation against a key holding the wrong kind of value",
+                        readReply(in), "battery46:37 —— 那份 list 已经不在了");
+
+                // 目标键同时是源：读的是改之前的那一份（battery45:56-58、battery46:24-26）
+                send(s, "SET", "p48t", "predata");
+                assertEquals("+OK", readReply(in));
+                send(s, "BITOP", "AND", "p48t", "p48a", "p48t");
+                assertEquals(":7", readReply(in), "battery45:56 —— 最长的是 7 字节的 predata");
+                send(s, "GETRANGE", "p48t", "0", "-1");
+                assertEquals(bulk(0x60, 0x60, 0x64, 0x64, 0x61, 0, 0), readReply(in), "battery45:57");
+                send(s, "BITOP", "NOT", "p48a", "p48a");
+                assertEquals(":5", readReply(in), "battery46:24");
+                send(s, "BITCOUNT", "p48a");
+                assertEquals(":19", readReply(in), "battery46:26");
+                send(s, "SET", "p48a", "hello");
+                assertEquals("+OK", readReply(in));
+
+                // 覆盖会清掉目标键原有的过期时间（battery45:64-66、battery46:38-39）
+                send(s, "SET", "p48d", "x", "EX", "100");
+                assertEquals("+OK", readReply(in));
+                send(s, "BITOP", "AND", "p48d", "p48a");
+                assertEquals(":5", readReply(in));
+                send(s, "TTL", "p48d");
+                assertEquals(":-1", readReply(in), "battery45:66 —— 不是 :100");
+
+                // 命令名与操作名都认大小写；重复源、三源都按最长那个走（battery46:19-20、battery45:70-71）
+                send(s, "bitop", "and", "p48d", "p48a", "p48a", "p48a", "p48a");
+                assertEquals(":5", readReply(in), "battery46:19");
+                send(s, "BITCOUNT", "p48d");
+                assertEquals(":21", readReply(in), "battery46:20 —— 自己 AND 自己 = 原样");
+                send(s, "BITOP", "AND", "p48d", "p48a", "p48b", "p48c");
+                assertEquals(":5", readReply(in), "battery45:70");
+                send(s, "BITCOUNT", "p48d");
+                assertEquals(":5", readReply(in), "battery45:73");
+
+                // 事务里自己改自己 WATCH 的键不中止：EXEC 先查脏、后执行（battery47:5-19）
+                send(s, "WATCH", "p48a");
+                assertEquals("+OK", readReply(in));
+                send(s, "MULTI");
+                assertEquals("+OK", readReply(in));
+                send(s, "BITOP", "AND", "p48d", "p48a", "p48b");
+                assertEquals("+QUEUED", readReply(in));
+                send(s, "EXEC");
+                assertEquals("[:5]", readReplyDeep(in), "battery47:7");
+
+                // 只在本机当前库里算：DB 3 的 BITOP 不在 DB 0 留下目标键（battery46:45-51）
+                send(s, "SELECT", "3");
+                assertEquals("+OK", readReply(in));
+                send(s, "SET", "p48e", "9");
+                assertEquals("+OK", readReply(in));
+                send(s, "BITOP", "AND", "p48f", "p48e");
+                assertEquals(":1", readReply(in), "battery46:48");
+                send(s, "GETRANGE", "p48f", "0", "-1");
+                assertEquals(bulk(0x39), readReply(in), "battery46:49");
+                send(s, "SELECT", "0");
+                assertEquals("+OK", readReply(in));
+                send(s, "EXISTS", "p48f");
+                assertEquals(":0", readReply(in), "battery46:53 —— 只在 DB 3 写过");
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        });
+    }
+
     // ==================== 结构守卫 ====================
 
     /**
@@ -1234,6 +1447,18 @@ class RedisServerReferenceParityTest {
     }
 
     /** 只解析这里用到的一层形状：+/-/: 单行，$ 按声明长度读满，* 递归一层层读。 */
+    /**
+     * 把期望的载荷按字节写成 harness 的 bulk 形状。BITOP 的结果天然带 NUL（短的源右边补零），
+     * 在 Java 源码里贴一串控制字符既读不出来、又容易被编辑器"顺手"改掉，所以按字节列。
+     */
+    private static String bulk(int... bytes) {
+        StringBuilder sb = new StringBuilder();
+        for (int b : bytes) {
+            sb.append((char) b);
+        }
+        return "$" + bytes.length + "\r\n" + sb;
+    }
+
     private static String readReply(DataInputStream in) throws IOException {
         String line = readLine(in);
         if (line.startsWith("$")) {

@@ -1971,6 +1971,75 @@ class RedisServerProtocolSemanticsTest {
         }
     }
 
+    /**
+     * 位族的写入只 bump 它<b>真的改过</b>的那个键。两条各堵一个洞：
+     * <ul>
+     *   <li>{@code bumpWatchedKeys} 的通用形状是"键名在下标 1"，而 BITOP 的下标 1 是操作名 ——
+     *       照通用形状走，它 bump 的是一个叫 "AND" 的键，真正被改写的目标键反倒没记到，
+     *       于是 WATCH 目标键的事务永远不中止（反向的判据也一样重要：源键只被读，WATCH 源键
+     *       不该被一次 BITOP 打掉）。</li>
+     *   <li>SETBIT 在 1.3.6 之前压根没进 {@code WRITE_COMMANDS}：写进了内存却不记账，
+     *       既不进 AOF，WATCH 它的键也看不见。</li>
+     * </ul>
+     * "目标键被覆盖、类型错的源一个字都不写"是对岸实测的（battery46 第 5—10、33—37 行），
+     * 源键只读就是从那里来的。
+     */
+    @Test
+    void bitWritesSignalOnlyTheKeysTheyActuallyChange() throws Exception {
+        int port = freePort();
+        RedisServer server = new RedisServer("127.0.0.1", port, 0);
+        Thread thread = startAndWait(server, port);
+        try (Socket mine = connect(port); Socket other = connect(port)) {
+            DataInputStream in = new DataInputStream(mine.getInputStream());
+            DataInputStream oin = new DataInputStream(other.getInputStream());
+
+            send(other, "SET", "sem:bit:src", "hello");
+            assertEquals("+OK", readReply(oin), "前置条件: 源键写得进去");
+
+            // 阳性：BITOP 改写目标键 —— WATCH 目标键必须中止
+            queueProbe(mine, in, "sem:bit:dest", "sem:bit:src");
+            send(other, "BITOP", "OR", "sem:bit:dest", "sem:bit:src");
+            assertEquals(":5", readReply(oin), "前置条件: BITOP 本身要成功");
+            send(mine, "EXEC");
+            assertEquals("*-1", readReply(in), "WATCH 的键被 BITOP 改写，EXEC 必须中止");
+
+            // 反向：源键只被读 —— 事务照常提交，取回的还是入队时那份值
+            queueProbe(mine, in, "sem:bit:src", "sem:bit:src");
+            send(other, "BITOP", "OR", "sem:bit:dest2", "sem:bit:src");
+            assertEquals(":5", readReply(oin));
+            send(mine, "EXEC");
+            assertEquals("[hello]", readReplyDeep(in), "BITOP 读源不写源，WATCH 源键不该被打掉");
+
+            // 阳性：SETBIT 写的是它自己的键
+            queueProbe(mine, in, "sem:bit:k", "sem:bit:k");
+            send(other, "SETBIT", "sem:bit:k", "3", "1");
+            assertEquals(":0", readReply(oin));
+            send(mine, "EXEC");
+            assertEquals("*-1", readReply(in), "SETBIT 是写命令，WATCH 它的键必须中止");
+
+            // 阴性对照：BITOP 碰的都是不相干的键，事务照常提交
+            queueProbe(mine, in, "sem:bit:unrelated", "sem:bit:src");
+            send(other, "BITOP", "OR", "sem:bit:dest3", "sem:bit:src");
+            assertEquals(":5", readReply(oin));
+            send(mine, "EXEC");
+            assertEquals("[hello]", readReplyDeep(in), "不相干键的 BITOP 不该中止事务");
+        } finally {
+            server.stop();
+            thread.join(DEADLINE_MS);
+        }
+    }
+
+    /** WATCH key + MULTI + GET probeKey；三条回包一并吃掉，返回入队是否成功。 */
+    private static void queueProbe(Socket socket, DataInputStream in, String watched, String probeKey)
+            throws IOException {
+        send(socket, "WATCH", watched);
+        assertEquals("+OK", readReply(in), "WATCH 要回 +OK");
+        send(socket, "MULTI");
+        assertEquals("+OK", readReply(in), "MULTI 要回 +OK");
+        send(socket, "GET", probeKey);
+        assertEquals("+QUEUED", readReply(in), "GET 入队要回 +QUEUED");
+    }
+
     // ==================== helpers ====================
 
     /** 从 CLIENT LIST 的文本里按对端端口取出某条连接那一行；找不到返回 null。 */

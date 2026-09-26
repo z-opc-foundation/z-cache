@@ -25,6 +25,13 @@ public final class RespError {
             new RespError("ERR bit is not an integer or out of range");
     public static final RespError BIT_ARG_INVALID =
             new RespError("ERR The bit argument must be 1 or 0.");
+    /**
+     * BITOP NOT 只吃一个源键（250 实测 battery45:14、battery46:15—17，句尾带句号，且
+     * {@code NOT}/{@code Not}/{@code nOt} 三种写法都是这一句）。它排在源键的类型检查之前，
+     * 也和 syntax error 不是一回事：同一位置的多余 token 换成 AND 就不回这句。
+     */
+    public static final RespError BITOP_NOT_SINGLE_SOURCE =
+            new RespError("ERR BITOP NOT must be called with a single source key.");
     private final String message;
 
     private RespError(String message) {
@@ -103,6 +110,10 @@ public final class RespError {
 
     public static RespError bitArgInvalid() {
         return BIT_ARG_INVALID;
+    }
+
+    public static RespError bitopNotSingleSource() {
+        return BITOP_NOT_SINGLE_SOURCE;
     }
 
     public String getMessage() {

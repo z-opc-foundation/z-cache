@@ -328,6 +328,7 @@ public class CommandHandler {
                 case "GETBIT":   result = handleGetbit(args);     break;
                 case "SETBIT":   result = handleSetbit(args);     break;
                 case "BITPOS":   result = handleBitpos(args);     break;
+                case "BITOP":    result = handleBitop(args);      break;
                 case "INCRBYFLOAT": result = handleIncrbyfloat(args); break;
                 case "MSETNX":   result = handleMsetnx(args);     break;
                 case "UNLINK":   result = handleUnlink(args);     break;
@@ -997,6 +998,83 @@ public class CommandHandler {
             if (candidate != 0) return RespInteger.of(i * 8 + Integer.numberOfLeadingZeros(candidate) - 24);
         }
         return RespInteger.of(!hasEnd && !lookingForOne ? (long) v.length * 8 : -1);
+    }
+
+    /** BITOP 的四种操作；只用得到内部编号，不参与判序。 */
+    private static final int OP_AND = 0, OP_OR = 1, OP_XOR = 2, OP_NOT = 3;
+
+    /**
+     * BITOP &lt;AND|OR|XOR|NOT&gt; dest key [key ...] —— 目标键<b>无条件被覆盖</b>，
+     * 长度取"最长的那一个源"，比它短的源右边按补零参与运算（battery45 第 27/31/35 行：
+     * 5 字节的 hello 与 2 字节的 hi 做 AND 得 {@code "ha\0\0\0"}、STRLEN 仍是 5）。回的是
+     * <b>结果的字节数</b>（＝最长源的字节数），<b>不是位数</b>：位族里 BITPOS／GETBIT／SETBIT
+     * 数的是位，BITOP 这一条数的是字节 —— 5 字节的 hello AND world 实测 {@code :5}（battery45:16），
+     * 而 {@code SETBIT s40 268435456 1} 撑出的那把大伞做源时实测 {@code :33554433}
+     * （battery40:44，正是 2^25+1 字节）。按位数回会把它报成 :40／:268435464。
+     * <p>
+     * 判序四档（battery45 第 7—16 行、battery46 第 12—20 行）：arity（少于 4 个 token，
+     * 操作名对不对都轮不到说话）→ 操作名语法（认大小写，{@code aNd} 收、{@code FOO}/{@code SET}
+     * 回 syntax error）→ NOT 只许一个源那一句（{@code b46d b46a b46a} 里两个源都是合法 string,
+     * 照样回那句；{@code nOt} 也认）→ 源的类型。
+     * <p>
+     * 两处"没做"是有实测支撑的：
+     * <ul>
+     *   <li><b>目标键不做类型检查</b>：{@code RPUSH b46z v} 之后 {@code BITOP XOR b46z b46a} 实测
+     *       :5 且 {@code TYPE b46z} 变成 string（battery46 第 33—37 行）。只有<b>源</b>才是
+     *       string 家族；目标是纯粹的覆盖。</li>
+     *   <li><b>源里有类型错时一个字节都不写</b>：{@code SET b46t predata} 之后拿 list 键做源，
+     *       实测 WRONGTYPE 而 {@code GET b46t} 还是 "predata"（battery46 第 5—8 行）。所以类型
+     *       这一档必须整体先于运算，不能边读边写。</li>
+     * </ul>
+     * 全空是另一档：最长源为 0（源全不在，或只剩不在的源）时目标键被<b>删掉</b>并回 :0，
+     * 而不是留一个空串 —— {@code SET b46n predata} 之后 {@code BITOP AND b46n b46m} 实测
+     * {@code EXISTS b46n} 是 0（battery45 第 52—55 行、battery46 第 28—31 行）。
+     * 结果是"长度非零但每一位都是 0"时目标键照写（{@code BITOP AND b45n b45d b45a} 实测
+     * STRLEN 5 / BITCOUNT 0）。覆盖会清掉目标键原有的过期时间（{@code SET b45n x EX 100} 之后
+     * 实测 TTL 是 -1，battery45 第 70—72 行）。
+     */
+    private Object handleBitop(String[] args) {
+        if (args.length < 4) return RespError.wrongNumberOfArguments("BITOP");
+        int op;
+        String name = args[1].toUpperCase(Locale.ROOT);
+        if ("AND".equals(name)) op = OP_AND;
+        else if ("OR".equals(name)) op = OP_OR;
+        else if ("XOR".equals(name)) op = OP_XOR;
+        else if ("NOT".equals(name)) op = OP_NOT;
+        else return RespError.syntaxError();
+        if (op == OP_NOT && args.length != 4) return RespError.bitopNotSingleSource();
+        int sources = args.length - 3;
+        byte[][] in = new byte[sources][];
+        long max = 0;
+        for (int i = 0; i < sources; i++) {
+            RespError conflict = wrongTypeAfterParse(MemoryStore.DataType.STRING, args[3 + i]);
+            if (conflict != null) return conflict;
+            byte[] v = store.getDb(currentDb, args[3 + i]);
+            in[i] = v == null ? new byte[0] : v;
+            if (in[i].length > max) max = in[i].length;
+        }
+        String dest = args[2];
+        if (max == 0) {
+            deleteEveryType(dest);
+            return RespInteger.of(0);
+        }
+        byte[] out = new byte[(int) max];
+        if (op == OP_NOT) {
+            for (int i = 0; i < max; i++) out[i] = (byte) ~in[0][i];
+        } else {
+            for (int i = 0; i < max; i++) {
+                int acc = op == OP_AND ? 0xFF : 0;
+                for (int k = 0; k < sources; k++) {
+                    int b = i < in[k].length ? in[k][i] & 0xFF : 0;
+                    if (op == OP_AND) acc &= b;
+                    else if (op == OP_OR) acc |= b;
+                    else acc ^= b;
+                }
+                out[i] = (byte) acc;
+            }
+        }
+        store.setDb(currentDb, dest, out);
+        return RespInteger.of(max);
     }
 
     private Object handleSetrange(String[] args) {
@@ -2690,7 +2768,7 @@ public class CommandHandler {
      */
     private static final java.util.Set<String> WRITE_COMMANDS = new java.util.HashSet<>(java.util.Arrays.asList(
         "SET", "SETEX", "PSETEX", "SETNX", "GETSET", "MSET", "MSETNX", "APPEND", "INCR", "DECR", "INCRBY", "DECRBY",
-        "SETRANGE", "INCRBYFLOAT",
+        "SETRANGE", "INCRBYFLOAT", "SETBIT", "BITOP",
         "DEL", "UNLINK", "EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT", "PERSIST", "RENAME", "RENAMENX", "MOVE",
         "HSET", "HDEL", "HMSET", "HINCRBY", "HINCRBYFLOAT", "HSETNX",
         "LPUSH", "RPUSH", "LPUSHX", "RPUSHX", "LPOP", "RPOP", "LSET", "LINSERT", "LREM", "LTRIM", "RPOPLPUSH", "LMOVE",
@@ -2932,6 +3010,13 @@ public class CommandHandler {
             for (int i = 1; i + 1 < record.length; i += 2) {
                 store.bumpKeyVersion(currentDb, record[i]);
             }
+            return;
+        }
+        if ("BITOP".equals(cmd)) {
+            // BITOP 的键名从下标 2 起（下标 1 是 AND/OR/XOR/NOT），而被改动的只有目标那一个：
+            // 源是只读的，WATCH 一个源键不会因为一次 BITOP 而中止（battery47 实测）。
+            // 按通用形状走的话会把操作名 "AND" 当成键去 bump，目标键反而没记到。
+            if (record.length > 2) store.bumpKeyVersion(currentDb, record[2]);
             return;
         }
         store.bumpKeyVersion(currentDb, record[1]);

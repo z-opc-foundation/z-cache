@@ -674,6 +674,63 @@ class RedisServerLifecycleTest {
         }
     }
 
+    /**
+     * SETBIT 与 BITOP 必须进 AOF —— 它们写的是真数据，重启之后得还在。
+     * <p>
+     * 这两个命令一度都不在 {@code WRITE_COMMANDS} 里，而那不是一个会红的缺陷：值进了内存、
+     * 当场 GET 得到、测试全绿，只有进程换过一代之后才看得出什么都没留下。所以这里的判据
+     * 只能跨进程：第一代只写不 SAVE，删掉快照，第二代只许从 AOF 里读回来。
+     * BITOP 还多带一层含义 —— 日志里记的是整条命令，重放时按同样的源重算，因此源键本身
+     * 也得恢复得了，否则重算出来的是另一个答案。
+     */
+    @Test
+    void bitWritesAreJournaledAndReplayed() throws Exception {
+        java.nio.file.Path dir = java.nio.file.Files.createTempDirectory("zcache-bit-aof");
+
+        int p1 = freePort();
+        RedisServer gen1 = new RedisServer("127.0.0.1", p1, 0);
+        gen1.setDataDir(dir.toString());
+        Thread t1 = startAndWait(gen1, p1);
+        try (Socket socket = connect(p1)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+            send(socket, "SET", "bit:src", "hello");
+            assertEquals("+OK", readReply(in));
+            send(socket, "SETBIT", "bit:pad", "100", "1");
+            assertEquals(":0", readReply(in), "前置条件: SETBIT 当场要成功");
+            send(socket, "BITOP", "OR", "bit:dest", "bit:pad", "bit:src");
+            assertEquals(":13", readReply(in), "前置条件: 最长源是 13 字节的 bit:pad");
+            send(socket, "BITCOUNT", "bit:dest");
+            assertEquals(":1", readReply(in));
+        } finally {
+            gen1.stop();
+            t1.join(DEADLINE_MS);
+        }
+        java.nio.file.Files.deleteIfExists(dir.resolve("dump.rdb"));
+
+        int p2 = freePort();
+        RedisServer gen2 = new RedisServer("127.0.0.1", p2, 0);
+        gen2.setDataDir(dir.toString());
+        Thread t2 = startAndWait(gen2, p2);
+        try (Socket socket = connect(p2)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+            send(socket, "GETBIT", "bit:pad", "100");
+            assertEquals(":1", readReply(in), "SETBIT 的位必须活过重启");
+            send(socket, "STRLEN", "bit:pad");
+            assertEquals(":13", readReply(in), "SETBIT 撑出来的补零长度也要一样");
+            send(socket, "GET", "bit:src");
+            assertEquals("hello", readReply(in), "BITOP 的源必须先恢复，否则重放重算的是另一个答案");
+            send(socket, "STRLEN", "bit:dest");
+            assertEquals(":13", readReply(in), "BITOP 的目标键必须活过重启");
+            send(socket, "BITCOUNT", "bit:dest");
+            assertEquals(":1", readReply(in));
+            send(socket, "GETRANGE", "bit:dest", "0", "4");
+            assertEquals("hello", readReply(in), "重放是按同样的源重算，不是把结果当字符串抄回来");
+        } finally {
+            gen2.stop();
+            t2.join(DEADLINE_MS);
+        }
+    }
+
     // ==================== helpers ====================
 
     private static int freePort() throws IOException {
