@@ -5,6 +5,9 @@
 > 1.3.4：RDB 快照补齐 16 个库与 TTL · SAVE/BGSAVE/LASTSAVE 真正落盘 · AOF 启动时重放（含库号与阻塞命令翻译）
 > 1.3.5：错类型读写如实回 `WRONGTYPE` · WATCH/EXEC 的中止判据修对（含库号隔离）· Stream 消费组补全
 > · `CLIENT LIST/KILL/INFO` 从假回复变成真实现 · 同 JVM 多实例不再互串订阅态
+> 1.3.6（开发中，Central 上是 1.3.5）：同一 JVM 里多台服务器不再互相改写对方的一切 ——
+> Stream 键空间、慢查询账、RDB/AOF 与 LOADING 标记全部收成"一台一份"
+> （实测过的最贵一条：不带 `--data-dir` 的第二台一启动，就把正在跑的那台的 SAVE 变成报错）
 
 [![Maven Central](https://img.shields.io/badge/Maven%20Central-1.3.5-blue?logo=apache-maven)](https://central.sonatype.com/search?q=g:io.github.yuku123+a:z-cache*)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
@@ -204,7 +207,7 @@ redis-cli -h localhost -p 16379 SLOWLOG GET 10
 | **🔒 分布式锁** | SET NX PX ✅ / EVAL·EVALSHA 🚧 未实现 | 服务端没有 Lua 解释器；客户端 `DistributedLock` 会降级成"先 GET 校验再 DEL"，**不是原子的**（跨进程竞争下可能误删别人的锁） |
 | **📡 Pub/Sub** | PUBLISH / SUBSCRIBE / UNSUBSCRIBE / PSUBSCRIBE / PUNSUBSCRIBE / PUBSUB | ✅ 确认包的第 3 个数从 1.3.5 起是"这条连接的频道数+模式数"（此前每条命令各自从 1 数，客户端据此记账会错位） |
 | **📋 Stream** | XADD / XREAD / XREADGROUP / XACK / XPENDING / XGROUP / XINFO | ✅ `XINFO CONSUMERS` 1.3.5 起才有实现（此前只有注释里没有 case）；XCLAIM 🚧 未实现；`XPENDING` 只有汇总形态，明细形式（`IDLE`/`start end count`）明确报错 |
-| **💾 持久化** | SAVE / BGSAVE / LASTSAVE | ✅ 1.3.4 起才真正落盘（此前三条命令只回一个写死的成功回复）；BGREWRITEAOF 🚧 未实现 |
+| **💾 持久化** | SAVE / BGSAVE / LASTSAVE | ✅ 1.3.4 起才真正落盘（此前三条命令只回一个写死的成功回复）；1.3.6 起这三板的作用域是"本台服务器"，同 JVM 里再起一台不带 `--data-dir` 的不会把这台关掉；BGREWRITEAOF 🚧 未实现 |
 | **📊 运维** | INFO / MONITOR / DEBUG / CLIENT / SLOWLOG | ✅ `CLIENT LIST` 从 1.3.5 起列出本机全部连接且 `sub=`/`psub=` 是真值（此前只有发起者一行、两个数写死 0）、`CLIENT KILL` 真关连接、新增 `CLIENT INFO`；SLOWLOG 1.3.5 才接上真实服务器（此前恒回 not configured） |
 | **事务** | MULTI / EXEC / DISCARD / WATCH / UNWATCH | ✅ 1.3.5 修掉 WATCH 的两处失效：复查用的版本尺恒返回 0（该中止的中止不了），且 EXEC/DISCARD 不清 WATCH（上一条事务的观察键会永久挂着，把后来的事务无端打掉） |
 | **Pipeline** | 客户端 SDK 自动支持 | ✅ |

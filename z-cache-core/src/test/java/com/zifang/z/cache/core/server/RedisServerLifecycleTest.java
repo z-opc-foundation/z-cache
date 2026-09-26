@@ -29,8 +29,6 @@ class RedisServerLifecycleTest {
 
     @Test
     void streamCommandsWithoutDataDir() throws Exception {
-        StreamStore previous = CommandHandler.getStreamStore();
-        CommandHandler.setStreamStore(null);
         int port = freePort();
         RedisServer server = new RedisServer("127.0.0.1", port, 0);
         Thread thread = startAndWait(server, port);
@@ -40,14 +38,14 @@ class RedisServerLifecycleTest {
             send(socket, "XADD", "demo", "*", "field", "value");
             String id = readReply(in);
             assertFalse(id.startsWith("-ERR"), "XADD 在没有 --data-dir 时被回答: " + id);
-            assertNotNull(CommandHandler.getStreamStore(), "服务器启动时必须把 StreamStore 建起来");
+            assertNotNull(server.serverScope().streamStore(),
+                    "服务器必须给自己这一份建起 StreamStore（不是往进程的静态字段上挂）");
 
             send(socket, "XLEN", "demo");
             assertEquals(":1", readReply(in));
         } finally {
             server.stop();
             thread.join(DEADLINE_MS);
-            CommandHandler.setStreamStore(previous);
         }
     }
 

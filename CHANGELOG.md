@@ -2,6 +2,48 @@
 
 All notable changes to z-cache will be documented in this file.
 
+## [1.3.6] - Unreleased
+
+### Fixed
+
+#### 同一个 JVM 里两台服务器互相改写对方的状态（作用域，不是内存序）
+- 1.3.5 只把 pub/sub 管理器与连接登记表收成"一台一份"，`StreamStore` / `SlowLog`
+  / `AofPersistence` / `RdbPersistence` / `loading` 这五个仍然挂在 `CommandHandler` 的静态字段上，
+  由"最后启动的那台"说了算。两条都在 socket 这一侧量到了：
+  - A 上 `XADD bleed:stream`，B 启动之后 B 上 `XLEN bleed:stream` 回 `:1` ——
+    两台服务器的 Stream 键空间是同一份。
+  - 更贵的一条：B 不带 `--data-dir`，`initPersistence()` 里那两行
+    `CommandHandler.setAofPersistence(null)` / `setRdbPersistence(null)` 把**A 的**写盘入口擦了。
+    A 照常接受 `SET`，但 `SAVE` 变成
+    `-ERR SAVE is not supported: no data directory configured`，停机快照也没有 ——
+    进程里只要先后起过两台，先起那台的数据就静默不落盘。
+- 现在这一份台份归一个新对象 `ServerScope`（pub/sub 管理器、连接登记表、MONITOR 集合、
+  `StreamStore`、`SlowLog`，以及启动过程中才挂上来的 RDB / AOF / `loading`），
+  `RedisServer` 构造时建自己那一份，`RedisServerHandler` 在搭管道时把它交给这条连接的
+  `CommandHandler`。静态字段退成"没绑过服务器时"的进程级默认值——嵌入式手工 handler 与
+  直接 `new CommandHandler(store)` 的单测走那条，行为不变。
+- `RedisServerHandler` 的四个构造器收成一个（`(CommandHandler, ServerScope, MemoryStore,
+  EventExecutorGroup)`）：两参/三参/六参那三个在仓库里零调用方，留着只会让人以为
+  "可以只传一个 pubSubManager"。
+
+### Added
+- `RedisServer.serverScope()`：只读拿到本台那一份，测试与嵌入式据此判断作用域边界。
+- `RedisServerProtocolSemanticsTest` 增加 2 条端到端回归（`streamKeyspaceIsScopedToOneServerInstance`
+  两头都量：B 读不到 A 的流，同时 A 读得到自己的流；
+  `serverWithoutDataDirDoesNotDisableOtherServersPersistence` 先钉"带 dataDir 这台本来能 SAVE"
+  再让第二台启动）。
+- 摘掉绑定的变异探针（`RedisServer` 传 `null` scope）在同一个文件里打出 **8 条命名判红**，
+  两条新回归与原来的 pub/sub 隔离回归都在其中；探针跑完按字节还原（md5 对账）。
+- 计数只认实测：`mvn clean test` 全量 **96 + 338 + 133 + 2 = 569 例全绿**；
+  这类跨实例作用域缺陷只在"整模块连跑"的形态下现形，所以再按 `-Dsurefire.runOrder=random`
+  把 common+core 连跑 3 次，三次都全绿。
+
+### 已知边界（这一版没动，说清楚）
+- RESP3 / `HELLO`、`EVAL` / `EVALSHA` / `SCRIPT` 依旧没有服务端实现，客户端 `DistributedLock`
+  因此仍走"GET 校验后 DEL"的非原子路径。
+- Stream 不参与 RDB/AOF；只有 String 键的 TTL 进快照。
+- `MemoryStore.keyVersions` 只增不减。
+
 ## [1.3.5] - 2026-09-26
 
 ### Fixed
@@ -121,7 +163,8 @@ All notable changes to z-cache will be documented in this file.
 - `MemoryStore.keyTypeMaps` 仍是半接线状态（只有 String 写路径维护它）：`typeOfDb()` 已经不读它，
   但键空间遍历侧还有人在读，所以它没被删。
 - `SlowLog` / `StreamStore` / AOF / RDB 仍是进程级静态：同一 JVM 里两台服务器共用一份。
-  `StreamStore` 尤其明显——A 机 `FLUSHDB` 会把 B 机的 stream 一起清掉。
+  `StreamStore` 尤其明显——A 机 `FLUSHDB` 会把 B 机的 stream 一起清掉。（本条已由 1.3.6 修掉，
+  当时缺的就是这一眼：两条实测判据写在 1.3.6 那一节里。）
 - `MONITOR` 的可见范围已随连接表收到"每台服务器一份"，但 `monitorClients` 的默认值仍是进程级
   集合：未经 `RedisServer` 装配的连接（单测直接 new）会落进那个共享集合里。
 - 未实现的命令一律如实报错而不是冒充：`XREAD`/`XREADGROUP` 没有 `BLOCK`；`XPENDING` 没有明细形态；

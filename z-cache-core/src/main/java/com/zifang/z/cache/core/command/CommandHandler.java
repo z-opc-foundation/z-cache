@@ -14,6 +14,8 @@ import org.apache.logging.log4j.Logger;
 
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ThreadLocalRandom;
 
 /**
@@ -58,37 +60,31 @@ public class CommandHandler {
     // 两条连接完全可能各自读到不同实例：SUBSCRIBE 记进 A、PSUBSCRIBE 记进 B，
     // CLIENT LIST 再读出 sub=1 psub=0 这种对不上账的数。
     //
-    // 现在这两样优先用"这条连接所属服务器"注入的那一份（{@link #bindSharedComponents}），
-    // 静态的只当"没人注入过"时的进程级默认值（嵌入式与单测走那条）。
-    //
-    // 剩下四个仍是进程级（SlowLog / AOF / RDB / StreamStore）：加 volatile 只解决可见性，
-    // 同 JVM 多实例仍共用一份，这条边界在 CHANGELOG 里写明，不当已修。
+    // 1.3.6 把同一把尺套到剩下的四样上（StreamStore / SlowLog / AOF / RDB）。它们当时仍是
+    // 进程级的，于是"再起一台服务器"会改掉正在跑的那台的行为——两条都实测过：
+    //   1) B 启动后 A 上 XLEN 读到 B 的流（{@code :1}，真 Redis 该是 {@code :0}）；
+    //   2) 不带 dataDir 的 B 一启动就把全局 RDB 置 null，A 的 SAVE 变成
+    //      {@code -ERR SAVE is not supported: no data directory configured}，
+    //      而 A 还在照常收写入——静默丢盘，比第一条更贵。
+    // 现在每条连接优先读"所属服务器"注入的那一份（{@link ServerScope}），静态的只当
+    // "没人注入过"时的进程级默认值（嵌入式与单测走那条）。加 volatile 只解决可见性，
+    // 解决不了共用，所以这里改的是作用域而不是内存序。
     private static volatile PubSubManager defaultPubSubManager;
-    private static volatile SlowLog slowLog;
-    private static volatile AofPersistence aofPersistence;
-    private static volatile RdbPersistence rdbPersistence;
-    private static volatile StreamStore streamStore;
+    private static volatile SlowLog defaultSlowLog;
+    private static volatile AofPersistence defaultAofPersistence;
+    private static volatile RdbPersistence defaultRdbPersistence;
+    private static volatile StreamStore defaultStreamStore;
+    private static volatile boolean defaultLoading;
+
+    /** 这条连接所属服务器的那一份共享状态；未绑定时为 null，读侧退回进程级默认值。 */
+    private volatile ServerScope scope;
 
     /** 进程级默认连接登记表：没有服务器注入时（单测直接 new）用这一份。 */
-    private static final java.util.concurrent.ConcurrentMap<ChannelHandlerContext, CommandHandler> DEFAULT_CONNECTIONS
-            = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final ConcurrentMap<ChannelHandlerContext, CommandHandler> DEFAULT_CONNECTIONS
+            = new ConcurrentHashMap<>();
     /** 进程级默认 MONITOR 集合，口径同上。 */
-    private static final java.util.Set<ChannelHandlerContext> DEFAULT_MONITOR_CLIENTS
-            = java.util.concurrent.ConcurrentHashMap.newKeySet();
-
-    /** 这条连接实际使用的 pub/sub 管理器；未注入时退回进程级默认值。 */
-    private volatile PubSubManager pubSubManager;
-    /**
-     * 这条连接所属服务器的连接登记表：{@code ctx -> 该连接的 CommandHandler}。
-     * CLIENT LIST 要列出所有连接（以前只列发起者自己那一条，等于没有列表），CLIENT KILL
-     * 要能按地址/id 找到目标并真的关掉它；连接在 {@link #setChannelContext} 里入表、
-     * {@link #onDisconnect} 里出表。范围是"这台服务器"，不是整个 JVM。
-     */
-    private volatile java.util.concurrent.ConcurrentMap<ChannelHandlerContext, CommandHandler> connections
-            = DEFAULT_CONNECTIONS;
-
-    /** MONITOR 客户端集合，作用域与 {@link #connections} 一致。 */
-    private volatile java.util.Set<ChannelHandlerContext> monitorClients = DEFAULT_MONITOR_CLIENTS;
+    private static final Set<ChannelHandlerContext> DEFAULT_MONITOR_CLIENTS
+            = ConcurrentHashMap.newKeySet();
 
     /** 每连接客户端名称（CLIENT SETNAME / GETNAME） */
     private volatile String clientName;
@@ -112,44 +108,68 @@ public class CommandHandler {
         this.transactionContext = new TransactionManager.TransactionContext();
     }
 
-    // ---- 共享组件 setter：进程级默认值，未注入过的连接读这一份 ----
+    // ---- 共享组件 setter：进程级默认值，未绑定服务器的那条连接读这一份 ----
     public static void setPubSubManager(PubSubManager m) { defaultPubSubManager = m; }
-    public static void setSlowLog(SlowLog l) { slowLog = l; }
-    public static void setAofPersistence(AofPersistence a) { aofPersistence = a; }
-    public static void setRdbPersistence(RdbPersistence r) { rdbPersistence = r; }
-    public static void setStreamStore(StreamStore ss) { streamStore = ss; }
+    public static void setSlowLog(SlowLog l) { defaultSlowLog = l; }
+    public static void setAofPersistence(AofPersistence a) { defaultAofPersistence = a; }
+    public static void setRdbPersistence(RdbPersistence r) { defaultRdbPersistence = r; }
+    public static void setStreamStore(StreamStore ss) { defaultStreamStore = ss; }
 
     /**
      * 把这条连接接到它所属服务器的那一份共享状态上。由
      * {@link com.zifang.z.cache.core.server.RedisServerHandler} 在建管道时调用一次。
-     * <p>
-     * 传 null 的那一项退回进程级默认值，所以单测直接 new {@code CommandHandler}、
-     * 或用旧的两/三参 {@code RedisServerHandler} 构造器的路径行为不变。
      *
-     * @param pubSub    这台服务器的 pub/sub 管理器
-     * @param registry  这台服务器的连接登记表（CLIENT LIST / KILL 的可见范围）
-     * @param monitors  这台服务器的 MONITOR 集合
+     * @param scope 这台服务器的共享状态；传 null 表示不接，读侧退回进程级默认值
      */
-    public void bindSharedComponents(PubSubManager pubSub,
-                                    java.util.concurrent.ConcurrentMap<ChannelHandlerContext, CommandHandler> registry,
-                                    java.util.Set<ChannelHandlerContext> monitors) {
-        this.pubSubManager = pubSub;
-        if (registry != null) {
-            this.connections = registry;
-        }
-        if (monitors != null) {
-            this.monitorClients = monitors;
-        }
+    public void bindScope(ServerScope scope) {
+        this.scope = scope;
     }
 
     /** pub/sub 管理器：先用这台连接所属服务器注入的那份，没有再退回进程级默认值。 */
     private PubSubManager pubSub() {
-        PubSubManager bound = this.pubSubManager;
-        return bound != null ? bound : defaultPubSubManager;
+        ServerScope s = this.scope;
+        return s != null ? s.pubSubManager() : defaultPubSubManager;
     }
 
-    public static StreamStore getStreamStore() { return streamStore; }
-    public static SlowLog getSlowLog() { return slowLog; }
+    /** MONITOR / CLIENT 命令"未绑定服务器"时退回的那份进程级登记表，单测直接 new 走这条。 */
+    private ConcurrentMap<ChannelHandlerContext, CommandHandler> connections() {
+        ServerScope s = this.scope;
+        return s != null ? s.connections() : DEFAULT_CONNECTIONS;
+    }
+
+    private Set<ChannelHandlerContext> monitorClients() {
+        ServerScope s = this.scope;
+        return s != null ? s.monitorClients() : DEFAULT_MONITOR_CLIENTS;
+    }
+
+    private StreamStore streams() {
+        ServerScope s = this.scope;
+        return s != null ? s.streamStore() : defaultStreamStore;
+    }
+
+    private SlowLog slowLog() {
+        ServerScope s = this.scope;
+        return s != null ? s.slowLog() : defaultSlowLog;
+    }
+
+    private RdbPersistence rdb() {
+        ServerScope s = this.scope;
+        return s != null ? s.rdbPersistence() : defaultRdbPersistence;
+    }
+
+    private AofPersistence aof() {
+        ServerScope s = this.scope;
+        return s != null ? s.aofPersistence() : defaultAofPersistence;
+    }
+
+    private boolean isLoading() {
+        ServerScope s = this.scope;
+        return s != null ? s.loading() : defaultLoading;
+    }
+
+    public static StreamStore getStreamStore() { return defaultStreamStore; }
+    public static SlowLog getSlowLog() { return defaultSlowLog; }
+
 
     /**
      * 绑定的同时把这条连接实际监听到的端口记下来：INFO 报的是它，不是配置里的默认 6379
@@ -158,12 +178,12 @@ public class CommandHandler {
      */
     public void setChannelContext(ChannelHandlerContext ctx) {
         if (ctx != null) {
-            connections.put(ctx, this);
+            connections().put(ctx, this);
             if (ctx.channel().localAddress() instanceof java.net.InetSocketAddress) {
                 this.localPort = ((java.net.InetSocketAddress) ctx.channel().localAddress()).getPort();
             }
         } else if (channelContext != null) {
-            connections.remove(channelContext);
+            connections().remove(channelContext);
         }
         this.channelContext = ctx;
     }
@@ -197,8 +217,8 @@ public class CommandHandler {
             pubSub.removeClient(channelContext);
         }
         if (channelContext != null) {
-            monitorClients.remove(channelContext);
-            connections.remove(channelContext);
+            monitorClients().remove(channelContext);
+            connections().remove(channelContext);
         }
         if (transactionManager != null) {
             transactionManager.cleanup(transactionContext);
@@ -413,12 +433,12 @@ public class CommandHandler {
                     logger.warn("Unknown command: {}", cmd);
                     result = RespError.unknownCommand(cmd);
             }
-            if (slowLog != null) {
+            if (slowLog() != null) {
                 long duration = System.nanoTime() - startTime;
-                slowLog.log(duration, args);
+                slowLog().log(duration, args);
             }
             // MONITOR 转发：向所有 MONITOR 客户端推送命令
-            if (!monitorClients.isEmpty() && !"MONITOR".equals(cmd)) {
+            if (!monitorClients().isEmpty() && !"MONITOR".equals(cmd)) {
                 forwardToMonitors(args);
             }
             // 写命令收尾：AOF 追加 + RDB 写入计数
@@ -1079,11 +1099,11 @@ public class CommandHandler {
 
     private Object handleSlowlog(String[] args) {
         if (args.length<2) return RespError.wrongNumberOfArguments("SLOWLOG");
-        if (slowLog==null) return RespError.of("ERR","SlowLog not configured");
+        if (slowLog()==null) return RespError.of("ERR","SlowLog not configured");
         switch (args[1].toUpperCase()) {
-            case "GET": { int c=args.length>2?Integer.parseInt(args[2]):10; List<SlowLog.SlowLogEntry> e=slowLog.get(c); Object[] r=new Object[e.size()]; for(int i=0;i<e.size();i++) { SlowLog.SlowLogEntry en=e.get(i); r[i]=RespArray.of(RespInteger.of(en.getId()),RespInteger.of(en.getTimestampNanos()/1000),RespInteger.of(en.getDurationNanos()/1000),toRespArray(en.getArgs())); } return RespArray.of(r); }
-            case "LEN": return RespInteger.of(slowLog.len());
-            case "RESET": slowLog.reset(); return RespSimpleString.of("OK");
+            case "GET": { int c=args.length>2?Integer.parseInt(args[2]):10; List<SlowLog.SlowLogEntry> e=slowLog().get(c); Object[] r=new Object[e.size()]; for(int i=0;i<e.size();i++) { SlowLog.SlowLogEntry en=e.get(i); r[i]=RespArray.of(RespInteger.of(en.getId()),RespInteger.of(en.getTimestampNanos()/1000),RespInteger.of(en.getDurationNanos()/1000),toRespArray(en.getArgs())); } return RespArray.of(r); }
+            case "LEN": return RespInteger.of(slowLog().len());
+            case "RESET": slowLog().reset(); return RespSimpleString.of("OK");
             default: return RespError.syntaxError();
         }
     }
@@ -1095,11 +1115,11 @@ public class CommandHandler {
      * 未配置 dataDir 时也照样回 OK。这里把两种情况分开：没有快照目标就如实报错。
      */
     private Object handleSave() {
-        if (rdbPersistence == null) {
+        if (rdb() == null) {
             return RespError.of("ERR", "SAVE is not supported: no data directory configured");
         }
         try {
-            rdbPersistence.save();
+            rdb().save();
             return RespSimpleString.of("OK");
         } catch (Exception e) {
             logger.error("SAVE failed: {}", e.getMessage(), e);
@@ -1109,10 +1129,10 @@ public class CommandHandler {
 
     /** BGSAVE — 受理后台快照；已有快照在跑时如实拒绝，与 Redis 行为一致。 */
     private Object handleBgsave() {
-        if (rdbPersistence == null) {
+        if (rdb() == null) {
             return RespError.of("ERR", "BGSAVE is not supported: no data directory configured");
         }
-        if (!rdbPersistence.saveAsync()) {
+        if (!rdb().saveAsync()) {
             return RespError.of("ERR", "Background save already in progress. Please wait");
         }
         return RespSimpleString.of("Background saving started");
@@ -1120,7 +1140,7 @@ public class CommandHandler {
 
     /** LASTSAVE — 最近一次成功快照的 Unix 秒；从未成功过则为 0，不再拿当前时间冒充。 */
     private Object handleLastsave() {
-        return RespInteger.of(rdbPersistence == null ? 0L : rdbPersistence.getLastSaveTime());
+        return RespInteger.of(rdb() == null ? 0L : rdb().getLastSaveTime());
     }
 
     private Object handleFlushdb() { store.flushDb(currentDb); return RespSimpleString.of("OK"); }
@@ -1208,7 +1228,7 @@ public class CommandHandler {
                 // 而且 sub=/psub= 恒为 0 —— 因为订阅中的连接根本走不到 CLIENT（被 pubsub 闸门挡了），
                 // 能从 socket 看到这些字段的只有别的连接。现在由旁观者来读，才真的量得到。
                 StringBuilder sb = new StringBuilder();
-                for (java.util.Map.Entry<ChannelHandlerContext, CommandHandler> entry : connections.entrySet()) {
+                for (java.util.Map.Entry<ChannelHandlerContext, CommandHandler> entry : connections().entrySet()) {
                     CommandHandler peer = entry.getValue();
                     if (peer.channelContext != entry.getKey()) {
                         continue; // 已断开的陈旧条目
@@ -1308,7 +1328,7 @@ public class CommandHandler {
             } catch (NumberFormatException e) {
                 return null;
             }
-            for (java.util.Map.Entry<ChannelHandlerContext, CommandHandler> entry : connections.entrySet()) {
+            for (java.util.Map.Entry<ChannelHandlerContext, CommandHandler> entry : connections().entrySet()) {
                 if (entry.getValue().channelContext == entry.getKey() && clientId(entry.getKey()) == id) {
                     return entry.getKey();
                 }
@@ -1325,7 +1345,7 @@ public class CommandHandler {
             return null;
         }
         ChannelHandlerContext matched = null;
-        for (java.util.Map.Entry<ChannelHandlerContext, CommandHandler> entry : connections.entrySet()) {
+        for (java.util.Map.Entry<ChannelHandlerContext, CommandHandler> entry : connections().entrySet()) {
             CommandHandler peer = entry.getValue();
             if (peer.channelContext != entry.getKey()) {
                 continue;
@@ -1386,8 +1406,8 @@ public class CommandHandler {
                         + " cannot be measured from the JVM, and reporting constants would be worse than an error");
             }
             case "SLOWLOG-RESET": {
-                if (slowLog == null) return RespError.of("ERR", "SlowLog not configured");
-                slowLog.reset();
+                if (slowLog() == null) return RespError.of("ERR", "SlowLog not configured");
+                slowLog().reset();
                 // Redis 回 +OK；回 :1 会让按 Redis 协议写的客户端把整型当成解析失败。
                 return RespSimpleString.of("OK");
             }
@@ -1407,12 +1427,12 @@ public class CommandHandler {
      */
     private Object handleMonitor(String[] args) {
         if (channelContext == null) return RespError.of("ERR", "no connection context");
-        if (monitorClients.contains(channelContext)) {
+        if (monitorClients().contains(channelContext)) {
             // 已在 MONITOR 模式，再次执行则退出
-            monitorClients.remove(channelContext);
+            monitorClients().remove(channelContext);
             return RespSimpleString.of("OK");
         }
-        monitorClients.add(channelContext);
+        monitorClients().add(channelContext);
         // Redis 兼容：MONITOR 返回 OK，然后开始推送命令
         return RespSimpleString.of("OK");
     }
@@ -1421,7 +1441,7 @@ public class CommandHandler {
      * RESET 命令：重置连接状态（退出 MONITOR 模式、清除客户端名称、切换到 db0）。
      */
     private Object handleReset() {
-        monitorClients.remove(channelContext);
+        monitorClients().remove(channelContext);
         this.clientName = null;
         this.currentDb = 0;
         return RespSimpleString.of("OK");
@@ -1432,7 +1452,7 @@ public class CommandHandler {
      * <p>格式与 Redis MONITOR 兼容：timestamp.epoch [db id addr] "command" "arg1" "arg2" ...
      */
     private void forwardToMonitors(String[] args) {
-        if (monitorClients.isEmpty()) return;
+        if (monitorClients().isEmpty()) return;
         long epoch = System.currentTimeMillis() / 1000;
         int db = currentDb;
         int id = channelContext.channel().hashCode() & 0x7FFFFFFF;
@@ -1445,7 +1465,7 @@ public class CommandHandler {
         }
 
         RespBulkString msg = RespBulkString.of(sb.toString());
-        java.util.Iterator<ChannelHandlerContext> it = monitorClients.iterator();
+        java.util.Iterator<ChannelHandlerContext> it = monitorClients().iterator();
         while (it.hasNext()) {
             ChannelHandlerContext monitorCtx = it.next();
             try {
@@ -1463,7 +1483,7 @@ public class CommandHandler {
      * XADD key [MAXLEN maxlen] id field value [field value ...]
      */
     private Object handleXadd(String[] args) {
-        if (streamStore == null) return RespError.of("ERR", "Stream not configured");
+        if (streams() == null) return RespError.of("ERR", "Stream not configured");
         if (args.length < 4) return RespError.wrongNumberOfArguments("XADD");
 
         String key = args[1];
@@ -1503,7 +1523,7 @@ public class CommandHandler {
         }
 
         try {
-            String entryId = streamStore.xadd(currentDb, key, fields, id, maxLen);
+            String entryId = streams().xadd(currentDb, key, fields, id, maxLen);
             return RespBulkString.of(entryId);
         } catch (Exception e) {
             return RespError.of("ERR", e.getMessage());
@@ -1514,9 +1534,9 @@ public class CommandHandler {
      * XLEN key
      */
     private Object handleXlen(String[] args) {
-        if (streamStore == null) return RespError.of("ERR", "Stream not configured");
+        if (streams() == null) return RespError.of("ERR", "Stream not configured");
         if (args.length != 2) return RespError.wrongNumberOfArguments("XLEN");
-        return RespInteger.of((int) streamStore.xlen(currentDb, args[1]));
+        return RespInteger.of((int) streams().xlen(currentDb, args[1]));
     }
 
     /**
@@ -1524,7 +1544,7 @@ public class CommandHandler {
      * XREVRANGE key end start [COUNT count]
      */
     private Object handleXrange(String[] args, boolean reverse) {
-        if (streamStore == null) return RespError.of("ERR", "Stream not configured");
+        if (streams() == null) return RespError.of("ERR", "Stream not configured");
         if (args.length < 4) return RespError.wrongNumberOfArguments(reverse ? "XREVRANGE" : "XRANGE");
 
         String key = args[1];
@@ -1537,8 +1557,8 @@ public class CommandHandler {
         }
 
         List<StreamEntry> entries = reverse
-                ? streamStore.xrevrange(currentDb, key, end, start, count)
-                : streamStore.xrange(currentDb, key, start, end, count);
+                ? streams().xrevrange(currentDb, key, end, start, count)
+                : streams().xrange(currentDb, key, start, end, count);
 
         Object[] result = new Object[entries.size()];
         for (int i = 0; i < entries.size(); i++) {
@@ -1558,11 +1578,11 @@ public class CommandHandler {
      * XDEL key id [id ...]
      */
     private Object handleXdel(String[] args) {
-        if (streamStore == null) return RespError.of("ERR", "Stream not configured");
+        if (streams() == null) return RespError.of("ERR", "Stream not configured");
         if (args.length < 3) return RespError.wrongNumberOfArguments("XDEL");
         String[] ids = new String[args.length - 2];
         System.arraycopy(args, 2, ids, 0, ids.length);
-        return RespInteger.of((int) streamStore.xdel(currentDb, args[1], ids));
+        return RespInteger.of((int) streams().xdel(currentDb, args[1], ids));
     }
 
     /**
@@ -1576,7 +1596,7 @@ public class CommandHandler {
      * 但语法必须收下，不能让客户端因为写了官方形式就拿回一个 internal error。
      */
     private Object handleXtrim(String[] args) {
-        if (streamStore == null) return RespError.of("ERR", "Stream not configured");
+        if (streams() == null) return RespError.of("ERR", "Stream not configured");
         if (args.length < 4) return RespError.wrongNumberOfArguments("XTRIM");
         if (!"MAXLEN".equalsIgnoreCase(args[2])) {
             return RespError.of("ERR", "unsupported XTRIM strategy '" + args[2] + "', only MAXLEN is implemented");
@@ -1590,14 +1610,14 @@ public class CommandHandler {
             return RespError.of("ERR", "value is not an integer or out of range");
         }
         if (maxLen < 0) return RespError.of("ERR", "MAXLEN requires a non-negative integer");
-        return RespInteger.of((int) streamStore.xtrim(currentDb, args[1], maxLen));
+        return RespInteger.of((int) streams().xtrim(currentDb, args[1], maxLen));
     }
 
     /**
      * XREAD [COUNT count] [BLOCK milliseconds] STREAMS key [key ...] id [id ...]
      */
     private Object handleXread(String[] args) {
-        if (streamStore == null) return RespError.of("ERR", "Stream not configured");
+        if (streams() == null) return RespError.of("ERR", "Stream not configured");
         if (args.length < 4) return RespError.wrongNumberOfArguments("XREAD");
 
         int count = -1;
@@ -1631,7 +1651,7 @@ public class CommandHandler {
         Object[] result = new Object[numKeys];
         int ri = 0;
         for (int k = 0; k < numKeys; k++) {
-            List<StreamEntry> entries = streamStore.xrange(currentDb, keys[k], ids[k], "+", count);
+            List<StreamEntry> entries = streams().xrange(currentDb, keys[k], ids[k], "+", count);
             if (!entries.isEmpty()) {
                 Object[] entryArr = new Object[entries.size()];
                 for (int j = 0; j < entries.size(); j++) {
@@ -1654,7 +1674,7 @@ public class CommandHandler {
      * XREADGROUP GROUP group consumer [COUNT count] [BLOCK ms] STREAMS key [key ...] id [id ...]
      */
     private Object handleXreadgroup(String[] args) {
-        if (streamStore == null) return RespError.of("ERR", "Stream not configured");
+        if (streams() == null) return RespError.of("ERR", "Stream not configured");
         if (args.length < 7) return RespError.wrongNumberOfArguments("XREADGROUP");
 
         int i = 1;
@@ -1680,7 +1700,7 @@ public class CommandHandler {
             streams.put(args[i + k], args[i + numKeys + k]);
         }
 
-        Map<String, List<StreamEntry>> result = streamStore.xreadgroup(currentDb, group, consumer, streams, count);
+        Map<String, List<StreamEntry>> result = streams().xreadgroup(currentDb, group, consumer, streams, count);
 
         Object[] streamResults = new Object[result.size()];
         int ri = 0;
@@ -1705,23 +1725,23 @@ public class CommandHandler {
      * XGROUP [CREATE key group id] [DESTROY key group] [CREATECONSUMER key group consumer] [DELCONSUMER key group consumer]
      */
     private Object handleXgroup(String[] args) {
-        if (streamStore == null) return RespError.of("ERR", "Stream not configured");
+        if (streams() == null) return RespError.of("ERR", "Stream not configured");
         if (args.length < 2) return RespError.wrongNumberOfArguments("XGROUP");
         String sub = args[1].toUpperCase();
         switch (sub) {
             case "CREATE": {
                 if (args.length < 5) return RespError.wrongNumberOfArguments("XGROUP CREATE");
-                boolean ok = streamStore.xgroupCreate(currentDb, args[2], args[3], args[4]);
+                boolean ok = streams().xgroupCreate(currentDb, args[2], args[3], args[4]);
                 return ok ? RespSimpleString.of("OK") : RespError.of("ERR", "BUSYGROUP Consumer Group name already exists");
             }
             case "DESTROY": {
                 if (args.length < 4) return RespError.wrongNumberOfArguments("XGROUP DESTROY");
-                boolean ok = streamStore.xgroupDestroy(currentDb, args[2], args[3]);
+                boolean ok = streams().xgroupDestroy(currentDb, args[2], args[3]);
                 return RespInteger.of(ok ? 1 : 0);
             }
             case "CREATECONSUMER": {
                 if (args.length < 5) return RespError.wrongNumberOfArguments("XGROUP CREATECONSUMER");
-                com.zifang.z.cache.core.stream.Stream stream = streamStore.getStream(currentDb, args[2]);
+                com.zifang.z.cache.core.stream.Stream stream = streams().getStream(currentDb, args[2]);
                 if (stream == null) return RespInteger.of(0);
                 com.zifang.z.cache.core.stream.ConsumerGroup cg = stream.getGroup(args[3]);
                 if (cg == null) return RespInteger.of(0);
@@ -1730,7 +1750,7 @@ public class CommandHandler {
             }
             case "DELCONSUMER": {
                 if (args.length < 5) return RespError.wrongNumberOfArguments("XGROUP DELCONSUMER");
-                com.zifang.z.cache.core.stream.Stream stream = streamStore.getStream(currentDb, args[2]);
+                com.zifang.z.cache.core.stream.Stream stream = streams().getStream(currentDb, args[2]);
                 if (stream == null) return RespInteger.of(0);
                 com.zifang.z.cache.core.stream.ConsumerGroup cg = stream.getGroup(args[3]);
                 if (cg == null) return RespInteger.of(0);
@@ -1745,11 +1765,11 @@ public class CommandHandler {
      * XACK key group id [id ...]
      */
     private Object handleXack(String[] args) {
-        if (streamStore == null) return RespError.of("ERR", "Stream not configured");
+        if (streams() == null) return RespError.of("ERR", "Stream not configured");
         if (args.length < 4) return RespError.wrongNumberOfArguments("XACK");
         String[] ids = new String[args.length - 3];
         System.arraycopy(args, 3, ids, 0, ids.length);
-        return RespInteger.of((int) streamStore.xack(currentDb, args[1], args[2], ids));
+        return RespInteger.of((int) streams().xack(currentDb, args[1], args[2], ids));
     }
 
     /**
@@ -1761,13 +1781,13 @@ public class CommandHandler {
      * 不再像以前那样把多余参数丢掉、拿汇总冒充明细。
      */
     private Object handleXpending(String[] args) {
-        if (streamStore == null) return RespError.of("ERR", "Stream not configured");
+        if (streams() == null) return RespError.of("ERR", "Stream not configured");
         if (args.length < 3) return RespError.wrongNumberOfArguments("XPENDING");
         if (args.length > 3) {
             return RespError.of("ERR", "XPENDING detail form (IDLE / start / end / count) is not supported");
         }
 
-        Object[] summary = streamStore.xpending(currentDb, args[1], args[2]);
+        Object[] summary = streams().xpending(currentDb, args[1], args[2]);
         if (summary == null) {
             return RespError.of("NOGROUP",
                     "No such key '" + args[1] + "' or consumer group '" + args[2] + "'");
@@ -1777,7 +1797,7 @@ public class CommandHandler {
         String lowestId = (String) summary[1];
         String highestId = (String) summary[2];
 
-        com.zifang.z.cache.core.stream.Stream stream = streamStore.getStream(currentDb, args[1]);
+        com.zifang.z.cache.core.stream.Stream stream = streams().getStream(currentDb, args[1]);
         com.zifang.z.cache.core.stream.ConsumerGroup group = stream == null ? null : stream.getGroup(args[2]);
         Map<String, Long> perConsumer = group == null
                 ? java.util.Collections.<String, Long>emptyMap() : group.perConsumerPending();
@@ -1798,12 +1818,12 @@ public class CommandHandler {
      * XINFO [GROUPS key] [STREAM key] [CONSUMERS key group]
      */
     private Object handleXinfo(String[] args) {
-        if (streamStore == null) return RespError.of("ERR", "Stream not configured");
+        if (streams() == null) return RespError.of("ERR", "Stream not configured");
         if (args.length < 3) return RespError.wrongNumberOfArguments("XINFO");
         String sub = args[1].toUpperCase();
         switch (sub) {
             case "GROUPS": {
-                com.zifang.z.cache.core.stream.Stream stream = streamStore.getStream(currentDb, args[2]);
+                com.zifang.z.cache.core.stream.Stream stream = streams().getStream(currentDb, args[2]);
                 if (stream == null) return RespArray.nullArray();
                 java.util.Set<String> names = stream.groupNames();
                 Object[] result = new Object[names.size()];
@@ -1819,7 +1839,7 @@ public class CommandHandler {
                 return RespArray.of(result);
             }
             case "STREAM": {
-                com.zifang.z.cache.core.stream.Stream stream = streamStore.getStream(currentDb, args[2]);
+                com.zifang.z.cache.core.stream.Stream stream = streams().getStream(currentDb, args[2]);
                 if (stream == null) return RespArray.nullArray();
                 return RespArray.of(
                         RespBulkString.of("length"), RespInteger.of((int) stream.length()),
@@ -1830,7 +1850,7 @@ public class CommandHandler {
                 // 文档注释里一直写着这条，但 switch 从来没有这个 case：
                 // XINFO CONSUMERS 拿回去的永远是 -ERR syntax error。
                 if (args.length < 4) return RespError.wrongNumberOfArguments("XINFO CONSUMERS");
-                com.zifang.z.cache.core.stream.Stream target = streamStore.getStream(currentDb, args[2]);
+                com.zifang.z.cache.core.stream.Stream target = streams().getStream(currentDb, args[2]);
                 com.zifang.z.cache.core.stream.ConsumerGroup group =
                         target == null ? null : target.getGroup(args[3]);
                 if (group == null) {
@@ -1883,12 +1903,12 @@ public class CommandHandler {
             new java.util.HashSet<>(java.util.Arrays.asList("BLPOP", "BRPOP", "BRPOPLPUSH"));
 
     /**
-     * AOF 重放期间为 true：此时每条命令都要照常执行，但绝不能再写回 AOF，
-     * 否则开机重放一次，AOF 就把自己抄了一份，越长越离谱。
+     * 进程级 LOADING 标记，见字段区里的 {@code defaultLoading}：重放期间每条命令照常执行，
+     * 但绝不能再写回 AOF，否则开机重放一次，AOF 就把自己抄了一份，越长越离谱。
+     * 跑着的服务器走的是自己 {@link ServerScope#setLoading(boolean)} 那一份，这里只服务
+     * 没有绑定服务器的路径（嵌入式手工搭 handler、单测）。
      */
-    private static volatile boolean loading;
-
-    public static void setLoading(boolean loading) { CommandHandler.loading = loading; }
+    public static void setLoading(boolean value) { defaultLoading = value; }
 
     /**
      * 写命令执行完之后的两件收尾事：追加 AOF、给 RDB 调度器记一次"库变了"。
@@ -1898,7 +1918,7 @@ public class CommandHandler {
      * 判断"没有任何写入"。定时快照要成立，这一记必须有人打。
      */
     private void propagateWriteToPersistence(String[] args, Object result) {
-        if (loading || args.length == 0) {
+        if (isLoading() || args.length == 0) {
             return;
         }
         String cmd = args[0].toUpperCase();
@@ -1916,13 +1936,13 @@ public class CommandHandler {
         }
 
         // 键空间变了 —— WATCH 的复查就吃这一记。放在 AOF 分支之前：没配 --data-dir 时
-        // aofPersistence 是 null，而事务照样得能中止。
+        // aof() 是 null，而事务照样得能中止。
         bumpWatchedKeys(record);
 
-        if (rdbPersistence != null) {
-            rdbPersistence.onWrite();
+        if (rdb() != null) {
+            rdb().onWrite();
         }
-        if (aofPersistence == null) {
+        if (aof() == null) {
             return;
         }
         try {
@@ -1938,9 +1958,9 @@ public class CommandHandler {
      */
     private void writeAofRecord(String[] record) throws java.io.IOException {
         if (currentDb != 0) {
-            aofPersistence.appendCommand(new String[]{"SELECT", Integer.toString(currentDb)});
+            aof().appendCommand(new String[]{"SELECT", Integer.toString(currentDb)});
         }
-        aofPersistence.appendCommand(record);
+        aof().appendCommand(record);
     }
 
     /** 一条命令同时改动两个键的操作（源与目标都要让 WATCH 看见）。 */

@@ -3,7 +3,7 @@ package com.zifang.z.cache.core.server;
 import com.zifang.z.cache.common.protocol.RespArray;
 import com.zifang.z.cache.common.protocol.RespError;
 import com.zifang.z.cache.core.command.CommandHandler;
-import com.zifang.z.cache.core.pubsub.PubSubManager;
+import com.zifang.z.cache.core.command.ServerScope;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.util.concurrent.EventExecutorGroup;
@@ -41,37 +41,22 @@ public class RedisServerHandler extends SimpleChannelInboundHandler<Object> {
     private volatile Thread blockedThread;
     private volatile boolean disconnected;
 
-    public RedisServerHandler(CommandHandler commandHandler, PubSubManager pubSubManager) {
-        this(commandHandler, pubSubManager, null, null);
-    }
-
-    public RedisServerHandler(CommandHandler commandHandler, PubSubManager pubSubManager, MemoryStore store) {
-        this(commandHandler, pubSubManager, store, null);
-    }
-
-    public RedisServerHandler(CommandHandler commandHandler, PubSubManager pubSubManager,
-                              MemoryStore store, EventExecutorGroup blockingGroup) {
-        this(commandHandler, pubSubManager, store, blockingGroup, null, null);
-    }
-
     /**
-     * @param serverConnections 这台服务器的连接登记表；null 时退回进程级默认值
-     * @param serverMonitors    这台服务器的 MONITOR 集合；null 时退回进程级默认值
+     * @param scope 这条连接所属服务器的那一份共享状态（pub/sub 管理器、连接登记表、MONITOR
+     *              集合、StreamStore、SlowLog、RDB/AOF）。传 null 表示不属于任何服务器，
+     *              读侧退回进程级默认值 —— 嵌入式与"手工搭管道"的测试走这条。
      */
-    public RedisServerHandler(CommandHandler commandHandler, PubSubManager pubSubManager,
-                              MemoryStore store, EventExecutorGroup blockingGroup,
-                              java.util.concurrent.ConcurrentMap<ChannelHandlerContext, CommandHandler> serverConnections,
-                              java.util.Set<ChannelHandlerContext> serverMonitors) {
+    public RedisServerHandler(CommandHandler commandHandler, ServerScope scope,
+                              MemoryStore store, EventExecutorGroup blockingGroup) {
         this.commandHandler = commandHandler;
         this.store = store;
         this.blockingGroup = blockingGroup;
         this.commandHandler.setChannelContext(null); // 会在 channelActive 中设置
-        // 这条连接用自己服务器的那份 pub/sub 管理器与连接登记表。以前这里是
-        // CommandHandler.setPubSubManager(...)（写静态字段）：每 accept 一条连接就全局覆写一次，
-        // 一个 JVM 里两台服务器会互相串订阅态，CLIENT LIST 也变成"列整个 JVM 的连接"。
-        if (pubSubManager != null || serverConnections != null || serverMonitors != null) {
-            this.commandHandler.bindSharedComponents(pubSubManager, serverConnections, serverMonitors);
-        }
+        // 这条连接用自己服务器的那份共享状态。以前这里是逐样写 CommandHandler 的静态字段
+        // （setPubSubManager / setStreamStore / setRdbPersistence ...）：每 accept 一条连接
+        // 就全局覆写一次，一个 JVM 里两台服务器会互相串订阅态、串 Stream 键空间，
+        // 后起的那台还会把前一台的持久化整个关掉。CLIENT LIST 也变成"列整个 JVM 的连接"。
+        this.commandHandler.bindScope(scope);
     }
 
     @Override

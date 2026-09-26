@@ -39,20 +39,16 @@ public class RedisServer {
     private final String password;
     private final MemoryStore store;
 
-    // PubSub 管理器
-    private final PubSubManager pubSubManager = new PubSubManager();
-
     /**
-     * 这台服务器自己的连接登记表与 MONITOR 集合。
-     * <p>它们以前是 {@code CommandHandler} 的静态字段，于是"这台服务器上有几条连接"其实是
-     * "这个 JVM 里有过几条连接"：CLIENT LIST 会列出别台服务器的客户端，CLIENT KILL 能踢掉
-     * 别人的连接，MONITOR 也收得到别台的命令。范围收成一台服务器一份。
+     * 这台服务器自己的一份共享状态：pub/sub 管理器、连接登记表、MONITOR 集合、StreamStore、
+     * SlowLog，以及启动后才挂上来的 RDB/AOF。
+     * <p>它们曾经都是 {@code CommandHandler} 的静态字段，于是"这台服务器上的状态"其实是
+     * "这个 JVM 里最后写过一次的那个值"：CLIENT LIST 列出别台服务器的客户端、CLIENT KILL
+     * 踢掉别人的连接、A 写的 Stream 在 B 上读得到，而不带 dataDir 的 B 一启动就把 A 的
+     * 持久化整个置空（A 继续收写入但 SAVE 已经不能用了）。两台服务器的对照实测在
+     * {@code RedisServerProtocolSemanticsTest}。
      */
-    private final java.util.concurrent.ConcurrentMap<io.netty.channel.ChannelHandlerContext,
-            com.zifang.z.cache.core.command.CommandHandler> connections =
-            new java.util.concurrent.ConcurrentHashMap<>();
-    private final java.util.Set<io.netty.channel.ChannelHandlerContext> monitorClients =
-            java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private final com.zifang.z.cache.core.command.ServerScope scope;
 
     // 持久化管理器
     private RdbPersistence rdbPersistence;
@@ -106,6 +102,19 @@ public class RedisServer {
         this.port = port;
         this.password = password == null || password.isEmpty() ? null : password;
         this.store = new MemoryStore(maxEntries);
+        // SlowLog 与 StreamStore 是一台服务器一份，不是进程一份：
+        // SLOWLOG RESET 只能清自己这台账，XADD 写的流也不能被别台服务器读到。
+        SlowLog scopeSlowLog = new SlowLog();
+        int scopeSlowlogMs = intProperty("zcache.slowlog-log-slower-than", 10, 0);
+        scopeSlowLog.setSlowLogThresholdNanos(java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(scopeSlowlogMs));
+        this.scope = new com.zifang.z.cache.core.command.ServerScope(
+                new StreamStore(16), scopeSlowLog);
+        logger.info("Slow log initialized (threshold: {} ms)", scopeSlowlogMs);
+    }
+
+    /** 这台服务器的共享状态；连接、Stream、慢查询账都到这一台为止。 */
+    public com.zifang.z.cache.core.command.ServerScope serverScope() {
+        return scope;
     }
 
     /**
@@ -161,8 +170,7 @@ public class RedisServer {
                                 // 挤在承载几十个连接的 I/O EventLoop 上；阻塞命令再单独挪到
                                 // blockingGroup，见该字段注释。
                                 p.addLast(businessGroup, "handler", new RedisServerHandler(
-                                        commandHandler, pubSubManager, store, blockingGroup,
-                                        connections, monitorClients));
+                                        commandHandler, scope, store, blockingGroup));
                             }
                         });
 
@@ -189,31 +197,12 @@ public class RedisServer {
 
     /**
      * 初始化持久化组件：加载 RDB + AOF，启动 AOF 写入。
+     * <p>挂在 {@link #scope} 上而不是 {@code CommandHandler} 的静态字段上：这条方法在
+     * {@code bind()} 之前跑完，所以每条连接的 handler 建出来时看到的就是终值，
+     * 而另一台服务器的 {@code initPersistence()} 碰不到这一台的。
      */
     private void initPersistence() {
-        // Stream 与持久化无关，且 1.3.0 的 X* 命令依赖它。放在 dataDir 早退之前：
-        // 否则不带 --data-dir 的默认启动形态下，全部 Stream 命令返回 "Stream not configured"。
-        if (CommandHandler.getStreamStore() == null) {
-            CommandHandler.setStreamStore(new StreamStore(16));
-            logger.info("Stream store initialized");
-        }
-
-        // SlowLog 和 StreamStore 是同一类接线：它的静态字段以前只有测试在赋值，
-        // 真实服务器里一直是 null，于是 SLOWLOG GET 永远回 -ERR SlowLog not configured，
-        // 分发末尾那段计时代码也从来没执行过——README 却写着 redis-cli SLOWLOG GET 10。
-        if (CommandHandler.getSlowLog() == null) {
-            SlowLog slowLog = new SlowLog();
-            int slowlogMs = intProperty("zcache.slowlog-log-slower-than", 10, 0);
-            slowLog.setSlowLogThresholdNanos(java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(slowlogMs));
-            CommandHandler.setSlowLog(slowLog);
-            logger.info("Slow log initialized (threshold: {} ms)", slowlogMs);
-        }
-
         if (dataDir == null || dataDir.isEmpty()) {
-            // 静态字段是跨实例共享的：一个进程里先起过带 dataDir 的服务、再起一个不带的，
-            // 后起的这个会继承前者的 RDB 路径和已经关掉的 AOF writer。
-            CommandHandler.setAofPersistence(null);
-            CommandHandler.setRdbPersistence(null);
             logger.info("No data directory configured, persistence disabled");
             return;
         }
@@ -231,7 +220,7 @@ public class RedisServer {
         // 默认相对路径 ./dump.rdb（进程 cwd），也就是 --data-dir 之外的另一个文件，
         // 于是 SAVE 与停机快照全都落在一个没人再读回的地方。
         rdbPersistence.setDbFilePath(rdbPath);
-        CommandHandler.setRdbPersistence(rdbPersistence);
+        scope.setRdbPersistence(rdbPersistence);
 
         String aofPath = dataDir + "/appendonly.aof";
         aofPersistence = new AofPersistence();
@@ -253,14 +242,15 @@ public class RedisServer {
         // 重放失败也不回头读 RDB：那时内存里已经落了一半重放结果，再盖一份只会更乱。
         if (aofPresent) {
             CommandHandler replayer = new CommandHandler(store, null);
-            CommandHandler.setLoading(true);
+            replayer.bindScope(scope);
+            scope.setLoading(true);
             try {
                 aofPersistence.loadAof(aofPath, replayer::replayCommand);
                 logger.info("AOF data replayed from {}", aofPath);
             } catch (Exception e) {
                 logger.error("Failed to replay AOF {}: {}", aofPath, e.getMessage(), e);
             } finally {
-                CommandHandler.setLoading(false);
+                scope.setLoading(false);
             }
         } else {
             try {
@@ -274,7 +264,7 @@ public class RedisServer {
         // 启动 AOF 写入（追加模式，上面重放过的内容原样保留）
         try {
             aofPersistence.start(aofPath);
-            CommandHandler.setAofPersistence(aofPersistence);
+            scope.setAofPersistence(aofPersistence);
             logger.info("AOF persistence started: {}", aofPath);
         } catch (Exception e) {
             logger.warn("Failed to start AOF: {}", e.getMessage());
@@ -318,10 +308,10 @@ public class RedisServer {
         if (serverChannel != null) {
             serverChannel.close();
         }
-        // 这两个静态字段是共享组件：不摘掉的话，本实例已经关掉的 AOF writer 还会被
-        // 同进程里下一个实例（嵌入式起停、测试）继续 append，命令静默进不了任何文件。
-        CommandHandler.setAofPersistence(null);
-        CommandHandler.setRdbPersistence(null);
+        // 摘掉本台的写盘入口：已经关掉的 AOF writer 不能再被这条连接上
+        // 迟到的命令 append（作用域已经是每台一份，不会再牵连别台）。
+        scope.setAofPersistence(null);
+        scope.setRdbPersistence(null);
         shutdown();
         started = false;
         logger.info("z-cache server stopped");
@@ -404,7 +394,7 @@ public class RedisServer {
     public boolean isRunning() { return started; }
     public int getPort() { return port; }
     public MemoryStore getStore() { return store; }
-    public PubSubManager getPubSubManager() { return pubSubManager; }
+    public PubSubManager getPubSubManager() { return scope.pubSubManager(); }
     public RdbPersistence getRdbPersistence() { return rdbPersistence; }
     public AofPersistence getAofPersistence() { return aofPersistence; }
 }

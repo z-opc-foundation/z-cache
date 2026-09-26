@@ -737,6 +737,94 @@ class RedisServerProtocolSemanticsTest {
         return false;
     }
 
+    /**
+     * 后起的那台服务器不能把前一台的 Stream 键空间换掉，两台也不该共用同一份。
+     * <p>
+     * 判据两头都量：B 读不到 A 的流（不漏），A 也读得到自己的流（不假绿）。
+     */
+    @Test
+    void streamKeyspaceIsScopedToOneServerInstance() throws Exception {
+        int portA = freePort();
+        int portB = freePort();
+        RedisServer serverA = new RedisServer("127.0.0.1", portA, 0);
+        RedisServer serverB = new RedisServer("127.0.0.1", portB, 0);
+        Thread threadA = startAndWait(serverA, portA);
+        Thread threadB = startAndWait(serverB, portB);
+        try (Socket a = connect(portA); Socket b = connect(portB)) {
+            DataInputStream ain = new DataInputStream(a.getInputStream());
+            DataInputStream bin = new DataInputStream(b.getInputStream());
+
+            send(a, "XADD", "bleed:stream", "*", "f", "v");
+            assertTrue(readReply(ain).matches("\\d+-\\d+"), "A 上 XADD 要回条目 id");
+            send(a, "XLEN", "bleed:stream");
+            assertEquals(":1", readReply(ain), "阳性对照：A 自己写进去的流读得回来");
+
+            send(b, "XLEN", "bleed:stream");
+            assertEquals(":0", readReply(bin), "另一台服务器上没有这条流");
+
+            send(b, "XADD", "own:stream", "*", "f", "v");
+            readReply(bin);
+            send(a, "XLEN", "own:stream");
+            assertEquals(":0", readReply(ain), "B 写的流不能出现在 A 上");
+        } finally {
+            serverA.stop();
+            serverB.stop();
+            threadA.join(DEADLINE_MS);
+            threadB.join(DEADLINE_MS);
+        }
+    }
+
+    /**
+     * 一台不带 dataDir 的服务器起来，不能顺手把另一台正在跑的服务器的持久化关掉。
+     */
+    @Test
+    void serverWithoutDataDirDoesNotDisableOtherServersPersistence() throws Exception {
+        java.nio.file.Path dir = java.nio.file.Files.createTempDirectory("zcache-scope-rdb");
+        int portA = freePort();
+        int portB = freePort();
+        RedisServer serverA = new RedisServer("127.0.0.1", portA, 0);
+        serverA.setDataDir(dir.toString());
+        RedisServer serverB = new RedisServer("127.0.0.1", portB, 0);
+        Thread threadA = startAndWait(serverA, portA);
+        try (Socket a = connect(portA)) {
+            DataInputStream ain = new DataInputStream(a.getInputStream());
+
+            send(a, "SET", "scope:key", "v");
+            assertEquals("+OK", readReply(ain));
+            send(a, "SAVE");
+            assertEquals("+OK", readReply(ain), "阳性对照：带 dataDir 的这台本来就能存盘");
+            assertTrue(java.nio.file.Files.exists(dir.resolve("dump.rdb")), "SAVE 之后快照文件必须在");
+
+            Thread threadB = startAndWait(serverB, portB);
+            try {
+                send(a, "SET", "scope:key2", "v");
+                assertEquals("+OK", readReply(ain));
+                send(a, "SAVE");
+                assertEquals("+OK", readReply(ain),
+                        "另一台服务器启动不该把本台的持久化一起关掉");
+            } finally {
+                serverB.stop();
+                threadB.join(DEADLINE_MS);
+            }
+        } finally {
+            serverA.stop();
+            threadA.join(DEADLINE_MS);
+            deleteRecursively(dir);
+        }
+    }
+
+    private static void deleteRecursively(java.nio.file.Path root) throws IOException {
+        if (!java.nio.file.Files.exists(root)) {
+            return;
+        }
+        try (java.util.stream.Stream<java.nio.file.Path> walk = java.nio.file.Files.walk(root)) {
+            for (java.nio.file.Path p : (Iterable<java.nio.file.Path>) walk.sorted(
+                    java.util.Comparator.<java.nio.file.Path>reverseOrder()::compare)::iterator) {
+                java.nio.file.Files.deleteIfExists(p);
+            }
+        }
+    }
+
     // ==================== helpers ====================
 
     /** 从 CLIENT LIST 的文本里按对端端口取出某条连接那一行；找不到返回 null。 */

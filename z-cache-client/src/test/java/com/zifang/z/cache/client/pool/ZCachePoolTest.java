@@ -71,7 +71,7 @@ class ZCachePoolTest {
                         ch.pipeline().addLast(new RespDecoder());
                         ch.pipeline().addLast(new RespEncoder());
                         CommandHandler commandHandler = new CommandHandler(store);
-                        ch.pipeline().addLast(new RedisServerHandler(commandHandler, null));
+                        ch.pipeline().addLast(new RedisServerHandler(commandHandler, null, null, null));
                     }
                 });
         ChannelFuture f = b.bind(testPort).sync();
