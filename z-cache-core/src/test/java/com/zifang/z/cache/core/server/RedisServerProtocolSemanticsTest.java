@@ -2814,6 +2814,101 @@ class RedisServerProtocolSemanticsTest {
         sender.start();
     }
 
+    /**
+     * XRANGE / XREVRANGE 的 COUNT：{@code COUNT 0} 是 nil 数组而不是"不限"，
+     * 而"键不在"是空数组 —— 上游把这两问排在一条命令的两个位置（:1376 与 :1380）。
+     * 改前实测（battery57）：{@code COUNT 0} 交整表、{@code COUNT -1} 交整表、
+     * 裸 {@code COUNT} 与多余字交整表、{@code COUNT 1 COUNT 2} 第一个生效。
+     */
+    @Test
+    void xrangeCountHasThreeShapesAndItsOwnPlaceInTheQueue() throws Exception {
+        int port = freePort();
+        RedisServer server = new RedisServer("127.0.0.1", port, 0);
+        Thread thread = startAndWait(server, port);
+        try (Socket socket = connect(port)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+
+            send(socket, "XADD", "sem:cnt", "1-1", "a", "1");
+            assertEquals("1-1", readReply(in));
+            send(socket, "XADD", "sem:cnt", "2-2", "b", "2");
+            assertEquals("2-2", readReply(in));
+            send(socket, "XADD", "sem:cnt", "3-3", "c", "3");
+            assertEquals("3-3", readReply(in));
+
+            // ---- 阳性对照：正数照旧是"截断"，不能把 nil 当成"什么都空" ----
+            send(socket, "XRANGE", "sem:cnt", "-", "+");
+            assertEquals("[[1-1, [a, 1]], [2-2, [b, 2]], [3-3, [c, 3]]]", readReplyDeep(in));
+            send(socket, "XRANGE", "sem:cnt", "-", "+", "COUNT", "2");
+            assertEquals("[[1-1, [a, 1]], [2-2, [b, 2]]]", readReplyDeep(in), "COUNT 2 截两条");
+            send(socket, "XRANGE", "sem:cnt", "-", "+", "COUNT", "9");
+            assertEquals("[[1-1, [a, 1]], [2-2, [b, 2]], [3-3, [c, 3]]]",
+                    readReplyDeep(in), "COUNT 大于条数就是全表，不是错误");
+
+            // ---- 这一支的主角：0 是 nil 数组 ----
+            send(socket, "XRANGE", "sem:cnt", "-", "+", "COUNT", "0");
+            assertEquals("*-1", readReplyDeep(in), "COUNT 0 回 *-1，不是空表也不是整表");
+            send(socket, "XREVRANGE", "sem:cnt", "+", "-", "COUNT", "0");
+            assertEquals("*-1", readReplyDeep(in), "降序共用同一段解析");
+            send(socket, "XRANGE", "sem:cnt", "-", "+", "COUNT", "-1");
+            assertEquals("*-1", readReplyDeep(in), "负数在上游先钳成 0（:1366），于是与 0 同答");
+
+            // ---- 两问的判序：键不在（:1376）排在 COUNT 0（:1380）之前 ----
+            send(socket, "XRANGE", "sem:cnt:ghost", "-", "+", "COUNT", "0");
+            assertEquals("[]", readReplyDeep(in),
+                    "键不在答空表（:1376），nil 那一只只留给存在的键（:1380）");
+            send(socket, "SET", "sem:cnt:str", "hello");
+            assertEquals("+OK", readReply(in));
+            send(socket, "XRANGE", "sem:cnt:str", "-", "+", "COUNT", "0");
+            assertEquals("-WRONGTYPE Operation against a key holding the wrong kind of value",
+                    readReply(in), "类型那一问也排在 count 之前");
+
+            // ---- 多余参数只有两种下场：COUNT 配对，其余 syntax error ----
+            send(socket, "XRANGE", "sem:cnt", "-", "+", "COUNT");
+            assertEquals("-ERR syntax error", readReply(in), "裸 COUNT 后面没值，:1363 不成立");
+            send(socket, "XRANGE", "sem:cnt", "-", "+", "EXTRA");
+            assertEquals("-ERR syntax error", readReply(in), ":1369 的 else 支");
+            send(socket, "XRANGE", "sem:cnt", "-", "+", "count", "2");
+            assertEquals("[[1-1, [a, 1]], [2-2, [b, 2]]]", readReplyDeep(in), "大小写不敏感");
+            send(socket, "XRANGE", "sem:cnt", "-", "+", "COUNT", "1", "COUNT", "2");
+            assertEquals("[[1-1, [a, 1]], [2-2, [b, 2]]]",
+                    readReplyDeep(in), "重复 COUNT 是后写的赢（:1364 就地覆盖），改前是第一个生效");
+
+            // ---- 值的文法：long 而不是 int，坏值一句话 ----
+            send(socket, "XRANGE", "sem:cnt", "-", "+", "COUNT", "abc");
+            assertEquals("-ERR value is not an integer or out of range", readReply(in));
+            send(socket, "XRANGE", "sem:cnt", "-", "+", "COUNT", "+2");
+            assertEquals("-ERR value is not an integer or out of range",
+                    readReply(in), "Redis 的整数尺不吃 +2（RedisIntegerFormat）");
+            send(socket, "XRANGE", "sem:cnt", "-", "+", "COUNT", "9999999999");
+            assertEquals("[[1-1, [a, 1]], [2-2, [b, 2]], [3-3, [c, 3]]]",
+                    readReplyDeep(in), "上游按 long long 取，超出 int 的 COUNT 不该被拒");
+            send(socket, "XRANGE", "sem:cnt", "-", "+", "COUNT", "4294967296");
+            assertEquals("[[1-1, [a, 1]], [2-2, [b, 2]], [3-3, [c, 3]]]",
+                    readReplyDeep(in),
+                    "2^32 直接窄化成 int 会得 0，而 0 在下面那层是\"不限\"");
+            send(socket, "XRANGE", "sem:cnt", "-", "+", "COUNT", "4294967297");
+            assertEquals("[[1-1, [a, 1]], [2-2, [b, 2]], [3-3, [c, 3]]]",
+                    readReplyDeep(in),
+                    "2^32+1 窄化成 1 —— 钳位不在窄化之前就会把三条截成一条");
+
+            // ---- 判序：坏 ID 永远先说话（:1356-1357 在 :1360 之前） ----
+            send(socket, "XRANGE", "sem:cnt", "bad-id", "+", "COUNT", "0");
+            assertEquals("-ERR Invalid stream ID specified as stream command argument",
+                    readReply(in), "COUNT 0 不该抢答坏 ID");
+            send(socket, "XRANGE", "sem:cnt", "-", "+", "COUNT", "0", "bad-id");
+            assertEquals("-ERR syntax error", readReply(in), "多余的非 COUNT 参数也一样排在 count 之后");
+
+            // ---- 闸门不改写字节：一整轮下来条目还在 ----
+            send(socket, "XLEN", "sem:cnt");
+            assertEquals(":3", readReply(in));
+            send(socket, "GET", "sem:cnt:str");
+            assertEquals("hello", readReply(in));
+        } finally {
+            server.stop();
+            thread.join(2000);
+        }
+    }
+
     /** 只解析测试用到的一层 RESP 形状：+/-/: 单行，$ bulk 按声明长度读满。 */
     private static String readReply(DataInputStream in) throws IOException {
         String line = readLine(in);

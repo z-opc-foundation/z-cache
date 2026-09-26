@@ -400,6 +400,65 @@ All notable changes to z-cache will be documented in this file.
   `键被别的类型占着时必须挡下 … expected: <-WRONGTYPE …> but was: <-NOGROUP No such key 'sem:ty:string' …>`。
   **改尺之前那一遍确实全绿，所以"改前 SURVIVED"不是一条缺陷记录，别照抄过去。**
 
+#### XRANGE 的 `COUNT` 有**三种**答复形状，我们只有两种、而且拿的是 int 尺
+
+- **上游那一段是三次"先答什么"**（`t_stream.c` `xrangeGenericCommand` :1348-1386）：
+  `long long count = -1`（:1352）→ 两端 ID 先解析（:1356-1357）→ **再**逐位扫剩余参数
+  （:1360-1373）→ 之后才 `lookupKeyReadOrReply` + `checkType`（:1376-1377）→ 最后
+  `count == 0` 单独一答（:1380-1382）。扫描那一圈只认 `COUNT <值>` 这一对：
+  `additional >= 1` 不成立（裸 `COUNT` 后面没值，:1363）或任何多余字（:1369）都回
+  `shared.syntaxerr`；值按 `getLongLongFromObjectOrReply`（:1364）取，**负数就地钳成 0**
+  （:1366）⇒ `COUNT -1` 与 `COUNT 0` 同答，而不是"不限"；重复 `COUNT` 是就地覆盖，后写的赢。
+  答复形状因此分出**三种**：键不在 = :1376 的 `emptymultibulk`（`*0`）、`COUNT 0` = :1381 的
+  `nullmultibulk`（`*-1`）、其余才是那张表。我们改前只有最后一种。
+- **改前逐行实测**（`battery57.pre4`，与改后同方法同量具）：`:6`（`COUNT 0`）交整表、
+  `:10`（`COUNT -1`）交整表、`:12`（裸 `COUNT`）与 `:15`（`EXTRA`）一律静默忽略、
+  `:14`（`COUNT 1 COUNT 2`）是**先写的赢**（只回一条）、`:16`（`XREVRANGE … COUNT 0`）交整表、
+  `:24 :25 :26`（`COUNT 4294967296 / 4294967297 / 2147483648`）回
+  `-ERR value is not an integer or out of range`。取值那一头走的是 `intArg`：一是**int 尺**
+  （上游 long long），二是超界抛 `NumberFormatException` 由分发层统一答成那句 not-an-integer
+  —— 于是"你给了个很大的 COUNT"被报成"你给了个不是整数的 COUNT"。
+  27 行里翻 **9** 行（6 语义 + 3 尺），两侧各 `wrote=27 lost=none`（`count_replay.log`），
+  且改前/改后各重放一遍逐字节相同（`pre3==pre4`、`post3==post4`）。
+- **不动的那些行才是这一支的对照组**：`:5` 整表、`:7 :8 :9` 正数截断、`:11 :18 :21` 坏值那一句、
+  `:19 :20` 键不在仍是 `*0`、`:22` 坏 ID 仍抢在 `COUNT 0` 之前说话、`:27` `XLEN` 仍 `:3`。
+  特别地 `:23`（`COUNT 18446744073709551616`，2^64）**改前后同形都拒** —— 换尺是换成 long long，
+  不是换成"没有上界"，这一行就是为了不被顺手改成 `*0` 而留在电池里。
+- **窄化那一个是两个陷阱叠在一起**：`4294967296` 直接 `(int)` 得 **0**，而 0 在下面那层
+  （`StreamStore.xrange` 的 limit）语义是"不限"，于是"钳位"与"不限"共用一个值；
+  `4294967297` 窄化成 **1**，三条被截成一条。所以钳位必须在窄化**之前**
+  （`count > Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) count`），两支各钉一行断言
+  （`RedisServerProtocolSemanticsTest.java:2885`、`:2889`）。
+- **判序**：`bad-id + COUNT 0` → 那句 invalid stream ID（`battery57:22`，改前后同形），
+  而 `- + COUNT 0 bad-id` → `-ERR syntax error`（扫描那一圈排在这只 nil 之前）。
+  **后一形状只在回归用例里钉着（:2898-2899），电池里没有这一行** —— 别以为翻电池能看见它。
+  同一节里 `:2856`（键不在 + `COUNT 0` → `*0`）与 `:2861`（同位换成被 String 占着的键 →
+  `-WRONGTYPE`）钉住"取键那一问排在 `count == 0` 之前"，这与上一节 XREADGROUP 的判序是同一类判据。
+- **`XREAD` 的 `COUNT 0` 是反的，别顺手"修"成一致**：上游 XREAD 把 `count` 直接交给
+  `streamReplyWithRange`（:1617 传的是那个 long long 本身，:1441 负数折 0，:1063 的 0 不截断），
+  所以 XREAD 侧 `COUNT 0` = **不限**、XRANGE 侧 `COUNT 0` = **nil 数组**。这一条已有断言在前
+  （`:639`），本轮只补了 XRANGE 那一半并在两处注释里互相点名。
+- **回归**：`xrangeCountHasThreeShapesAndItsOwnPlaceInTheQueue`
+  （`RedisServerProtocolSemanticsTest.java:2824-2910`）—— 三条阳性对照（无 COUNT / `COUNT 2` /
+  `COUNT 9`）、三种形状各一行、判序三行、值的文法五行（`abc`、`+2`、`9999999999`、2^32、2^32+1）、
+  收尾 `XLEN` 仍 `:3` 且 `GET sem:cnt:str` 仍 `hello`（闸门不改写字节）。
+  全量 `mvn -o -B clean test`：**358 + 380 + 134 + 2 = 874，failures/errors/skipped 全 0**
+  （`count_full.log`，core 一档从 379 抬到 380）。
+- **13 支具名变异，13 支全部点名判红**（`code_mut.py Q`，Q1-Q13；打之前先在干净树上跑阳性对照，
+  `count_control.log` 里 `Tests run: 1, Failures: 0`）。Q1 摘 nil、Q2 nil 退成空表、
+  Q3 调换两问判序、Q4 负数不钳、Q5 摘掉 `additional >= 1`、Q6 多余字退成忽略、
+  Q7 后写赢改成先写赢、Q8 long 尺退成 int 尺、Q9 类型闸挪到两问之后、Q10 摘掉起点 ID 那一问、
+  Q11 `equalsIgnoreCase` 退成 `equals`、Q12 钳位挪到窄化之后。
+  **Q13 是我按"等价变异"写的假设，实测把它证伪了**：我以为单独摘掉"键不在"那一问不可观测
+  （store 对不存在的键本来就交空表），只删那一行、保留 nil 那一行跑一遍 ⇒ **KILLED**，
+  红的是 `:2857` 那一条 `expected: <[]> but was: <*-1>`。也就是说这一问**独立可观测**
+  （摘掉之后"不存在的键 + `COUNT 0`"会答成 nil），我原本打算写进这一节的"等价变异"那句不成立、
+  已删。这一支留在尺上记的是"我以为等价，尺说不是"。
+  另外 Q5/Q10 两支的红消息不是断言文案而是**兜底 catch 的 JVM 文本**
+  （`-ERR internal error: Index 5 out of bounds for length 5`、
+  `internal error: Cannot load from long array because "startId" is null`，见 `CommandHandler.java:481-483`）
+  —— 这两道闸同时是"不漏 JVM 文本"那一族的闸，与前面 stream ID 那一节同源。
+
 ### Added
 - `RedisServer.serverScope()`：只读拿到本台那一份，测试与嵌入式据此判断作用域边界。
 - `StreamIdFormat`（z-cache-common）：stream ID 的唯一文法（uint64 两段、`-` / `+` 两种位置、
@@ -500,12 +559,22 @@ All notable changes to z-cache will be documented in this file.
   + "闸门不改写字节" + 判序与整条作废面。配套 `expectWrongType` helper（不再用 `startsWith`）。
 - 取键闸门的具名变异脚本 `~/.cache/zcache_gauges/gate_mut.py`（18 支，快照 `gate_snapshot/`，
   还原只从本次快照 `cp` + md5 对账，互斥锁 `mut.lock` 带 pid 校验）。
-- 错误码这一支的具名变异脚本 `~/.cache/zcache_gauges/code_mut.py`（12 支，快照 `code_snapshot/`，
+- 错误码这一支的具名变异脚本 `~/.cache/zcache_gauges/code_mut.py`（改前 12 支；本轮加到 **25 支**：
+  P1-P12 错误码 + Q1-Q13 `COUNT`，`code_mut.py anchors` 报 `25 支探针 / 25 个锚点`，快照 `code_snapshot/`，
   同一套"只从本次副本还原 + md5 对账 + 带 pid 的锁"）。它的选取器按**谁读这行代码**派生，
   不按主题派生 —— 这一点是 P5 那一次 SURVIVED 换来的（见上面那一节）。
+  **快照的保质期是"下一次改动"，不是"下一次运行"**：本轮开跑 Q 族之前，盘上的快照还是**上一支**
+  （改前错误码那一版，md5 `8ecc6567…`），而工作树已经是 `COUNT` 那一版（`738e0850…`）——
+  照它跑，每支探针收尾都会把未提交的 `COUNT` 修复按字节还原掉。所以先重打快照、
+  再跑，且每支的还原行都得回读成 `738e0850…`（13 支全是）。
   两支 battery 留档：`battery55.txt` 46 行（改前 `battery55.prefix.tr` / 改后 `battery55.post`）、
   `battery56.txt` 15 行（改前 `battery56.pre` 由 HEAD 树建出的 jar `0f4e6474…` 量得 /
   改后 `battery56.post` 由 jar `eeb88c1b…` 量得）。
+- `COUNT` 这一支的电池 `battery57.txt` 27 行（4 行建流 + 22 行判据 + `XLEN` 收尾）：改前
+  `battery57.pre4` 由 jar `eeb88c1b…`（= HEAD 那棵树，上一轮留档）量得、改后 `battery57.post4`
+  由 jar `4e447b61…`（工作树）量得，两侧各 `wrote=27 lost=none` 记在 `count_replay.log`，
+  且与更早的 `pre3` / `post3` 逐字节相同（同一对 jar 重放两遍一致才算数）。
+  两份 jar 都留了副本（`jar_postfix.whl`、`jar_countfix`），因为 `mvn clean` 会删掉 `target` 里那枚。
 
 ### 已知边界（这一版没动，说清楚）
 - RESP3 / `HELLO`、`EVAL` / `EVALSHA` / `SCRIPT` 依旧没有服务端实现，客户端 `DistributedLock`
@@ -529,9 +598,9 @@ All notable changes to z-cache will be documented in this file.
     `TYPE` / `EXISTS` / `DEL` / `DBSIZE` / `RENAME` 才谈得上把它们算进去）。
   - **答复层剩余项（本机现状已逐条实测：`battery55` 46 行 / `battery56` 15 行，
     改前改后各一份；下面每行左边是我们答的原文，右边是上游行号）**：
-    - `XRANGE t55:ok - + COUNT 0` 与 `XREVRANGE … COUNT 0` 交出整表（`battery55:5`、`:7`
-      都是 `*[[1-1,[a,1]]]`）；上游 :1380-1382 对 `count == 0` 回 `shared.nullmultibulk`
-      即 `*-1`，而"键不在"是 :1376 的 `emptymultibulk`（`*0`）——**两种形状我们只有一种**。
+    - ~~`XRANGE t55:ok - + COUNT 0` 与 `XREVRANGE … COUNT 0` 交出整表~~ —— **本轮已闭**
+      （见上面《XRANGE 的 `COUNT` 有三种答复形状》，`battery57` 27 行实测翻 9 行）。
+      那一处 `battery55:5 :7` 的读数留在这里，是为了记改前形状从哪量来的。
     - `XADD` 的 arity 三行 `battery55:27 :28 :31` 全回 `wrong number of arguments for 'xadd' command`，
       `:29`（`XADD t55:ok 5-5 a`，落单的值）回我们自己的 `XADD needs at least one field value pair`；
       上游 :1284-1286 把这些都归到同一句**裸句** `wrong number of arguments for XADD`

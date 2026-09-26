@@ -2556,10 +2556,23 @@ public class CommandHandler {
         if (endId == null) return invalidStreamId();
         start = StreamIdFormat.format(startId[0], startId[1]);
         end = StreamIdFormat.format(endId[0], endId[1]);
-        int count = -1;
 
-        if (args.length > 4 && "COUNT".equalsIgnoreCase(args[4]) && args.length > 5) {
-            count = intArg(args[5]);
+        // 上游 :1360-1373 是一段逐位扫描，不是一句"args[4] 是不是 COUNT"：认得 {@code COUNT <值>}
+        // 这一对，其余任何多余参数（含只写到 COUNT 而后面没值，:1363 的 additional >= 1 不成立）
+        // 都走 :1369 的 syntaxerr；值按 getLongLongFromObjectOrReply（:1364）取 long long，
+        // 负数钳成 0（:1366）⇒ {@code COUNT -1} 与 {@code COUNT 0} 是同一个答复，不是"不限"；
+        // 重复 COUNT 后写的赢（就地覆盖）。
+        long count = -1;
+        for (int j = 4; j < args.length; j++) {
+            int additional = args.length - j - 1;
+            if ("COUNT".equalsIgnoreCase(args[j]) && additional >= 1) {
+                Long parsed = RedisIntegerFormat.parse(args[j + 1]);
+                if (parsed == null) return RespError.notAnInteger();
+                count = parsed.longValue() < 0 ? 0 : parsed.longValue();
+                j++;
+            } else {
+                return RespError.of("ERR", "syntax error");
+            }
         }
 
         // 取键排在两端 ID 与 COUNT 都解析完之后（上游 :1376），所以坏 ID 永远比类型先说话，
@@ -2567,9 +2580,16 @@ public class CommandHandler {
         RespError conflict = streamTypeConflict(key);
         if (conflict != null) return conflict;
 
+        // :1376 的"键不在"答 emptymultibulk（{@code *0}），而 :1380 的"COUNT 0"答
+        // nullmultibulk（{@code *-1}）—— 两问排在同一条命令里而形状不同，客户端据此分
+        // "你给了个 0"与"这键没东西"。所以这一问必须在 count == 0 之前答完。
+        if (streams().getStream(currentDb, key) == null) return RespArray.empty();
+        if (count == 0) return RespArray.nullArray();
+
+        int limit = count > Integer.MAX_VALUE ? Integer.MAX_VALUE : (int) count;
         List<StreamEntry> entries = reverse
-                ? streams().xrevrange(currentDb, key, end, start, count)
-                : streams().xrange(currentDb, key, start, end, count);
+                ? streams().xrevrange(currentDb, key, end, start, limit)
+                : streams().xrange(currentDb, key, start, end, limit);
 
         Object[] result = new Object[entries.size()];
         for (int i = 0; i < entries.size(); i++) {
