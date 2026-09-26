@@ -95,7 +95,7 @@ All notable changes to z-cache will be documented in this file.
   **一个都不存在**（拿 `git show a1a744b:` 取那一棵树来 grep，命中 0），这五支当时一律回
   `unknown command`。BITFIELD 到这一版仍然没做，见下面"已知边界"。
 - 位族不是一条共用管线，**谁先开口是每支命令各自的实测**（250 上 redis-server 4.0.9 的一次性实例
-  6391-6394，电池 39-48 共 429 行逐行对拍，两侧 `DIFF=0`）：
+  6391-6394，电池 39-48 共 380 行逐行对拍（`cmp3.py` 自己报的行数，不是文件行数），两侧 `DIFF=0`）：
   - `BITCOUNT`：查键 → 类型 → 计数区间文法 → 整数文法。
   - `GETRANGE`：整数文法 → 查键 → 类型 —— 和 `BITCOUNT` 正好反着，所以"抽一个共用前置检查"
     的写法必然在其中一支上红。
@@ -107,9 +107,11 @@ All notable changes to z-cache will be documented in this file.
     `BITOP FOO d k` 与 `BITOP SET d k` 都是 `-ERR syntax error`；
     `BITOP NOT d k1 k2` 是 `-ERR BITOP NOT must be called with a single source key.`
     （`Not` / `nOt` 同命）。
-- **BITOP 是这一族里唯一不数位的成员，它按字节答复**：`BITOP AND d hello world` → `:5`
-  而不是 `:40`（`battery45:16`）。`GETBIT / SETBIT / BITPOS / BITCOUNT` 都按位说话，
-  第一版就是按那一族类推写了 `max * 8`，25 行判红才把它纠正过来；
+- **BITOP 是这一族里唯一不数位的成员，它按字节答复**：`battery45:16` 那行
+  `bitop and b45n b45a b45b`（`b45a=hello`、`b45b=world`）参考实例回 `:5`，不是 `:40`。
+  `GETBIT / SETBIT / BITPOS / BITCOUNT` 都按位说话，第一版就是按那一族类推写了 `max * 8`，
+  纠正过来之前判红 **23 行**（电池 45/46/47 里回数为正整数的那 23 行 `BITOP`；
+  另有 5 行是 `:0`，`×8` 不动它，所以那 5 行不构成证据）。
   现在这条既有真值行、也有把 `*8` 种回去的变异探针（`expected: <:5> but was: <:40>`）。
 - 语义面实测到的形状（逐条钉在 `bitopRepliesBytesAndFollowsTheMeasuredPrecedence` 里）：
   一个字节内位序是 MSB 优先；短源右端补零、结果长度取最长源；最长源长度为 0 时
@@ -173,11 +175,17 @@ All notable changes to z-cache will be documented in this file.
   （红在"WATCH 的键被 BITOP 改写，EXEC 必须中止"）。按字节还原 + md5 对账，
   脚本 `~/.cache/zcache_gauges/zmut_bitop.sh`。
 
-- 计数只认实测：`mvn clean test` 全量 **96 + 340 + 133 + 2 = 571 例全绿，0 skipped**
-  （上一版是 569 例、12 条被跳过）。这类跨实例作用域缺陷只在"整模块连跑"的形态下现形，
-  所以再按 `-Dsurefire.runOrder=random` 把 common+core 连跑 3 次：三次都是 96 + 340 全绿，
-  且三次的测试类执行顺序 md5 互不相同（`50f336…` / `722080…` / `dcdf08…`）——
-  随机确实生效了，不是只传了个开关。
+- 计数只认实测（`tally.py` 从 surefire 报告聚合，空运行会硬 FATAL 而不是打"0 例全绿"）：
+  `mvn clean test` 全量 **324 + 372 + 134 + 2 = 832 例全绿，0 skipped**。上一版本节写的
+  "96 + 340 + 133 + 2 = 571" 是位族五支进来之前的旧数，一并订正。
+- 这类跨实例作用域缺陷只在"整模块连跑"的形态下现形，所以按 `-Dsurefire.runOrder=random`
+  把 common+core 连跑 9 次（3 + 6 两批）：**7 次 324 + 372 全绿，2 次不是**。执行顺序确实
+  变了（三批的 md5 `355a02d4…` / `0b99054e…` / `911368ea…` 互不相同，不是只传了个开关）。
+- 那 2 次红的归因只做到一半：6 连跑第 4 次红在
+  `saveSnapshotsEveryDatabaseAndTheirTtls → startAndWait` 的"线程死了还没开始监听"，
+  端口探测与 bind 之间被抢占是**嫌疑**而不是证据；3 连跑第 2 次当时脚本没留住失败名，
+  只剩一个 `Errors: 1`，无法归因。为此三个服务器测试类的 `startAndWait` 现在把那条
+  服务器线程带回来的异常一起报出来（旧版只留下一段没人在读的栈），下次红由异常自己说。
 
 ### 已知边界（这一版没动，说清楚）
 - RESP3 / `HELLO`、`EVAL` / `EVALSHA` / `SCRIPT` 依旧没有服务端实现，客户端 `DistributedLock`
@@ -188,6 +196,18 @@ All notable changes to z-cache will be documented in this file.
 - `MemoryStore.keyTypeMaps` 仍只有 String 写路径维护；`existsDb` / `checkKeyType` 这些读它的
   方法对集合键一律"看不见"。`RENAME` 已经不读它了，但 `MemoryStore.rename()` / `renameDb()`
   还在读，且那两个方法主代码零调用方（集合分支只 `del(newKey)`，真接上会毁数据）。
+- 位族这一版补到 `GETBIT / SETBIT / BITCOUNT / BITPOS / BITOP` 五支，**`BITFIELD` 仍然没有**：
+  `CommandHandler.java` 里 grep `BITFIELD` 命中 0，而
+  `_doc/001_arch/01-module-structure.md:62,213` 依旧把它列在展品清单里。同一份文档 `:64,223`
+  宣传的 geo 一族八支（`GEOADD / GEOPOS / GEODIST / GEORADIUS / GEORADIUSBYMEMBER / GEOSEARCH /
+  GEOHASH / GEOSEARCHSTORE`）也是零实现（各自 grep 命中 0）。这两处是文档在超前于代码，
+  要么补实现、要么改文档，本轮没动。
+- `maxauthtries` 只存在于注释里：`AUTH` 失败多少次都能重来，没有连接数上限那一档。
+- `z-cache-server` 模块 0 条测试（`tally.py` 对它是硬 FATAL：`no surefire xml found`，
+  不是"跑过了没测到东西"）。`Main` 只是 5 行转发，真正没人量的是 `core` 里那台
+  `ZCacheServerMain` 的命令行面：`--password` / `--password-file`（33/39 行）确实实现了，
+  但全仓库测试树 grep 它只有一处注释提到 —— 参数解析、鉴权开关、`HealthCheck`
+  全部零回归，于是"默认值不够硬"那一条至今没有兜底。
 - 测试端口仍是"先探一个空闲端口再 bind"，存在被抢占的窗口（频率见上）。彻底做法是
   `RedisServer` 支持 `port 0` 并回读实际端口，改动面覆盖两个测试类约 25 处，本轮没做。
 

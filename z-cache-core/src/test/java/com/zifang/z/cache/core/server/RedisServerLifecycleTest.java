@@ -740,11 +740,15 @@ class RedisServerLifecycleTest {
     }
 
     private static Thread startAndWait(RedisServer server, int port) throws Exception {
+        final java.util.concurrent.atomic.AtomicReference<Throwable> died =
+                new java.util.concurrent.atomic.AtomicReference<Throwable>();
         Thread thread = new Thread(() -> {
             try {
                 server.start();
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
+            } catch (Throwable t) {
+                died.set(t);
             }
         }, "test-z-cache-server");
         thread.setDaemon(true);
@@ -753,11 +757,12 @@ class RedisServerLifecycleTest {
         long deadline = System.currentTimeMillis() + DEADLINE_MS;
         while (System.currentTimeMillis() < deadline) {
             if (!thread.isAlive()) {
-                // bind 失败（freePort 探到的端口在这个窗口里被别人占走）会以"守护线程死了 +
-                // 一段没人在读的栈"的形态出现，调用方则一直空转到超时。早退并说清是哪一类，
-                // 免得下一次红被当成被测代码的缺陷去查。
+                // 这条线程死了原本只留下"一段没人在读的栈"，调用方要么空转到超时、要么把
+                // 一切归给"端口被抢占"这一类猜测。现在把线程自己带回来的异常一起报出来，
+                // 归属由它说。
                 throw new IllegalStateException("server thread died before listening on " + port
-                        + " —— 端口探测与 bind 之间的窗口被抢占属于量具问题，重跑即可");
+                        + " —— 该线程带回来的异常: " + (died.get() == null
+                            ? "无（线程干净退出却没开始监听）" : String.valueOf(died.get())));
             }
             try (Socket probe = new Socket()) {
                 probe.connect(new InetSocketAddress("127.0.0.1", port), 200);

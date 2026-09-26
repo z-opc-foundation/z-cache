@@ -1402,11 +1402,15 @@ class RedisServerReferenceParityTest {
     }
 
     private static Thread startAndWait(RedisServer server, int port) throws Exception {
+        final java.util.concurrent.atomic.AtomicReference<Throwable> died =
+                new java.util.concurrent.atomic.AtomicReference<Throwable>();
         Thread thread = new Thread(() -> {
             try {
                 server.start();
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
+            } catch (Throwable t) {
+                died.set(t);
             }
         }, "parity-test-server");
         thread.setDaemon(true);
@@ -1416,7 +1420,8 @@ class RedisServerReferenceParityTest {
         while (System.currentTimeMillis() < deadline) {
             if (!thread.isAlive()) {
                 throw new IllegalStateException("server thread died before listening on " + port
-                        + " —— 端口探测与 bind 之间的窗口被抢占属于量具问题，重跑即可");
+                        + " —— 该线程带回来的异常: " + (died.get() == null
+                            ? "无（线程干净退出却没开始监听）" : String.valueOf(died.get())));
             }
             try (Socket probe = new Socket()) {
                 probe.connect(new InetSocketAddress("127.0.0.1", port), 200);
