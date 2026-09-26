@@ -2360,6 +2360,15 @@ public class CommandHandler {
     /**
      * XADD key [MAXLEN maxlen] id field value [field value ...]
      */
+    /**
+     * stream ID 的合法性只认 {@code StreamIdFormat} 一处；这里只负责"非法时回哪句话"。
+     * 原文照抄上游 t_stream.c:1205，不再让 {@code NumberFormatException} 的
+     * {@code For input string: "..."} 冒到协议上。
+     */
+    private static Object invalidStreamId() {
+        return RespError.of("ERR", StreamIdFormat.INVALID_ID);
+    }
+
     private Object handleXadd(String[] args) {
         if (streams() == null) return RespError.of("ERR", "Stream not configured");
         if (args.length < 4) return RespError.wrongNumberOfArguments("XADD");
@@ -2392,6 +2401,17 @@ public class CommandHandler {
         String id = args[i++];
         if (i + 1 > args.length || (args.length - i) % 2 != 0) {
             return RespError.of("ERR", "XADD needs at least one field value pair");
+        }
+        if (!"*".equals(id)) {
+            // XADD 走 strict（单独的 "-" / "+" 在这里是非法 ID，上游 :1276），缺 seq 补 0；
+            // 交回客户端的写法由数值反推（"05-1" echo 成 "5-1"），和 addReplyStreamID 一致。
+            long[] parsed = StreamIdFormat.parse(id, 0L, true);
+            if (parsed == null) return invalidStreamId();
+            if (parsed[0] == 0L && parsed[1] == 0L) {
+                // 上游 :1293：提前挡掉 0-0，否则会出现"建了流又插不进去"的空键。
+                return RespError.of("ERR", "The ID specified in XADD must be greater than 0-0");
+            }
+            id = StreamIdFormat.format(parsed[0], parsed[1]);
         }
 
         Map<String, String> fields = new LinkedHashMap<>();
@@ -2428,6 +2448,14 @@ public class CommandHandler {
         String key = args[1];
         String start = args[2];
         String end = args[3];
+        // 范围两端都不 strict（"-"/"+" 在这里就是最小/最大值），但缺省 seq 不对称：
+        // 起点 "5" 是 5-0，终点 "5" 是 5-<uint64max>，上游 :1356-1357。
+        long[] startId = StreamIdFormat.parse(start, 0L, false);
+        if (startId == null) return invalidStreamId();
+        long[] endId = StreamIdFormat.parse(end, StreamIdFormat.MAX_U64, false);
+        if (endId == null) return invalidStreamId();
+        start = StreamIdFormat.format(startId[0], startId[1]);
+        end = StreamIdFormat.format(endId[0], endId[1]);
         int count = -1;
 
         if (args.length > 4 && "COUNT".equalsIgnoreCase(args[4]) && args.length > 5) {
@@ -2460,6 +2488,11 @@ public class CommandHandler {
         if (args.length < 3) return RespError.wrongNumberOfArguments("XDEL");
         String[] ids = new String[args.length - 2];
         System.arraycopy(args, 2, ids, 0, ids.length);
+        // 先把每个 ID 都判一遍再动手删（上游 t_stream.c:2420-2427 那段 sanity check）：
+        // 否则 "XDEL k 1-1 坏ID" 删掉一半才报错，命令半执行。
+        for (String id : ids) {
+            if (StreamIdFormat.parse(id, 0L, true) == null) return invalidStreamId();
+        }
         return RespInteger.of((int) streams().xdel(currentDb, args[1], ids));
     }
 
@@ -2524,6 +2557,11 @@ public class CommandHandler {
         for (int k = 0; k < numKeys; k++) {
             keys[k] = args[i + k];
             ids[k] = args[i + numKeys + k];
+            // "$" 在解析之前就被上游单独收下（t_stream.c:1520 那一档），所以这里放过它；
+            // 除此之外一律 strict。
+            if (!"$".equals(ids[k]) && StreamIdFormat.parse(ids[k], 0L, true) == null) {
+                return invalidStreamId();
+            }
         }
 
         Object[] result = new Object[numKeys];
@@ -2609,6 +2647,9 @@ public class CommandHandler {
         switch (sub) {
             case "CREATE": {
                 if (args.length < 5) return RespError.wrongNumberOfArguments("XGROUP CREATE");
+                if (!"$".equals(args[4]) && StreamIdFormat.parse(args[4], 0L, true) == null) {
+                    return invalidStreamId();
+                }
                 boolean ok = streams().xgroupCreate(currentDb, args[2], args[3], args[4]);
                 return ok ? RespSimpleString.of("OK") : RespError.of("ERR", "BUSYGROUP Consumer Group name already exists");
             }
@@ -2647,6 +2688,9 @@ public class CommandHandler {
         if (args.length < 4) return RespError.wrongNumberOfArguments("XACK");
         String[] ids = new String[args.length - 3];
         System.arraycopy(args, 3, ids, 0, ids.length);
+        for (String id : ids) {
+            if (StreamIdFormat.parse(id, 0L, true) == null) return invalidStreamId();
+        }
         return RespInteger.of((int) streams().xack(currentDb, args[1], args[2], ids));
     }
 
