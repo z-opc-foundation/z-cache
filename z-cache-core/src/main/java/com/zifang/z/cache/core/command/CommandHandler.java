@@ -2680,33 +2680,97 @@ public class CommandHandler {
     }
 
     /**
-     * XREAD [COUNT count] [BLOCK milliseconds] STREAMS key [key ...] id [id ...]
+     * XREAD / XREADGROUP 选项那一圈的读数（上游 t_stream.c:1430-1486 是<b>一个</b>循环，
+     * 两个命令共用；这里也共用，免得两处口径各漂各的）。
+     */
+    private static final class XreadSpec {
+        int count = -1;          // -1 = 没给 COUNT（上游 count 起步是 0，含义同样是"不限"）
+        String group;
+        String consumer;
+        boolean noack;
+        int streamsArg = -1;     // STREAMS 之后第一个下标；-1 = 整圈走完没见过 STREAMS
+        int numKeys;
+    }
+
+    /**
+     * 照上游那一圈扫描选项：选项可以任意顺序、任意个，{@code STREAMS} 一到就 break，
+     * 其后的一切都被当成"键…键…位置…位置"那两列 —— 所以下面那四句错误各有它固定的位置，
+     * 谁先谁后不是风格问题：
+     * <ul>
+     *   <li>:1445-1449　{@code STREAMS} 之后的词数是奇数就报
+     *       "Unbalanced XREAD list of streams: for each stream key an ID or '$' must be specified."
+     *       —— 这一问排在取键、查类型<b>之前</b>，所以一份不配对的清单里就算混着 String 键，
+     *       报的也是配对问题而不是 WRONGTYPE。</li>
+     *   <li>:1453-1458　{@code GROUP} 出现在 XREAD 里是那一句专有话；
+     *       :1462-1468　{@code NOACK} 同型。</li>
+     *   <li>:1475-1479　整圈走完没见过 {@code STREAMS} 才是 syntax error。</li>
+     *   <li>:1481-1486　XREADGROUP 而 {@code GROUP} 没见过 —— 排在 STREAMS 那一问<b>之后</b>，
+     *       所以 {@code XREADGROUP GROUP g}（GROUP 后面凑不齐两个词）落进 else 分支吃 syntax error，
+     *       而 {@code XREADGROUP STREAMS k 0-0} 报的是"Missing GROUP"。</li>
+     * </ul>
+     * 返回 {@code null} 表示这一圈读干净了，读数写进 {@code spec}。
+     */
+    private Object scanXreadOptions(String[] args, boolean xreadgroup, XreadSpec spec) {
+        String cmd = xreadgroup ? "XREADGROUP" : "XREAD";
+        for (int i = 1; i < args.length; i++) {
+            int moreargs = args.length - i - 1;
+            String o = args[i];
+            if ("BLOCK".equalsIgnoreCase(o) && moreargs > 0) {
+                // BLOCK 不能"跳过"：收下它等于对客户端谎称会阻塞，客户端于是把一个立即返回的
+                // 空结果当成"没有新数据"，拿着它做轮询就成了忙等。要么真阻塞，要么明确拒绝。
+                return RespError.of("ERR", cmd + " BLOCK is not supported: this server never blocks on a stream");
+            } else if ("COUNT".equalsIgnoreCase(o) && moreargs > 0) {
+                spec.count = intArg(args[++i]);
+            } else if ("STREAMS".equalsIgnoreCase(o) && moreargs > 0) {
+                spec.streamsArg = i + 1;
+                int rest = args.length - spec.streamsArg;
+                if ((rest & 1) != 0) {
+                    return RespError.of("ERR", "Unbalanced XREAD list of streams: "
+                            + "for each stream key an ID or '$' must be specified.");
+                }
+                spec.numKeys = rest / 2;
+                break;
+            } else if ("GROUP".equalsIgnoreCase(o) && moreargs >= 2) {
+                if (!xreadgroup) {
+                    return RespError.of("ERR", "The GROUP option is only supported by "
+                            + "XREADGROUP. You called XREAD instead.");
+                }
+                spec.group = args[i + 1];
+                spec.consumer = args[i + 2];
+                i += 2;
+            } else if ("NOACK".equalsIgnoreCase(o)) {
+                if (!xreadgroup) {
+                    return RespError.of("ERR", "The NOACK option is only supported by "
+                            + "XREADGROUP. You called XREAD instead.");
+                }
+                spec.noack = true;
+            } else {
+                return RespError.syntaxError();
+            }
+        }
+        if (spec.streamsArg < 0) return RespError.syntaxError();
+        if (xreadgroup && spec.group == null) {
+            return RespError.of("ERR", "Missing GROUP option for XREADGROUP");
+        }
+        return null;
+    }
+
+    /**
+     * XREAD [BLOCK milliseconds] [COUNT count] STREAMS key [key ...] id [id ...]
      */
     private Object handleXread(String[] args) {
         if (streams() == null) return RespError.of("ERR", "Stream not configured");
+        // 上游命令表里 XREAD 的 arity 是 -4（server.c:318）：下限是"STREAMS + 一键一位"，
+        // 不是某一种固定写法 —— `XREAD NOACK` 三个词在闸外就被拒，而 `XREAD STREAMS k 0` 合法。
         if (args.length < 4) return RespError.wrongNumberOfArguments("XREAD");
 
-        int count = -1;
-        int i = 1;
+        XreadSpec spec = new XreadSpec();
+        Object refused = scanXreadOptions(args, false, spec);
+        if (refused != null) return refused;
 
-        // 解析 COUNT
-        if ("COUNT".equalsIgnoreCase(args[i]) && i + 1 < args.length) {
-            count = intArg(args[i + 1]);
-            i += 2;
-        }
-
-        // BLOCK 不能"跳过"：收下它等于对客户端谎称会阻塞，客户端于是把一个立即返回的
-        // 空结果当成"没有新数据"，拿着它做轮询就成了忙等。要么真阻塞，要么明确拒绝。
-        if ("BLOCK".equalsIgnoreCase(args[i])) {
-            return RespError.of("ERR", "XREAD BLOCK is not supported: this server never blocks on a stream");
-        }
-
-        if (!"STREAMS".equalsIgnoreCase(args[i])) {
-            return RespError.syntaxError();
-        }
-        i++;
-
-        int numKeys = (args.length - i) / 2;
+        int count = spec.count;
+        int i = spec.streamsArg;
+        int numKeys = spec.numKeys;
         String[] keys = new String[numKeys];
         long[][] positions = new long[numKeys][];
         for (int k = 0; k < numKeys; k++) {
@@ -2748,30 +2812,23 @@ public class CommandHandler {
     }
 
     /**
-     * XREADGROUP GROUP group consumer [COUNT count] [BLOCK ms] STREAMS key [key ...] id [id ...]
+     * XREADGROUP GROUP group consumer [COUNT count] [BLOCK ms] [NOACK] STREAMS key [key ...] id [id ...]
      */
     private Object handleXreadgroup(String[] args) {
         if (streams() == null) return RespError.of("ERR", "Stream not configured");
+        // 上游 XREADGROUP 的 arity 是 -7（server.c:319）：GROUP 与一对名字、STREAMS 与一对
+        // 键位都在下限里，所以"少了 GROUP"这种写法过得了闸、要在选项那一圈里报。
         if (args.length < 7) return RespError.wrongNumberOfArguments("XREADGROUP");
 
-        int i = 1;
-        if (!"GROUP".equalsIgnoreCase(args[i])) return RespError.syntaxError();
-        String group = args[i + 1];
-        String consumer = args[i + 2];
-        i += 3;
+        XreadSpec spec = new XreadSpec();
+        Object refused = scanXreadOptions(args, true, spec);
+        if (refused != null) return refused;
 
-        int count = -1;
-        if ("COUNT".equalsIgnoreCase(args[i]) && i + 1 < args.length) {
-            count = intArg(args[i + 1]);
-            i += 2;
-        }
-        if ("BLOCK".equalsIgnoreCase(args[i])) {
-            return RespError.of("ERR", "XREADGROUP BLOCK is not supported: this server never blocks on a stream");
-        }
-        if (!"STREAMS".equalsIgnoreCase(args[i])) return RespError.syntaxError();
-        i++;
-
-        int numKeys = (args.length - i) / 2;
+        String group = spec.group;
+        String consumer = spec.consumer;
+        int count = spec.count;
+        int i = spec.streamsArg;
+        int numKeys = spec.numKeys;
         String[] keys = new String[numKeys];
         String[] positions = new String[numKeys];
         for (int k = 0; k < numKeys; k++) {
@@ -2802,7 +2859,7 @@ public class CommandHandler {
         for (int k = 0; k < numKeys; k++) {
             if (">".equals(positions[k])) {
                 List<StreamEntry> fresh =
-                        streams().xreadgroupNew(currentDb, keys[k], group, consumer, count);
+                        streams().xreadgroupNew(currentDb, keys[k], group, consumer, count, spec.noack);
                 // 没有新条目时这个键不点名：上游 :1575-1585 只在"比组里最后投递位置还新"的
                 // 条目真存在时才 serve 它。一个键都没点名才是 *-1。
                 if (fresh.isEmpty()) continue;

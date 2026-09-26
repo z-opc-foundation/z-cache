@@ -156,7 +156,7 @@ class StreamTest {
         stream.createGroup("g1", "0");
         ConsumerGroup cg = stream.getGroup("g1");
 
-        cg.markDelivered("100-0", "consumer1");
+        cg.markDelivered("100-0", "consumer1", false);
         assertEquals(1, cg.pendingCount());
 
         long acked = cg.ack("100-0");
@@ -171,8 +171,8 @@ class StreamTest {
         stream.createGroup("g1", "0");
         ConsumerGroup cg = stream.getGroup("g1");
 
-        cg.markDelivered("100-0", "c1");
-        cg.markDelivered("200-0", "c2");
+        cg.markDelivered("100-0", "c1", false);
+        cg.markDelivered("200-0", "c2", false);
 
         assertEquals(2, cg.pendingCount());
         assertEquals(2, cg.getConsumers().size());
@@ -207,10 +207,10 @@ class StreamTest {
 
         assertTrue(store.xgroupCreate(0, "s1", "g1", "0"));
 
-        List<StreamEntry> delivered = store.xreadgroupNew(0, "s1", "g1", "c1", 10);
+        List<StreamEntry> delivered = store.xreadgroupNew(0, "s1", "g1", "c1", 10, false);
         assertEquals(2, delivered.size());
         // 投出去的东西不会再投第二遍：组的位置跟着走
-        assertTrue(store.xreadgroupNew(0, "s1", "g1", "c1", 10).isEmpty());
+        assertTrue(store.xreadgroupNew(0, "s1", "g1", "c1", 10, false).isEmpty());
 
         // 历史按消费者各自的 PEL。fromId 是闭区间起点，命令那一侧传进来的是"所要位置的下一个 ID"。
         List<String> c1History = store.xreadgroupHistory(0, "s1", "g1", "c1", "0-1", 0);

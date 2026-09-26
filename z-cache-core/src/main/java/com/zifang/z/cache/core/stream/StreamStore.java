@@ -150,9 +150,11 @@ public class StreamStore {
      * @param group    消费组名
      * @param consumer 消费者名（不存在则顺手建出来）
      * @param count    最大条数（{@code <= 0} = 不限）
+     * @param noack    {@code true} 时只投递、不记 PEL（上游 :1020 那一块整段跳过）
      * @return 本次投递的条目；键或组不在、或者没有新条目时为空列表
      */
-    public List<StreamEntry> xreadgroupNew(int db, String key, String group, String consumer, int count) {
+    public List<StreamEntry> xreadgroupNew(int db, String key, String group, String consumer,
+                                           int count, boolean noack) {
         List<StreamEntry> newEntries = new ArrayList<>();
         Stream stream = getStream(db, key);
         if (stream == null) return newEntries;
@@ -165,7 +167,7 @@ public class StreamStore {
         for (StreamEntry e : stream.getEntries()) {
             if (!cg.isNewerThanLastDelivered(e.getId())) continue;
             newEntries.add(e);
-            cg.markDelivered(e.getId(), consumer);
+            cg.markDelivered(e.getId(), consumer, noack);
             if (count > 0 && newEntries.size() >= count) break;
         }
         return newEntries;

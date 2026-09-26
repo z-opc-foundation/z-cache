@@ -75,9 +75,24 @@ class ZCacheClientIntegrationTest {
     private static void awaitListening(int port) throws Exception {
         long deadline = System.currentTimeMillis() + DEADLINE_MS;
         while (System.currentTimeMillis() < deadline) {
+            // 就绪的判据不能只是"连得上"：临时端口在放开后可能被别的进程占走（本机常有
+            // 别的战役在跑 surefire），那时裸 connect 照样立刻成功，客户端读到的是别人家的
+            // 响应。要对方答一句话，且答的必须是 RESP 形状。
             try (Socket probe = new Socket()) {
                 probe.connect(new InetSocketAddress("127.0.0.1", port), 200);
-                return;
+                probe.setSoTimeout(300);
+                probe.getOutputStream().write(
+                        "*1\r\n$4\r\nPING\r\n".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                probe.getOutputStream().flush();
+                int first = probe.getInputStream().read();
+                if (first == '+' || first == '-' || first == ':' || first == '$' || first == '*') {
+                    return;
+                }
+                throw new IllegalStateException("port " + port + " 上答话的不是 RESP，首字节 "
+                        + (first < 0 ? "是流已关闭" : "'" + (char) first + "'(" + first + ")")
+                        + " —— 端口大概率在 freePort() 放开后被别的进程占走了");
+            } catch (java.net.SocketTimeoutException stillWarmingUp) {
+                Thread.sleep(50);
             } catch (IOException notYet) {
                 Thread.sleep(50);
             }

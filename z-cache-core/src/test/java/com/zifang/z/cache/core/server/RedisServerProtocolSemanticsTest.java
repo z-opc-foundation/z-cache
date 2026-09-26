@@ -932,6 +932,96 @@ class RedisServerProtocolSemanticsTest {
     }
 
     /**
+     * XREAD / XREADGROUP 的选项那一圈（上游 t_stream.c:1430-1486）改前只有三个出口：
+     * 一个自造的 arity 句、一个 syntax error、以及"把没配对的清单当成位置写法不对"。
+     * 上游给的是四句各有各位置的话，加上 STREAMS 之后那两列的配对判据排在取键与查类型<b>之前</b>。
+     * NOACK 那一支顺带钉住它只做一件事：不记 PEL —— 组的投递位置照样推进、消费者照样存在
+     * （:990-992 与 :1610 的 {@code SLC_NONE}）。
+     */
+    @Test
+    void xreadOptionSentencesFollowTheReference() throws Exception {
+        int port = freePort();
+        RedisServer server = new RedisServer("127.0.0.1", port, 0);
+        Thread thread = startAndWait(server, port);
+        try (Socket socket = connect(port)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+
+            send(socket, "XADD", "xr:opt", "1-1", "a", "1");
+            assertEquals("1-1", readReply(in));
+            send(socket, "XGROUP", "CREATE", "xr:opt", "g", "0-0");
+            assertEquals("+OK", readReply(in));
+            send(socket, "SET", "xr:str", "v");
+            assertEquals("+OK", readReply(in));
+
+            // arity 下限（server.c:318 的 -4）排在选项扫描之前：这一行是控制项，
+            // 它保证下面那句 Unbalanced 不是从"参数太少"里绕出来的。
+            send(socket, "XREAD", "STREAMS", "xr:opt");
+            assertEquals("-ERR wrong number of arguments for 'xread' command", readReply(in));
+
+            String unbalanced = "-ERR Unbalanced XREAD list of streams: "
+                    + "for each stream key an ID or '$' must be specified.";
+            // 两键一位（:1445-1449 的奇数那一问）
+            send(socket, "XREAD", "STREAMS", "xr:opt", "xr:opt", "0-0");
+            assertEquals(unbalanced, readReply(in));
+            // 带 COUNT 也一样：配对那一问看的是 STREAMS 之后的词数
+            send(socket, "XREAD", "COUNT", "2", "STREAMS", "xr:opt");
+            assertEquals(unbalanced, readReply(in));
+            // 预排在类型那一问之前：清单里混着一个 String 键，报的仍是配对而不是 WRONGTYPE。
+            // 改前这一格与上面那格答的是两句不同的话（一句 WRONGTYPE 一句坏 ID），
+            // 说明它当时根本没有"配对"这一问。
+            send(socket, "XREAD", "STREAMS", "xr:str", "xr:str", "0-0");
+            assertEquals(unbalanced, readReply(in));
+
+            String groupMine = "-ERR The GROUP option is only supported by XREADGROUP. "
+                    + "You called XREAD instead.";
+            String noackMine = "-ERR The NOACK option is only supported by XREADGROUP. "
+                    + "You called XREAD instead.";
+            send(socket, "XREAD", "GROUP", "g", "c", "STREAMS", "xr:opt", "0-0");
+            assertEquals(groupMine, readReply(in));
+            send(socket, "XREAD", "NOACK", "STREAMS", "xr:opt", "0-0");
+            assertEquals(noackMine, readReply(in));
+            // 两句都排在"没见过 STREAMS"那一问之前（:1475-1479），所以后面没有 STREAMS 也照样报它
+            send(socket, "XREAD", "GROUP", "g", "c", "NOACK");
+            assertEquals(groupMine, readReply(in));
+
+            // XREADGROUP 的 arity 是 -7（server.c:319）：少 GROUP 而词数够不到的写法，
+            // 要在选项那一圈里报"Missing GROUP"，够不到的在闸外就报了 arity。
+            send(socket, "XREADGROUP", "STREAMS", "xr:opt", "0-0");
+            assertEquals("-ERR wrong number of arguments for 'xreadgroup' command", readReply(in));
+            send(socket, "XREADGROUP", "COUNT", "2", "STREAMS", "xr:opt", "xr:opt", "0-0", "0-0");
+            assertEquals("-ERR Missing GROUP option for XREADGROUP", readReply(in));
+            // 判序控制项：两个特例问都排在"没见过 STREAMS"之后（:1476 在 :1483 之前）。
+            // 这一行选项全认得、词数够 -7 的闸，而清单里根本没有 STREAMS —— 报的必须是 syntax error，
+            // 把上面那两问挪到它前面就变成"Missing GROUP"。
+            send(socket, "XREADGROUP", "COUNT", "1", "NOACK", "COUNT", "2", "NOACK");
+            assertEquals("-ERR syntax error", readReply(in));
+
+            // NOACK 交的是"投出去而不记账"
+            send(socket, "XREADGROUP", "GROUP", "g", "c", "NOACK", "COUNT", "1",
+                    "STREAMS", "xr:opt", ">");
+            String delivered = readReplyDeep(in);
+            assertTrue(delivered.contains("1-1"), "NOACK 也要把条目投出去: " + delivered);
+            send(socket, "XPENDING", "xr:opt", "g");
+            assertEquals("*4", readWireReply(in));
+            assertEquals(":0", readWireReply(in), "NOACK 不记 PEL（:1020 那一块整段跳过）");
+            assertEquals("$-1", readWireReply(in));
+            assertEquals("$-1", readWireReply(in));
+            assertEquals("*-1", readWireReply(in));
+            // 消费者还是要被建出来：:1610 用 SLC_NONE，而那个函数"查不到就顺手创建"（:1745-1758）
+            send(socket, "XINFO", "CONSUMERS", "xr:opt", "g");
+            String consumers = readReplyDeep(in);
+            assertTrue(consumers.contains("[name, c, pending, :0"),
+                    "NOACK 读过之后消费者存在而手上没货: " + consumers);
+            // 组的投递位置也确实推进了：再来一次 > 是空的（不是重投同一条）
+            send(socket, "XREADGROUP", "GROUP", "g", "c", "COUNT", "1", "STREAMS", "xr:opt", ">");
+            assertEquals("*-1", readWireReply(in), "位置已推进，同一条不重投");
+        } finally {
+            server.stop();
+            thread.join(DEADLINE_MS);
+        }
+    }
+
+    /**
      * XINFO CONSUMERS 以前在文档注释里有、switch 里没有这个 case，
      * 所以 {@code XINFO CONSUMERS key group} 永远回 {@code -ERR syntax error}。
      */
@@ -2876,9 +2966,27 @@ class RedisServerProtocolSemanticsTest {
                         + " —— 该线程带回来的异常: " + (died.get() == null
                             ? "无（线程干净退出却没开始监听）" : String.valueOf(died.get())));
             }
+            // 就绪的判据不能只是"连得上"。freePort() 是先 bind 一个临时端口再放开，放开到
+            // 真正 bind 之间有窗口，本机同时有别的战役在跑 surefire 时这个窗口会被别人插进来；
+            // 裸 connect 在那种情况下照样立刻"就绪"，于是后面每条断言都在读别人家的响应
+            // （实测过一次 `expected: <+OK> but was: <HTTP/1.1 400 Bad Request>`，而这串字符
+            // 不在本仓任何源码里）。要对方答一句话，且答的必须是 RESP 形状。
             try (Socket probe = new Socket()) {
                 probe.connect(new InetSocketAddress("127.0.0.1", port), 200);
-                return thread;
+                probe.setSoTimeout(300);
+                probe.getOutputStream().write(
+                        "*1\r\n$4\r\nPING\r\n".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                probe.getOutputStream().flush();
+                int first = probe.getInputStream().read();
+                if (first == '+' || first == '-' || first == ':' || first == '$' || first == '*') {
+                    return thread;
+                }
+                throw new IllegalStateException("port " + port + " 上答话的不是 RESP，首字节 "
+                        + (first < 0 ? "是流已关闭" : "'" + (char) first + "'(" + first + ")")
+                        + " —— 端口大概率在 freePort() 放开后被别的进程占走了");
+            } catch (java.net.SocketTimeoutException stillWarmingUp) {
+                // 内核已 accept 而事件循环还没读：这是我们自己起步慢，不能算别人的端口
+                Thread.sleep(50);
             } catch (IOException notYet) {
                 Thread.sleep(50);
             }

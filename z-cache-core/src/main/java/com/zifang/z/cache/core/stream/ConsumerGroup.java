@@ -121,9 +121,16 @@ public class ConsumerGroup {
 
     /**
      * 标记条目为已投递（加入 pending）。
+     * <p>
+     * {@code noack} 那一支对应上游 {@code STREAM_RWR_NOACK}（:1468 置位、:1615 传下去、
+     * :1020 那一整块 PEL 写入被跳过）。注意它<b>只</b>跳 PEL：组的投递位置照样要推进
+     * （:990-992 那一问排在 NOACK 之外），消费者照样要被建出来并被 touch
+     * （:1610 用的是 {@code SLC_NONE}，而 :1745-1758 那个函数"查不到就顺手创建"）。
+     * 所以 NOACK 读过的条目既不进 {@code XPENDING} 的账，也不留在消费者本地历史里，
+     * 但 {@code XINFO CONSUMERS} 仍要看到这个名字。
      */
-    public void markDelivered(String entryId, String consumerName) {
-        pendingEntries.put(entryId, consumerName);
+    public void markDelivered(String entryId, String consumerName, boolean noack) {
+        if (!noack) pendingEntries.put(entryId, consumerName);
         // 两段一起推进：只抬毫秒段会让同一毫秒内的后几条永远投不出去
         if (isNewerThanLastDelivered(entryId)) {
             long[] parsed = StreamEntry.parseId(entryId);
@@ -131,7 +138,7 @@ public class ConsumerGroup {
             lastDeliveredSeq = parsed[1];
         }
         Consumer consumer = getOrCreateConsumer(consumerName);
-        consumer.incrementPendingCount();
+        if (!noack) consumer.incrementPendingCount();
         consumer.touch();
     }
 

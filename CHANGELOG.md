@@ -732,6 +732,77 @@ All notable changes to z-cache will be documented in this file.
   U6 才是改前真没人看过的一格（改前没有任何断言读过"空 PEL 时的 `start` / `end`"）。
 
 
+#### XREAD / XREADGROUP 的选项那一圈：四句话各有它的位置，而 NOACK 以前根本进不来
+
+上游把两个命令写在**同一个**函数里（`xreadCommand`，t_stream.c:1430-1486），选项是一圈扫描；
+我们改前是两个手写的线性前奏，只认"COUNT、然后 BLOCK、然后 STREAMS"这一个固定顺序，
+XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支里都是行为本身：
+
+- `:1445-1449` —— `STREAMS` 之后的词数是奇数就报
+  `Unbalanced XREAD list of streams: for each stream key an ID or '$' must be specified.`
+  这一问排在**取键与查类型之前**，所以一份不配对的清单里就算混着 String 键，报的也是配对而不是
+  WRONGTYPE（改前那一格答的是 `Invalid stream ID specified…`，也就是先把落单的那个数当成 ID 去解析）。
+- `:1453-1458` / `:1462-1468` —— `GROUP` 与 `NOACK` 出现在 XREAD 里各有它的专有误用句，
+  改前两句都是那句笼统的 `-ERR syntax error`。
+- `:1475-1479` —— 整圈走完没见过 `STREAMS` 才是 syntax error。
+- `:1481-1486` —— XREADGROUP 而 `GROUP` 没见过，报 `Missing GROUP option for XREADGROUP`，
+  且这一问（:1483-1485 那三行）排在 `STREAMS` 那一问**之后**（探针 V5 就是换这一序，红在一个控制格上）。
+- 两道 arity 下限没动，因为它们本来就是对的：`server.c:318` 的 XREAD 是 **-4**、
+  `server.c:319` 的 XREADGROUP 是 **-7**。这两个数决定了哪些写法压根轮不到选项那一圈 ——
+  `XREAD STREAMS k` 三个词是 arity 句而不是 Unbalanced，`XREADGROUP GROUP g STREAMS k 0-0`
+  六个词也是 arity 句。
+- **`NOACK` 改前根本不被接受**（`XREADGROUP GROUP g c NOACK …` 直接 syntax error），
+  所以这个选项一直没法用。它只做一件事：**不记 PEL**（上游 :1468 置位、:1615 传下去、
+  :1020 那一整块 PEL 写入被跳过）。组的投递位置照样推进（:990-992 排在那一问之外），
+  消费者照样要被建出来并被 touch（:1610 用 `SLC_NONE`，而 :1745-1758 那个函数"查不到就顺手创建"）。
+- 新读者 `RedisServerProtocolSemanticsTest.xreadOptionSentencesFollowsTheReference` 把上面每一句
+  按线上文本钉一遍，并钉 NOACK 那三件兑现：投出去了（条目在里面）、`XPENDING` 仍回 `:0` 与 `*-1`、
+  `XINFO CONSUMERS` 仍列出那个消费者、而再来一次 `>` 是 `*-1`（位置已推进，不重投）。
+- 一处**没动也没验**的格子，写下来免得被当成已对齐："空 `>` 读 + NOACK 到底会不会把消费者建出来"。
+  上游那一句 `streamLookupConsumer` 排在 `serve_synchronously` 那一支里面（:1596-1612），
+  进不进得去由更早的条件决定，我没核实到那一层；两侧各有一处 `getOrCreateConsumer`
+  （`StreamStore.xreadgroupNew` 与 `ConsumerGroup.markDelivered`），所以探针 V8 摘掉前一处也全绿
+  （76 支里唯一的 SURVIVED，等价变异），与 U4/U7 是同一个形状的两个备份互兜。**不删任何一侧**，
+  等拿到那一支的权威再定。
+
+
+#### 就绪探针把"连上了"当作"起来了"：一把会替别人撒谎的尺（量具侧，不是服务器行为）
+
+- 症状：本轮最后一次全量 `b64_full2.log` rc=1，`RedisServerLifecycleTest` 两例
+  `expected: <+OK> but was: <HTTP/1.1 400 Bad Request>`（`:394` 与 `:653`），
+  而**同一个树几分钟前刚全绿过**（`b64_full.log`），中间只有注释与行号引用的改动。
+  两条的耗时是 `0.007 s` / `0.006 s` —— 这个数本身就否掉了"服务器起了又崩"：那需要真实启动。
+- 三条独立取证：
+  1. `grep -r 'HTTP/1\.1' / 'Bad Request'` 在本仓**零命中** ⇒ 这串字节不可能是 z-cache 发的；
+  2. 两例**单独重跑绿**（`Tests run: 2, Failures: 0`，1.772 s —— 正常量级是百毫秒，反证 0.007 s 那一遍
+     根本没起过服务器）；
+  3. 同一时刻本机有**别的战役在跑 surefire**（`z-mq-broker` pid 18446 @ 03:30），端口是共享资源。
+- 真因在量具：`freePort()` 用 `new ServerSocket(0)` 取到一个临时端口**再放开**，放开到 `RedisServer`
+  真 bind 之间有窗口；`startAndWait` 的就绪判据是裸 `probe.connect(...)` 成功 —— 连上别人家的监听口
+  也算"起来了"，于是后面每条断言都在读别人的响应。而循环里 `!thread.isAlive()` 那道闸排在 connect
+  **之前**，第一轮时 bind 还没失败、线程活着，所以那道闸结构上拦不住这种抢占。
+- 修法：探针要对方答一句话，且答的**首字节必须是 RESP 的类型标记**（`+ - : $ *`，带 `requirepass`
+  时是 `-NOAUTH`，仍算 RESP）。`SocketTimeoutException` 单独走"继续等"那一支：内核已 accept 而事件
+  循环还没读是我们自己起步慢，不许算成别人的端口。判据是 `grep 'probe.connect(new InetSocketAddress'`
+  的命中面，共 4 处，已逐个改完并各自回读到 1 条新守卫
+  （`RedisServerLifecycleTest` / `RedisServerProtocolSemanticsTest` / `RedisServerReferenceParityTest`
+  / client 侧 `ZCacheClientIntegrationTest.awaitListening`）。`ZCachePoolTest` 那处 `new ServerSocket(0)`
+  不带这种探针（它自己用 Netty 起了服务），本轮没动。
+- **探针有牙，是注入同一现场量的 A/B**（`fake_http_400.py` 占住 57432 只答 `HTTP/1.1 400 Bad Request`，
+  再把 `freePort()` 打成 `return 57432;`）：
+  - 旧版（`git show HEAD:` 取的那份）⇒ `saveSnapshotsEveryDatabaseAndTheirTtls:394 expected: <+OK>
+    but was: <HTTP/1.1 400 Bad Request>`，与 `b64_full2.log` 那一条**逐字相同、行号相同**
+    （`b64_teeth_oldcode.log`）—— 这是复现，不是推测；
+  - 新版 ⇒ `IllegalStateException: port 57432 上答话的不是 RESP，首字节 'H'(72) —— 端口大概率在
+    freePort() 放开后被别的进程占走了`，落在 `startAndWait:781`，计为 Error 而非假 Failure
+    （`b64_teeth_newcode.log`）。
+  - 两支都从 `RLT.hardened.java` 副本 cp 回原文件，md5 `e2d7477d…` 对账；python 监听口 kill 之后
+    `lsof -iTCP:57432 -sTCP:LISTEN` 复扫 0 条。
+- 这条**没有**把"撞车"本身消掉：临时端口放开后仍可被别人拿走，改的是**归属** —— 从此撞车报的是
+  "端口上答话的不是 RESP"，不再伪装成一条业务断言失败。要让全量在撞车下照样不红，得让 `startAndWait`
+  换端口重来，那要动这 3 个类里所有用例的"先建服务器再取端口"结构，本轮没做。
+
+
 ### Added
 - `RedisServer.serverScope()`：只读拿到本台那一份，测试与嵌入式据此判断作用域边界。
 - `StreamIdFormat`（z-cache-common）：stream ID 的唯一文法（uint64 两段、`-` / `+` 两种位置、
@@ -949,6 +1020,34 @@ All notable changes to z-cache will be documented in this file.
 - 全量反应堆：**878 例全绿**（`358 + 384 + 134 + 2`，四个模块各自 0 失败 0 错 0 跳过，
   `b63_full.log` / `b63_full2.log` 尾都 `BUILD SUCCESS`），core 从上一轮的 383 抬到 384
   （本轮新增一条协议用例）。第二遍 `b63_full2.log` 是在注释按 U4/U7 实测改写之后跑的。
+- `StreamStore.xreadgroupNew(...)` 多了一个 `noack` 形参、`ConsumerGroup.markDelivered(...)` 也是
+  （两个口子都只被命令层与 `StreamTest` 用，没有对外行为变化）；命令层新增共用的
+  `scanXreadOptions(...)` 与读数载体 `XreadSpec`（XREAD / XREADGROUP 从此走同一圈选项扫描）。
+- 最新这一轮的电池 `battery64.txt` 24 行（`:1-:4` 建流、组与一枚 String 键、`:5-:8` 配对那一问
+  含它那道 arity 控制与"混着 String 键也报配对"那格、`:9-:12` 两句误用句的三种摆法、
+  `:13-:16` XREADGROUP 的 -7 闸与 XREAD 的 -4 闸各两格、`:17-:20` NOACK 投递 → `XPENDING` →
+  再读一次 → 账仍是空、`:21` 副作用对照、`:22-:24` "Missing GROUP" 与两句判序控制）：
+  改前 `battery64.pre` 由**提交树 `adf6354` 重建**的 `b64_pre.jar` 量得（工作树当时与 HEAD 逐文件相同，
+  这一轮的"改前面"不需要 `git show` 那套覆盖），改后 `battery64.post` 由 `b64_post.jar` 量得。
+  **翻 12 行（`:6 :7 :8 :9 :10 :11 :12 :17 :19 :20 :22 :23`）**，其余 12 行逐字节未动
+  （`:5 :13 :14 :15 :16 :24` 正是那六道闸与判序控制，它们本来就没打算翻）。
+  两侧各 `wrote=24 lost=none`（`b64_replay_pre.log` / `b64_replay_post.log`），
+  CH 的 class md5 从 `15bb4380…`（提交树）到 `8edaa85f…`（本轮）。
+- `code_mut.py` 涨到 **76 支 / 77 个锚点**（新增 V1-V8，`python3 code_mut.py V` 分族跑；
+  族名前缀的判断里加了 `V`，量具第一次有**第三个**目标文件 `stream/StreamStore.java`，
+  因为 V8 要打的是"投递前顺手建消费者"那一行）。**7 KILLED / 1 SURVIVED**（V8 见上面那一节，
+  等价变异）；V4 的红是一句 `internal error: Cannot invoke "Object.hashCode()" because "key" is null`
+  —— 摘掉"缺 GROUP 就报那句"之后，`group` 一路走到取组的位置上被当 map 键用，
+  这说明那一问不只是文案，它下面真的接不住 null。V5 是纯粹换判序（把两问互换），
+  红在 `:24` 那一格：那一行两个问都会答，只有顺序对了才只答一句。
+  选取器带上新方法、对岸的 `xreadPositionsAreExclusiveAndHistoryComesFromTheConsumerPel`
+  与整个 `StreamTest`（V6/V7 打的是 `markDelivered`，纯函数那一侧也得跑）。
+  8 支逐支回读，三个文件还原后与工作树逐个 md5 对账（`79d29d23…` / `2d12be43…` / `3113b87e…`）。
+- 全量反应堆：**879 例全绿，连跑两遍**（`358 + 385 + 134 + 2`，四个模块各自 0 失败 0 错 0 跳过，
+  `b64_full3.log` 与 `b64_full4.log` 尾都是 `BUILD SUCCESS`），core 从 384 抬到 385（新增一条协议用例）。
+  这两遍是**含上面那处探针修改**之后跑的。中间那一遍红的（`b64_full2.log`，两例 `HTTP/1.1 400`）
+  不是服务器行为退步，已按三条取证 + 注入现场 A/B 归到量具上，见上面那一节 —— 台账里留着它，
+  是因为"同一棵树几分钟前全绿、中间只改了注释"这种红，最容易被人直接抹成"环境问题"而不留证据。
 
 ### 已知边界（这一版没动，说清楚）
 - RESP3 / `HELLO`、`EVAL` / `EVALSHA` / `SCRIPT` 依旧没有服务端实现，客户端 `DistributedLock`
@@ -1014,14 +1113,16 @@ All notable changes to z-cache will be documented in this file.
       —— 组挂在这枚流上，说明流对象确实建出来了（`RedisServerProtocolSemanticsTest.java:3095-3098`）。
       但"键空间看不见 stream"那一条仍在（下面单独一条）：`XLEN` 那一格区分不了空流与无键
       （`battery59:10 :11 :12` 三格全是 `:0`），`TYPE` / `EXISTS` / `DBSIZE` / `DEL` 也照旧。
-    - 选项句四类各回各的：`battery55:20`/`:21`（`XREADGROUP STREAMS …` / 缺 GROUP）与 `:22`
-      （`XREAD STREAMS t55:ok`，1 键 0 ID）都回 arity 句，`:23`（2 键 1 ID）回
-      `Invalid stream ID specified as stream command argument`，`:24`/`:25`/`:26`
-      （XREAD 里写 `GROUP` / `NOACK`）统一回 `-ERR syntax error`；
-      上游分别是 `Unbalanced XREAD list of streams: …`（:1445-1449）、
-      `Missing GROUP option for XREADGROUP`（:1483-1485）、
-      `The GROUP option is only supported by XREADGROUP. You called XREAD instead.`（:1453-1457）、
-      `The NOACK option …`（:1462-1466）。
+    - 选项句四类**本轮已闭**（见上面《XREAD / XREADGROUP 的选项那一圈》，`battery64` 24 行实测
+      翻 12 行）：`Unbalanced XREAD list of streams: …`（:1445-1449）、
+      `Missing GROUP option for XREADGROUP`（:1481-1486）、
+      `The GROUP option is only supported by XREADGROUP. You called XREAD instead.`（:1453-1458）、
+      `The NOACK option …`（:1462-1468）四句都按线上文本钉住了。
+      当时那条记法有两处要纠正：一是把 `battery55:20 :21`（`XREADGROUP STREAMS …`、缺 GROUP）
+      也算成"该报专有误用句"—— XREADGROUP 的 arity 是 **-7**（server.c:319），那两行在闸外就该
+      回 arity 句，改前改后都对；二是漏了判序 —— 缺 GROUP 那一问排在"没见过 STREAMS"之后，
+      而 `NOACK` 那一问排在两者之前（新控制格 `battery64:24` 钉的就是这一序）。
+      **同一支里仍没做的只剩逐条目形式**（下面那一支）。
     - `XPENDING` 的逐条目形式仍明确拒绝：`battery55:39 :40 :41` 三行都回
       `-ERR XPENDING detail form (IDLE / start / end / count) is not supported`；摘要形式 `:45`
       回 `:1 / "1-1" / "1-1" / [[c55,1]]`。

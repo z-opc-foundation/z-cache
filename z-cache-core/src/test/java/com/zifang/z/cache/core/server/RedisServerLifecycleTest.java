@@ -764,9 +764,27 @@ class RedisServerLifecycleTest {
                         + " —— 该线程带回来的异常: " + (died.get() == null
                             ? "无（线程干净退出却没开始监听）" : String.valueOf(died.get())));
             }
+            // 就绪的判据不能只是"连得上"。freePort() 是先 bind 一个临时端口再放开，放开到
+            // 真正 bind 之间有窗口，本机同时有别的战役在跑 surefire 时这个窗口会被别人插进来；
+            // 裸 connect 在那种情况下照样立刻"就绪"，于是后面每条断言都在读别人家的响应
+            // （实测过一次 `expected: <+OK> but was: <HTTP/1.1 400 Bad Request>`，而这串字符
+            // 不在本仓任何源码里）。要对方答一句话，且答的必须是 RESP 形状。
             try (Socket probe = new Socket()) {
                 probe.connect(new InetSocketAddress("127.0.0.1", port), 200);
-                return thread;
+                probe.setSoTimeout(300);
+                probe.getOutputStream().write(
+                        "*1\r\n$4\r\nPING\r\n".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                probe.getOutputStream().flush();
+                int first = probe.getInputStream().read();
+                if (first == '+' || first == '-' || first == ':' || first == '$' || first == '*') {
+                    return thread;
+                }
+                throw new IllegalStateException("port " + port + " 上答话的不是 RESP，首字节 "
+                        + (first < 0 ? "是流已关闭" : "'" + (char) first + "'(" + first + ")")
+                        + " —— 端口大概率在 freePort() 放开后被别的进程占走了");
+            } catch (java.net.SocketTimeoutException stillWarmingUp) {
+                // 内核已 accept 而事件循环还没读：这是我们自己起步慢，不能算别人的端口
+                Thread.sleep(50);
             } catch (IOException notYet) {
                 Thread.sleep(50);
             }
