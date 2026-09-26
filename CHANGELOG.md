@@ -152,6 +152,27 @@ All notable changes to z-cache will be documented in this file.
   `RENAME` 这一版另跑 5 支（摘 dst 整表清理 / 源键判据换回 `keyTypeMaps` / 不删源键 /
   TTL 不搬 / `deleteEveryType` 退回"第一条命中就返回"），**5 支全部点名判红**。
   探针跑完按字节还原（md5 对账），脚本留在 `~/.cache/zcache_mut/`。
+- 位族五支的回归全部落在真实服务器上，不在 `CommandHandler` 的单元测试里：
+  `RedisServerReferenceParityTest` 新增 5 条
+  （`bitcountLooksUpTheKeyBeforeGrammar` / `bitcountMatchesTheMeasuredTruthTable` /
+  `getbitAndSetbitFollowTheMeasuredGrammar` / `bitposMatchesTheMeasuredPrecedenceAndFolding` /
+  `bitopRepliesBytesAndFollowsTheMeasuredPrecedence`，该类现在 21 条）。
+  每条期望串都是 250 参考实例那一行的原文，**没有一条是手算的**——
+  `BITCOUNT` 手算错过两次（0x6c 是 4 位、0x61 是 3 位），之后专门补了 `battery48`
+  只为准许把 `BITOP OR bit:dest bit:pad bit:src` 之后的 `BITCOUNT` 取成实测的 `:22`。
+- `RedisServerProtocolSemanticsTest.bitWritesSignalOnlyTheKeysTheyActuallyChange` 四支：
+  `WATCH` 目标键 + 别人 `BITOP` → `EXEC` 中止；`WATCH` 源键 + 别人 `BITOP` → 结果照交；
+  `WATCH k` + 别人 `SETBIT` k → 中止；外加一支"改的是无关键"的阴性对照，
+  否则"一个键都不 bump"也能把前三支糊过去。
+- `RedisServerLifecycleTest.bitWritesAreJournaledAndReplayed` 跨代际：第一代只写不 SAVE，
+  删掉 `dump.rdb`，第二代只许从 AOF 把 `GETBIT` / `STRLEN` / `BITCOUNT` / `GETRANGE`
+  四个读数原样读回来 —— 这是 `SETBIT` 漏出 `WRITE_COMMANDS` 那条缺陷唯一会红的地方。
+- 位族具名变异 4 支，**4 支全部点名判红**：`BITOP` 的答复改回 `max * 8`（红在 `:5` vs `:40`）、
+  摘掉 `NOT` 单源那句话（红在 `battery45:14`，且是"错成 WRONGTYPE"而不是错成没反应）、
+  给目标键也加类型检查（红在 `battery46:33`）、摘掉 `bumpWatchedKeys` 的 `BITOP` 分支
+  （红在"WATCH 的键被 BITOP 改写，EXEC 必须中止"）。按字节还原 + md5 对账，
+  脚本 `~/.cache/zcache_gauges/zmut_bitop.sh`。
+
 - 计数只认实测：`mvn clean test` 全量 **96 + 340 + 133 + 2 = 571 例全绿，0 skipped**
   （上一版是 569 例、12 条被跳过）。这类跨实例作用域缺陷只在"整模块连跑"的形态下现形，
   所以再按 `-Dsurefire.runOrder=random` 把 common+core 连跑 3 次：三次都是 96 + 340 全绿，
