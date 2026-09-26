@@ -903,6 +903,61 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   **源码推导** —— 参照实例 redis 4.0.9 根本不认 stream 类型，这一支没有可对拍的真值，
   与上一格同档。（`~` 近似裁剪仍然只是被跳过而不兑现，那一格留在下面。）
 
+#### `XSETID key <id>`：一条都不在的流允许把 ID 空间退回原位
+
+- 这一支在上游是六步（`t_stream.c:1931-1956`），本轮把六步逐个装到 `CommandHandler.handleXsetid`
+  上，顺序与线位都按源码：`server.c:321` 的 arity 是**精确 3**（同族里只有它不带 `-`，
+  `xadd -5`、`xgroup -2`、`xack -4`、`xpending -3`、`xclaim -6`、`xinfo -2`、`xdel -3`、
+  `xtrim -2` 全在 `server.c:314-327` 那张表里，现在这张表本机可读，见下面"量具"那条）
+  → `:1932` `lookupKeyWriteOrReply(…, shared.nokeyerr)`（键不在答 `-ERR no such key`，
+  **不建流**，这一点与 XADD 的 `streamTypeLookupWriteOrCreate` 正相反）→ `:1933` 问类型 →
+  `:1937` **strict** 解析（`streamParseStrictIDOrReply`，missing_seq 传 0）→ `:1942-1951`
+  那道表顶闸 → `:1952-1953` 写 `s->last_id` 并答 `+OK`。
+- 表顶闸这一格是这一支的全部难度：外面套着 `if (s->length > 0)`，比的是
+  `streamLastValidID`（**还活着的最大学 ID**）而不是 `s->last_id`，条件又是 `< 0`
+  而不是 XADD 那个 `<= 0`。三件事叠起来的结果是：**空流可以把 ID 空间往回挪**
+  （这正是它的用途 —— 导入历史数据前先退回去），而有活条目时连 `0-0` 都要被拒。
+  本仓 `Stream` 早就把这两个量分开了（`lastId()` / `lastValidId()`，上一格 X4 变异为它作过证），
+  所以缺的只是把 `lastValidId()` 接到这道闸上，外加一个允许往回写的 `setLastId`。
+- 改前实测：`battery67`（43 行）对改前那个 jar（`b67_pre.jar`，提交树 `1ea4260` 重建，
+  `CommandHandler.class` md5 `49603ae429747d4cce0674066f92f598`）与改后那个 jar
+  （`b67_post.jar`，`d10af081519025d9b83c42fb417a2241`）各跑一遍，`zdiff.py` 的原始账是
+  `A=battery67.pre B=battery67.post 行数=43 顺序不同=0 (-) 真实不一致=27`（两侧各
+  `wrote=43 lost=none`，见 `b67_replay_pre_rows43.log` / `b67_postbuild.log`）。
+  那 27 行里 **20 行是 XSETID 本身**（`:3 :8 :10 :14 :15 :18 :19 :20 :21 :23 :26 :27 :28 :29 :30 :38 :39 :42`
+  加 `:33 :35`），改前一律 `-ERR unknown command 'XSETID'`；另外 **7 行是下游证据**
+  （`:5 :12 :22 :25 :34 :37 :43` —— 表顶挪过之后 XADD 的单调性判的就是挪后的位置，
+  `XLEN` 也跟着变，这一类"命令自己不改、却把别人的答案改了"的行才是真正证明它写进去了的那一半）。
+- 三条**对照组**要单独记，因为它们两侧逐字相同而含义不一样：`:40 :41` 是
+  `XGROUP CREATE k67:s g67 0` 与 `XGROUP SETID k67:s g67 -` —— 非严格那一支本来就在（1.3.5
+  那轮装的），所以同一枚 `-` 在 XGROUP SETID 侧答 `+OK` 而在 XSETID 侧答非法，**两侧都同答
+  不等于两侧都正确**，它是"严格与否"这个标志位的参照；`:17` 的 `XAUTOCLAIM` 两侧都回
+  unknown 而这一格**本来就是对的**（`server.c:314-327` 那张表里根本没有 xautoclaim，它是
+  6.2 才加的）；`:16` 的 `XCLAIM` 两侧也都回 unknown，但那一格是**真缺口**（表里有，
+  arity `-6`），留在下面的边界里。
+- 自证是八支变异（`code_mut.py` 新增 Y 族，日志 `code_Y1.log`…`code_Y8.log`，每支跑完从本次
+  快照按字节还原并 md5 对账：CH `c540de658a5addd5b3fc9f167b58ed9d`、ST
+  `fc0889359abeda9c83b45afc76266804`，两支 ST 探针的还原同样逐字节同）：Y1 把 arity 放开成
+  `< 3`、Y2 把 strict 摘成宽松、Y3 把表顶闸退回 `<= 0`、Y4 让那道闸去问 `lastId()` 而不是
+  存活最大、Y5 把"键不在"那一回答成 `+OK`、Y6 把 ID 解析挪到两道取键闸之前、Y7 让
+  `setLastId` 那一句空转、Y8 把 `setLastId` 改成只许往上涨。**八支全 KILLED。**
+- **Y2 第一轮是 SURVIVED 的，而这一条值得写进账里**：当时那支测试只用 `$` 与 `*` 问严格与否，
+  而这两个字在 strict 与非 strict 两支里都过不了 `string2ull`（`:1197`）—— 摘掉标志位
+  一句话都不改，所谓"钉住了 strict"其实钉的是"这字不是数字"。上游那道 `:1179-1180` 只管
+  `-` 与 `+`（`buf[1] == '\0'` 才拦），所以唯一的判别输入就是这两枚。补上
+  `XSETID k -` / `XSETID k +` 与对照 `XGROUP SETID k g -` 之后 Y2 才红。
+  写这一段的理由不是"后来修好了"，而是：**一条断言如果两侧同答，它就不许被读成"它区分了这两侧"** ——
+  这一格上一轮（`:33` 那条 XPENDING 的教训）已经记过一次同形的，第二次踩在同一类句子上。
+- 量具这一轮有一处实打实的升级：5.0.14 的**完整源码**已在
+  本机 `~/.cache/zcache_gauges/full5/redis-5.0.14/src/`（从 `redis-5.0.14.tar.gz` 解出
+  `t_stream.c` 与 `server.c`）。此前命令表读不到，arity 只能猜，于是 XSETID 这种
+  "精确 3" 与 "至少 3" 的差别永远量不出来（`XSETID k 2-2 extra` 那一行回什么，取决于表里
+  写的是 `3` 还是 `-3`）；现在它是一张可读的表（`server.c:314-327`），本轮的 arity 断言
+  与 XCLAIM 的下一步都建立在这张表上。
+- 依据档次与上一格同：参照实例 4.0.9 不认 stream 类型，所以"上游答什么"全部是**源码推导**，
+  没有对拍真值；"我们改前答什么"是本机实测。
+
+
 
 ### Added
 - `RedisServer.serverScope()`：只读拿到本台那一份，测试与嵌入式据此判断作用域边界。
@@ -1203,6 +1258,35 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   **4 支全 KILLED**，红的句子逐支不同（见上面那一节的自证清单）。
 - 全量反应堆：**882 例全绿，连跑两遍**（`358 + 388 + 134 + 2`，core 从 386 抬到 388 =
   本轮那两条新用例；`b66_full1.log` 与 `b66_full2_maxlen.log` 尾都是 `BUILD SUCCESS`）。
+- `CommandHandler.handleXsetid`（`XSETID key <id>`）：按 `t_stream.c:1931-1956` 的六步装齐 ——
+  `server.c:321` 的精确 arity、`:1932` 的"键不在答 `-ERR no such key` 而**不建流**"、
+  `:1933` 的类型闸、`:1937` 的 strict 解析（missing_seq 为 0）、`:1942-1951` 那道套着
+  `if (s->length > 0)` 且比的是存活最大 ID 的表顶闸（条件 `< 0`，等于存活表顶允许）、
+  `:1952-1953` 写表顶并答 `+OK`。`XGROUP` 的分派表里多出一行 `case "XSETID"`。
+- `Stream.setLastId(ms, seq)`：把 `last_id` 那两个计数器写成一个新值，**允许往回写**
+  （上游那道闸只在有活条目时才拦，空流重开 ID 空间就是这一支的用途）。它与 `trim` 的
+  关系由 Y8 变异钉住：把 `setLastId` 改成"只许往上涨"会红在"退回去之后 2-2 就又能写了"。
+- `RedisServerProtocolSemanticsTest#xsetidMovesTheTopAndOnlyRefusesToCrossALiveEntry`：
+  六段各钉一格 —— 挪表顶之后 XADD 判的是新位置、等于存活表顶不拒而 XADD 拒、空流可以退回
+  （连 `0-0` 都可以）而有活条目时 `0-0` 立刻被拒、`-`/`+` 在 strict 侧非法而在
+  `XGROUP SETID` 侧合法（这一对是 Y2 唯一抓得住的形状）、裸 `4` 落 `4-0` 不是 `4-MAX`、
+  arity 多一个字都不收、以及"取键两问排在 ID 解析之前"那个顺序（`XSETID k67:str bad-id`
+  答 WRONGTYPE 而不答 invalid stream ID）。
+- 电池 `battery67.txt` **43 行**：`:2-:12` 挪顶与退回的主干（`:5 :12` 是下游证据）、
+  `:13-:15` 两键并存与"键不在"、`:16 :17` XCLAIM/XAUTOCLAIM（前者真缺口、后者本来就该
+  unknown，两侧同答的两种含义）、`:18-:25` 等于表顶 / `$` / `*` / `0-0` 与它们带红的
+  `XLEN`（`:24` 两侧同答，是"被拒的 XADD 连裁剪都不跑"那一格的对照）、`:26-:30`  arity 与判序、`:31-:37` "清空之后仍可退回"那一组（`:31 :32 :36` 是
+  对照组）、`:38-:43` strict 判别组（`:40 :41` 是非严格侧的对照）。
+  改前 `battery67.pre` 由提交树 `1ea4260` 重建的 `b67_pre.jar`（CH `49603ae4…`）量得，
+  改后 `battery67.post` 由 `b67_post.jar`（CH `d10af081…`）量得，两侧各 `wrote=43 lost=none`。
+- `code_mut.py` 涨到 **95 支 / 96 个锚点**（新增 Y1-Y8，族名前缀判断里加了 `Y`）。
+  **8 支全 KILLED**；Y2 第一次是 SURVIVED，补了 `-`/`+` 那对判别输入之后才红（记在上面那一节）。
+- 量具侧一件永久的事：5.0.14 的**完整源码**解到 `~/.cache/zcache_gauges/full5/`，
+  命令表从此本机可读（`server.c:314-327`）。stream 族九支的 arity 全部现抄：
+  `xadd -5`、`xlen 2`、`xgroup -2`、`xsetid 3`、`xack -4`、`xpending -3`、`xclaim -6`、
+  `xinfo -2`、`xdel -3`、`xtrim -2`，而 **xautoclaim 不在表里**。
+- 全量反应堆：**883 例全绿，连跑两遍**（`358 + 389 + 134 + 2`，core 从 388 抬到 389 =
+  本轮那一条新用例；`b67_full1.log` / `b67_full2.log` 尾都是 `BUILD SUCCESS`）。
 
 ### 已知边界（这一版没动，说清楚）
 - RESP3 / `HELLO`、`EVAL` / `EVALSHA` / `SCRIPT` 依旧没有服务端实现，客户端 `DistributedLock`
@@ -1290,8 +1374,12 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
       XINFO 那一支自己遍历 `getConsumers()`、计数用 `getOrDefault(…, 0L)` 兜，与
       `perConsumerPending()` 的种子行互为备份（两支变异各单打都不红、一起打才炸）。
       **同一支里仍没做的还剩逐条目形式**（上面那一支）。
-    - `XSETID` / `XCLAIM` / `XAUTOCLAIM` 三行（`battery55:36 :37 :38`）都回
-      `-ERR unknown command '…'`。
+    - ~~`XSETID` / `XCLAIM` / `XAUTOCLAIM` 三行（`battery55:36 :37 :38`）都回
+      `-ERR unknown command '…'`。~~ **本轮把 XSETID 那一行闭了**（上面 `#### XSETID key <id>`
+      那一节，`battery67` 43 行两侧对拍）。剩下两行要分开算：`XAUTOCLAIM` 回 unknown 是
+      **对的**（5.0.14 命令表 `server.c:314-327` 里没有它，6.2 才加），不该再记成缺口；
+      `XCLAIM` 仍是真缺口，而它的 arity 现在可读（`server.c:324` 是 `-6`），卡点只剩
+      PEL 的 `delivery_count` / `delivery_time`（下面那一支）。
     - **`XGROUP CREATECONSUMER` 没有权威可比**：`battery55:44` 对已存在的消费者回 `:1`。
       我钉的权威是 5.0.14，而那份源码的 XGROUP 只有 CREATE / SETID / DESTROY / DELCONSUMER / HELP
       （子命令注释 :1794-1797、`help[]` 表 :1799-1805，`DELCONSUMER` 是唯一 `c->argc == 5`
@@ -1324,7 +1412,9 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
     要把 `XPENDING` 的 IDLE / 次数形式或 `XCLAIM` 做对，得先把 PEL 换成带元数据的结构。
 - `XREAD` / `XREADGROUP` 的 `BLOCK` 仍然是明确拒绝而不是实现（`XREAD BLOCK` 回
   `-ERR XREAD BLOCK is not supported…`）——拒绝是有意的：收下 `BLOCK` 等于对客户端谎称会阻塞。
-- `XCLAIM` / `XSETID` 依旧没有实现（本机实测 `XCLAIM` 回 `-ERR unknown command 'XCLAIM'`）。
+- `XCLAIM` 依旧没有实现（本机实测回 `-ERR unknown command 'XCLAIM'`；arity 是 `server.c:324`
+  的 `-6`，卡在没有元数据的 PEL，见上面那一支）。`XSETID` 已在 1.3.6 这一版兑现，
+  `XAUTOCLAIM` 在 5.0.14 里根本不存在、不该实现。
 - `MemoryStore.keyVersions` 只增不减。
 - `MemoryStore.keyTypeMaps` 仍只有 String 写路径维护；`existsDb` / `checkKeyType` 这些读它的
   方法对集合键一律"看不见"。`RENAME` 已经不读它了，但 `MemoryStore.rename()` / `renameDb()`

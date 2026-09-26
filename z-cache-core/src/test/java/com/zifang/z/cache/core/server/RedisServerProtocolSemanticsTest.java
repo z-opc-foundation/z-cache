@@ -3482,6 +3482,126 @@ class RedisServerProtocolSemanticsTest {
     }
 
     /**
+     * {@code XSETID key <id>}（上游 {@code t_stream.c:1931-1956}）：这一格的数法全在"精确 3"的
+     * arity（5.0.14 命令表 {@code server.c:321}）与"什么时候才问比表顶小"那一条上。
+     * 改前实测（{@code battery67.pre}，43 行）里 XSETID 的 <b>20</b> 行全不是上游的答 ——
+     * 它那时是一个不存在的命令。账是 {@code zdiff.py battery67.pre battery67.post} 量出来的：
+     * 行数 43、顺序不同 0、<b>真实不一致 27</b>，其中 20 行就是 XSETID 本身，另外 7 行
+     * （{@code :5 :12 :22 :25 :34 :37 :43}）是表顶被挪动之后 XADD/XLEN 跟着变的下游证据。
+     * {@code :40 :41} 两侧同答（{@code XGROUP CREATE} 收 0、{@code XGROUP SETID} 照收 {@code -}），
+     * 是"非严格那一支本来就在"的对照 —— 严格与否则由 {@code :38 :39} 那两枚 {@code -}/{@code +} 定。
+     * 对照组 {@code :17} 的 {@code XAUTOCLAIM} 两侧都回 unknown，这一格<b>本来就是对的</b>：
+     * 5.0.14 的命令表 {@code server.c:314-327} 里没有它。{@code :16} 的 {@code XCLAIM} 同样两侧
+     * unknown，但那一格是真缺口（命令表 {@code :324} 有它，arity 是 {@code -6}），归下一支。
+     */
+    @Test
+    void xsetidMovesTheTopAndOnlyRefusesToCrossALiveEntry() throws Exception {
+        int port = freePort();
+        RedisServer server = new RedisServer("127.0.0.1", port, 0);
+        Thread thread = startAndWait(server, port);
+        try (Socket socket = connect(port)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+
+            // ---- 挪得动，而且 XADD 读的就是挪过的那个表顶 ----
+            send(socket, "XADD", "xs:a", "1-1", "a", "1");
+            assertEquals("1-1", readReply(in));
+            send(socket, "XSETID", "xs:a", "2-2");
+            assertEquals("+OK", readReply(in));
+            send(socket, "XADD", "xs:a", "1-5", "a", "2");
+            assertEquals("-ERR The ID specified in XADD is equal or smaller than "
+                    + "the target stream top item", readReply(in),
+                    "1-5 本来是能写的（表顶在 1-1）：这一条被拒才是 XSETID 真的动了 s->last_id 的证据");
+            send(socket, "XADD", "xs:a", "3-1", "a", "3");
+            assertEquals("3-1", readReply(in));
+
+            // ---- 等于存活表顶是允许的：:1946 的条件是 `< 0`，不是 XADD 那个 `<= 0` ----
+            send(socket, "XSETID", "xs:a", "3-1");
+            assertEquals("+OK", readReply(in), "同一个位置 XADD 会拒（等于表顶），XSETID 不拒");
+            // ---- 比存活表顶小才拒，而且拒了不改任何东西 ----
+            send(socket, "XSETID", "xs:a", "2-2");
+            assertEquals("-ERR The ID specified in XSETID is smaller than "
+                    + "the target stream top item", readReply(in), ":1946-1950");
+            send(socket, "XADD", "xs:a", "MAXLEN", "0", "2-2", "a", "4");
+            assertEquals("-ERR The ID specified in XADD is equal or smaller than "
+                    + "the target stream top item", readReply(in), "被拒的 XADD 连裁剪都不跑");
+            send(socket, "XLEN", "xs:a");
+            assertEquals(":2", readReply(in), "上面两问都没动条目");
+
+            // ---- 空流可以往回挪，而那正是这一支存在的理由 ----
+            // :1942 那一问外面套着 `if (s->length > 0)`：一条都不在的时候 ID 空间是允许重开的。
+            send(socket, "XADD", "xs:c", "MAXLEN", "0", "6-6", "a", "5");
+            assertEquals("6-6", readReply(in));
+            send(socket, "XLEN", "xs:c");
+            assertEquals(":0", readReply(in));
+            send(socket, "XADD", "xs:c", "2-2", "a", "6");
+            assertEquals("-ERR The ID specified in XADD is equal or smaller than "
+                    + "the target stream top item", readReply(in), "清空不退回 ID 空间（上一格那条）");
+            send(socket, "XSETID", "xs:c", "1-1");
+            assertEquals("+OK", readReply(in), "空流上没有\"比表顶小\"这一问");
+            // 同一个位置换成 0-0 也照样过：:1937 只做 strict 解析，"0-0 一律拒"是 XADD
+            // 独有的那一道（:1292-1295），XSETID 这一支没有它（battery67:33 量的就是这一格）。
+            send(socket, "XSETID", "xs:c", "0-0");
+            assertEquals("+OK", readReply(in), ":1942 的 `if (s->length > 0)` 不进，0-0 就写得进去");
+            send(socket, "XADD", "xs:c", "2-2", "a", "6");
+            assertEquals("2-2", readReply(in), "退回去之后 2-2 就又能写了");
+            // 一旦有活条目，同一个 0-0 立刻过不了（battery67:21 同形：那边表顶在 2-2）。
+            send(socket, "XSETID", "xs:c", "0-0");
+            assertEquals("-ERR The ID specified in XSETID is smaller than "
+                    + "the target stream top item", readReply(in),
+                    "同一句话在空流上不成句、在有条目的流上才成句，差别只在 s->length");
+
+            // ---- ID 是 strict 解析，而 strict 只管得住 `-` 与 `+`（:1179-1180）----
+            // 与 XGROUP SETID 正好相反，那边 :1895 用的是 streamParseIDOrReply（非严格）：
+            // 同一枚 `-` 在这里非法、在那里是合法位置（解析成 0-0）。`$` 与 `*` 两支都过不了
+            // string2ull（:1197），分不出严格与否 —— 只有 `-`/`+` 分得出。这一格是 Y2 变异
+            // （把 true 摘成 false）当初钻过去的地方，所以两侧都得上树量。
+            send(socket, "XSETID", "xs:c", "-");
+            assertEquals("-ERR Invalid stream ID specified as stream command argument", readReply(in),
+                    ":1179 那一问只在 strict 为真时才拦");
+            send(socket, "XSETID", "xs:c", "+");
+            assertEquals("-ERR Invalid stream ID specified as stream command argument", readReply(in));
+            send(socket, "XGROUP", "CREATE", "xs:c", "g1", "0");
+            assertEquals("+OK", readReply(in));
+            send(socket, "XGROUP", "SETID", "xs:c", "g1", "-");
+            assertEquals("+OK", readReply(in), "对照：非严格那一支照收同一枚 -");
+            send(socket, "XSETID", "xs:c", "$");
+            assertEquals("-ERR Invalid stream ID specified as stream command argument", readReply(in));
+            send(socket, "XSETID", "xs:c", "*");
+            assertEquals("-ERR Invalid stream ID specified as stream command argument", readReply(in));
+
+            // ---- 没有 `-` 时补的是 0（:1937 传下去的 missing_seq 就是 0，不是 MAX）----
+            send(socket, "XSETID", "xs:c", "4");
+            assertEquals("+OK", readReply(in));
+            send(socket, "XADD", "xs:c", "4-1", "a", "7");
+            assertEquals("4-1", readReply(in), "裸 4 落的是 4-0；补成 4-MAX 这一条就写不进了");
+
+            // ---- arity 是精确 3（server.c:321），三个字之外一律命令表那句 ----
+            send(socket, "XSETID");
+            assertEquals("-ERR wrong number of arguments for 'xsetid' command", readReply(in));
+            send(socket, "XSETID", "xs:c");
+            assertEquals("-ERR wrong number of arguments for 'xsetid' command", readReply(in));
+            send(socket, "XSETID", "xs:c", "2-2", "extra");
+            assertEquals("-ERR wrong number of arguments for 'xsetid' command", readReply(in),
+                    "同族的 xadd/-5、xgroup/-2、xpending/-3 都收多余字，只有这一支多一个字都不收");
+
+            // ---- 判序：取键在 ID 解析之前（:1932 在 :1937 之前）----
+            send(socket, "XSETID", "xs:ghost", "bad-id");
+            assertEquals("-ERR no such key", readReply(in),
+                    "shared.nokeyerr（server.c:1462-1463）：它不像 XADD 那样把流建起来");
+            send(socket, "SET", "xs:str", "hello");
+            assertEquals("+OK", readReply(in));
+            send(socket, "XSETID", "xs:str", "bad-id");
+            assertEquals("-WRONGTYPE Operation against a key holding the wrong kind of value",
+                    readReply(in), "类型那一问也在 ID 之前，所以这里看不到 invalid stream ID");
+            send(socket, "GET", "xs:str");
+            assertEquals("hello", readReply(in), "被拦下的 XSETID 没有把那枚 String 变成别的");
+        } finally {
+            server.stop();
+            thread.join(2000);
+        }
+    }
+
+    /**
      * XGROUP 的三道闸与分派（上游 {@code t_stream.c:1798-1926}，句子在
      * {@code networking.c:623-630}）。这一支钉的是<b>顺序</b>而不是"认不认得子命令"：
      * 第六个字必须是 MKSTREAM（:1817-1824）→ 取键问类型（:1827-1834）→ 键必须存在、

@@ -449,6 +449,7 @@ public class CommandHandler {
                 case "XREAD":      result = handleXread(args);     break;
                 case "XREADGROUP": result = handleXreadgroup(args); break;
                 case "XGROUP":     result = handleXgroup(args);    break;
+                case "XSETID":     result = handleXsetid(args);    break;
                 case "XACK":       result = handleXack(args);      break;
                 case "XPENDING":   result = handleXpending(args);  break;
                 case "XINFO":      result = handleXinfo(args);     break;
@@ -3015,6 +3016,49 @@ public class CommandHandler {
             default:
                 return unknownXgroupSubcommand(typed);
         }
+    }
+
+    /**
+     * {@code XSETID key <id>}：把流自己的表顶（上游的 {@code s->last_id}）挪到给定位置。
+     *
+     * <p>上游 {@code t_stream.c:1931-1956}。这一格的形状几乎全在那个数法上：
+     * <ol>
+     *   <li><b>arity 是精确的 3</b>（5.0.14 命令表 {@code server.c:321}，stream 族里唯一一个
+     *       不多不少的），所以 {@code XSETID k} 与 {@code XSETID k 1-1 多余} 都在命令表就回
+     *       {@code 'xsetid' command} 那一句，函数体一行都没跑；</li>
+     *   <li>:1932 取键用的是 {@code lookupKeyWriteOrReply(…, shared.nokeyerr)} —— 键不在回
+     *       {@code -ERR no such key}（{@code server.c:1462-1463}）。它<b>不建流</b>，与 XADD 的
+     *       {@code streamTypeLookupWriteOrCreate}（:1300）是两种取键；</li>
+     *   <li>:1933 {@code checkType} → WRONGTYPE；</li>
+     *   <li>:1937 的 ID 走 <b>strict</b>：{@code *} 与单独的 {@code -} / {@code +} 在这里都是非法
+     *       ID，而 {@code XGROUP SETID} 同一格用的是非严格那支（:1895）—— 同一个位置、两种答案。
+     *       {@code 0-0} 则照收（"必须大于 0-0"那一问是 XADD 独有的 :1292）；</li>
+     *   <li>:1942-1951 只有<b>流非空</b>时才问"是不是比表顶小"，而且比的是
+     *       {@code streamLastValidID}（还活着的最大学 ID）而不是 {@code s->last_id}；条件也是
+     *       {@code < 0} 而非 {@code <= 0} —— <b>等于表顶是允许的</b>，与 XADD 的单调性闸正好差一个等号；</li>
+     *   <li>:1952-1953 按位赋值后回 {@code +OK}。空流允许往回挪，那正是这一支的用途：
+     *       导完历史数据把 ID 空间退回原位。</li>
+     * </ol>
+     */
+    private Object handleXsetid(String[] args) {
+        if (streams() == null) return RespError.of("ERR", "Stream not configured");
+        if (args.length != 3) return RespError.wrongNumberOfArguments("XSETID");
+        String key = args[1];
+        // 两键并存这一格在上游不存在（一个键名只有一个对象），判序按本仓 stream 族既有口径：
+        // 先问类型，再问"有没有"。
+        RespError conflict = streamTypeConflict(key);
+        if (conflict != null) return conflict;
+        com.zifang.z.cache.core.stream.Stream stream = streams().getStream(currentDb, key);
+        if (stream == null) return RespError.of("ERR", "no such key");
+        long[] id = StreamIdFormat.parse(args[2], 0L, true);
+        if (id == null) return invalidStreamId();
+        long[] top = stream.lastValidId();
+        if (top != null && StreamIdFormat.compare(id[0], id[1], top[0], top[1]) < 0) {
+            return RespError.of("ERR", "The ID specified in XSETID is smaller than "
+                    + "the target stream top item");
+        }
+        stream.setLastId(id[0], id[1]);
+        return RespSimpleString.of("OK");
     }
 
     /**

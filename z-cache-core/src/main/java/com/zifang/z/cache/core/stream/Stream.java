@@ -230,6 +230,20 @@ public class Stream {
     }
 
     /**
+     * 把表顶<b>按位</b>挪到 {@code <ms, seq>}（上游 {@code t_stream.c:1952} 的
+     * {@code s->last_id = id}，赋值之前只被 :1942 那一问拦一次）。
+     * <p>
+     * 与 {@link #addEntry} 里那个只向前走的 {@code updateCounters} 不同，这一格<b>可以往回挪</b>：
+     * 上游只在流非空时才拦"比表顶小"，空流的 ID 空间是允许重开的 —— 这正是 XSETID 存在的理由
+     * （把历史数据导进去之后，把 ID 退回真正的位置）。往回挪之后自动 ID 会重新发出比曾经
+     * 交出去过的 ID 更小的一串，上游也是这样，所以这里不加任何保护。
+     */
+    public synchronized void setLastId(long ms, long seq) {
+        lastTimestamp.set(ms);
+        lastSequence.set(seq);
+    }
+
+    /**
      * 现在还留在流里的最大 ID，也就是上游的 {@code streamLastValidID}；一条都不在时返回 null。
      * <p>
      * 与 {@link #lastId()} 是两件事：XDEL 掉最大那条之后表顶仍停在原处（XADD 的单调性闸
