@@ -549,6 +549,142 @@ class RedisServerReferenceParityTest {
         });
     }
 
+    /**
+     * GETBIT / SETBIT —— 这两条命令在改动前<b>根本不存在</b>（回 unknown command），
+     * 而 {@code _doc/001_arch/01-module-structure.md} 一直把它们列在位操作里。
+     * 下面每一档都有 250 实测背书：语法与判序来自 battery41 第 3—8 行、battery42 第 22—28 与
+     * 33—36 行、battery43 第 3—7 行；算术与补零来自 battery40 第 2—9 行、battery43 第 25—31 行；
+     * "改位不清 TTL" 来自 battery44 全篇（对岸 SETBIT/SETRANGE/APPEND/INCR 都保留 expire，
+     * 新建的键才是 -1）。
+     */
+    @Test
+    void getbitAndSetbitFollowTheMeasuredGrammar() throws Exception {
+        run(port -> {
+            try (Socket s = connect(port)) {
+                DataInputStream in = new DataInputStream(s.getInputStream());
+                String offsetErr = "-ERR bit offset is not an integer or out of range";
+                String bitErr = "-ERR bit is not an integer or out of range";
+
+                // 坏 bit 不许把键建出来（battery41:2/3）
+                send(s, "SETBIT", "p44:fresh", "0", "2");
+                assertEquals(bitErr, readReply(in), "battery41:2");
+                send(s, "EXISTS", "p44:fresh");
+                assertEquals(":0", readReply(in), "battery41:3 —— 被拒的 SETBIT 一个字节都不落");
+
+                // 偏移那一栏：Redis 的整数语法 + 512MB 串换算成的位上限，两句合一
+                send(s, "SETBIT", "p44:fresh", "abc", "1");
+                assertEquals(offsetErr, readReply(in), "battery41:4");
+                send(s, "SETBIT", "p44:fresh", "-1", "1");
+                assertEquals(offsetErr, readReply(in), "battery41:5");
+                send(s, "SETBIT", "p44:fresh", "1099511627776", "1");
+                assertEquals(offsetErr, readReply(in), "battery41:6 —— 2^40");
+                send(s, "SETBIT", "p44:fresh", "4294967296", "1");
+                assertEquals(offsetErr, readReply(in), "battery42:33 —— 2^32 正好越界");
+                send(s, "SETBIT", "p44:fresh", "+0", "1");
+                assertEquals(offsetErr, readReply(in), "battery42:22 —— +0 不收");
+                send(s, "SETBIT", "p44:fresh", "05", "1");
+                assertEquals(offsetErr, readReply(in), "battery42:24 —— 前导零不收");
+
+                // bit 那一栏比整数语法还严：只收 "0" / "1" 两种字面
+                send(s, "SETBIT", "p44:fresh", "0", "-0");
+                assertEquals(bitErr, readReply(in), "battery42:23");
+                send(s, "SETBIT", "p44:fresh", "0", "01");
+                assertEquals(bitErr, readReply(in), "battery42:25");
+                send(s, "SETBIT", "p44:fresh", "0", "+1");
+                assertEquals(bitErr, readReply(in), "battery42:26");
+                send(s, "EXISTS", "p44:fresh");
+                assertEquals(":0", readReply(in), "上面那一整族都没建出键");
+
+                // arity 各报各的名字（小写是命令表里的原文）
+                send(s, "SETBIT", "p44:fresh");
+                assertEquals("-ERR wrong number of arguments for 'setbit' command", readReply(in),
+                        "battery41:21");
+                send(s, "SETBIT", "p44:fresh", "0");
+                assertEquals("-ERR wrong number of arguments for 'setbit' command", readReply(in),
+                        "battery41:20");
+                send(s, "GETBIT", "p44:fresh");
+                assertEquals("-ERR wrong number of arguments for 'getbit' command", readReply(in),
+                        "battery41:22");
+
+                // 判序：偏移 → 类型 → 取值。坏偏移排在 WRONGTYPE 之前（battery43:4/7）
+                send(s, "LPUSH", "p44:l", "x");
+                assertEquals(":1", readReply(in));
+                send(s, "GETBIT", "p44:l", "abc");
+                assertEquals(offsetErr, readReply(in), "battery41:24 —— 不是 WRONGTYPE");
+                send(s, "GETBIT", "p44:l", "1099511627776");
+                assertEquals(offsetErr, readReply(in), "battery42:35 —— GETBIT 也走同一道范围闸");
+                send(s, "SETBIT", "p44:l", "0", "2");
+                assertEquals(bitErr, readReply(in), "battery43:3 —— 坏 bit 也排在类型之前");
+                send(s, "GETBIT", "p44:l", "0");
+                assertEquals("-WRONGTYPE Operation against a key holding the wrong kind of value",
+                        readReply(in), "battery40:11");
+                send(s, "SETBIT", "p44:l", "0", "1");
+                assertEquals("-WRONGTYPE Operation against a key holding the wrong kind of value",
+                        readReply(in), "battery41:23");
+                send(s, "LLEN", "p44:l");
+                assertEquals(":1", readReply(in), "被 WRONGTYPE 挡下的 SETBIT 没把 list 覆盖掉");
+
+                // 算术：编号在字节内从高位数起，撑长的那一段补零
+                send(s, "SETBIT", "p44:s", "100", "1");
+                assertEquals(":0", readReply(in), "battery40:2 —— 回旧值");
+                send(s, "GETBIT", "p44:s", "100");
+                assertEquals(":1", readReply(in), "battery40:3");
+                send(s, "GETBIT", "p44:s", "0");
+                assertEquals(":0", readReply(in), "battery40:4");
+                send(s, "STRLEN", "p44:s");
+                assertEquals(":13", readReply(in), "battery40:5 —— 第 100 位要 13 个字节才装得下");
+                send(s, "BITCOUNT", "p44:s");
+                assertEquals(":1", readReply(in), "battery43:29 同形 —— 中间补的是零字节");
+                send(s, "SETBIT", "p44:s", "0", "1");
+                assertEquals(":0", readReply(in));
+                send(s, "BITCOUNT", "p44:s");
+                assertEquals(":2", readReply(in), "battery40:8");
+                send(s, "SETBIT", "p44:s", "100", "0");
+                assertEquals(":1", readReply(in), "清位时回的是那一位原来的值");
+                send(s, "BITCOUNT", "p44:s");
+                assertEquals(":1", readReply(in));
+
+                // 串尾右边一律 0，而不是"越界"（battery43:25/26）
+                send(s, "SET", "p44:h", "hello");
+                assertEquals("+OK", readReply(in));
+                send(s, "GETBIT", "p44:h", "39");
+                assertEquals(":1", readReply(in), "battery43:25 —— 'o'=0x6F 的最低位");
+                send(s, "GETBIT", "p44:h", "40");
+                assertEquals(":0", readReply(in), "battery43:26 —— 已经出了串尾");
+
+                // 空串：长度 0，读位是 0，写第 0 位把它撑成 1 字节
+                send(s, "SET", "p44:e", "");
+                assertEquals("+OK", readReply(in));
+                send(s, "GETBIT", "p44:e", "0");
+                assertEquals(":0", readReply(in));
+                send(s, "SETBIT", "p44:e", "0", "1");
+                assertEquals(":0", readReply(in));
+                send(s, "STRLEN", "p44:e");
+                assertEquals(":1", readReply(in));
+
+                // 改位不清 TTL，而新建的键没有 TTL（battery44 全篇）
+                send(s, "SET", "p44:t", "v", "EX", "100");
+                assertEquals("+OK", readReply(in));
+                send(s, "SETBIT", "p44:t", "0", "1");
+                assertEquals(":0", readReply(in));
+                send(s, "TTL", "p44:t");
+                long ttl = Long.parseLong(readReply(in).substring(1));
+                assertTrue(ttl > 90 && ttl <= 100, "SETBIT 之后 TTL 必须还在，实测 " + ttl);
+                send(s, "GETBIT", "p44:t", "0");
+                assertEquals(":1", readReply(in));
+                send(s, "TTL", "p44:t");
+                long ttlAfterRead = Long.parseLong(readReply(in).substring(1));
+                assertTrue(ttlAfterRead > 90 && ttlAfterRead <= 100, "GETBIT 也不清 TTL，实测 " + ttlAfterRead);
+                send(s, "SETBIT", "p44:new", "3", "1");
+                assertEquals(":0", readReply(in));
+                send(s, "TTL", "p44:new");
+                assertEquals(":-1", readReply(in), "battery44:19 —— 建出来的新键没有过期时间");
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        });
+    }
+
     /** 溢出那一档的取舍见 {@code setExpireTimeGrammarAndRange} 末尾；下面这几支管的是文案与算术。 */
     @Test
     void incrementOverflowIsReportedAsTheReferenceSays() throws Exception {

@@ -291,6 +291,52 @@ public class MemoryStore {
         return appendDb(0, key, suffix);
     }
 
+    /**
+     * SETBIT 的落盘：把第 {@code bitIndex} 位（字节内<b>从高位数起</b>，与 Redis 的编号一致）
+     * 写成 {@code on}，串不够长就先撑长、中间一律补零；回的是<b>改之前的那一位</b>。
+     * <p>
+     * 读-改-写在同一个 {@code synchronized} 块里做完：如果改成"handler 先 {@code getDb} 拿副本、
+     * 改完再 {@code setDb} 写回"，两条并发 SETBIT 会互相吞掉对方置上的那位（丢更新），
+     * 而且每次都要整串复制一遍。TTL 与 {@link #appendDb} 同一条路：保留原 {@code expireAt}，
+     * 只有键本来不在时才新建。
+     */
+    public long setbitDb(int db, String key, long bitIndex, boolean on) {
+        int byteIndex = (int) (bitIndex >>> 3);
+        int mask = 1 << (7 - (int) (bitIndex & 7));
+        synchronized (stringStores[db]) {
+            ValueWrapper current = getLiveWrapper(db, key);
+            byte[] prefix = current == null || current.data == null ? new byte[0] : current.data;
+            long previous = byteIndex < prefix.length && (prefix[byteIndex] & mask) != 0 ? 1 : 0;
+            byte[] value = byteIndex < prefix.length ? prefix.clone() : Arrays.copyOf(prefix, byteIndex + 1);
+            if (on) value[byteIndex] |= (byte) mask;
+            else value[byteIndex] &= (byte) ~mask;
+            putDb(db, key, new ValueWrapper(value, current == null ? -1 : current.expireAt));
+            setKeyType(key, DataType.STRING, db);
+            return previous;
+        }
+    }
+
+    /**
+     * GETBIT 的读法：只碰目标位所在的那<b>一个字节</b>，不把整串复制回来 ——
+     * {@link #getDb} 每次 {@code clone()}，而位偏移的合法区间大到能把串撑到 512MB，
+     * 那时读一个位的代价是几亿字节。串尾右边的位按 Redis 的口径回 0（实测
+     * {@code GETBIT <5 字节的串> 40} 是 0 而不是错），键不在、键已过期同样是 0。
+     */
+    public int getbitDb(int db, String key, long bitIndex) {
+        int byteIndex = (int) (bitIndex >>> 3);
+        int mask = 1 << (7 - (int) (bitIndex & 7));
+        synchronized (stringStores[db]) {
+            ValueWrapper wrapper = getLiveWrapper(db, key);
+            if (wrapper == null || wrapper.data == null || byteIndex >= wrapper.data.length) {
+                misses.incrementAndGet();
+                return 0;
+            }
+            wrapper.touch();
+            hits.incrementAndGet();
+            return (wrapper.data[byteIndex] & mask) != 0 ? 1 : 0;
+        }
+    }
+
     public long appendDb(int db, String key, byte[] suffix) {
         synchronized (stringStores[db]) {
             ValueWrapper current = getLiveWrapper(db, key);

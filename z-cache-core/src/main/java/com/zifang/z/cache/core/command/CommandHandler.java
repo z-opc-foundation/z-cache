@@ -325,6 +325,8 @@ public class CommandHandler {
                 case "SUBSTR":   result = handleGetrange(args, true);  break;
                 case "SETRANGE": result = handleSetrange(args);   break;
                 case "BITCOUNT": result = handleBitcount(args);   break;
+                case "GETBIT":   result = handleGetbit(args);     break;
+                case "SETBIT":   result = handleSetbit(args);     break;
                 case "INCRBYFLOAT": result = handleIncrbyfloat(args); break;
                 case "MSETNX":   result = handleMsetnx(args);     break;
                 case "UNLINK":   result = handleUnlink(args);     break;
@@ -871,6 +873,62 @@ public class CommandHandler {
         long bits = 0;
         for (long i = from; i <= to; i++) bits += Integer.bitCount(v[(int) i] & 0xFF);
         return RespInteger.of(bits);
+    }
+
+    /**
+     * 位偏移的合法区间。Redis 那侧的闸门是"一个字符串最长 512MB"，换算到位就是
+     * {@code 0 <= offset < 2^32}：实测 {@code 2^28} 收（把串撑成 33554433 字节，battery40:24），
+     * {@code 2^32}、{@code 2^40}、{@code -1} 全拒（battery42 第 33/34 行、battery41 第 5 行）。
+     * GETBIT 走的是同一道闸 —— {@code GETBIT h41 4294967296} 实测回错，而不是按"串尾右边算 0"
+     * 回 0（battery42:35），所以越界这一档不能只挂在 SETBIT 上。
+     */
+    private static final long MAX_BIT_OFFSET = 1L << 32;
+
+    private static Long parseBitOffset(String text) {
+        Long v = RedisIntegerFormat.parse(text);
+        if (v == null || v.longValue() < 0 || v.longValue() >= MAX_BIT_OFFSET) return null;
+        return v;
+    }
+
+    /**
+     * GETBIT key offset —— 判序是量出来的（battery43 第 4/7 行、battery41 第 7/24 行、
+     * battery42 第 27/28/35 行）：arity → <b>偏移</b> → 类型 → 取值。坏偏移排在 WRONGTYPE 之前
+     * （{@code GETBIT <list 键> abc} 实测回 "bit offset ..." 而不是 WRONGTYPE），而偏移合法的
+     * {@code GETBIT <list 键> 0} 才回 WRONGTYPE；键不在、偏移越出串尾都是 0（{@code GETBIT s40 1000}
+     * 对 13 字节的串实测 :0），因为 Redis 把串尾右边一律当补零。
+     * <p>
+     * 位的编号是<b>字节内从高位数起</b>：{@code SETBIT q43c 40 1} 之后 {@code BITPOS q43c 1}
+     * 实测 :40，{@code GETBIT o41 7} 在整字节置 1 之后实测 :1，{@code GETBIT "hello" 39} 是 1
+     * （末字节 'o'=0x6F 的最低位）。
+     */
+    private Object handleGetbit(String[] args) {
+        if (args.length != 3) return RespError.wrongNumberOfArguments("GETBIT");
+        Long offset = parseBitOffset(args[2]);
+        if (offset == null) return RespError.bitOffsetInvalid();
+        RespError conflict = wrongTypeAfterParse(MemoryStore.DataType.STRING, args[1]);
+        if (conflict != null) return conflict;
+        return RespInteger.of(store.getbitDb(currentDb, args[1], offset.longValue()));
+    }
+
+    /**
+     * SETBIT key offset bit —— 回<b>改之前的那一位</b>；键不在时当场建出来（实测
+     * {@code SETBIT nosuch40 0 1} 之后 {@code EXISTS} 是 1，battery41 第 14/15 行），需要撑长时
+     * 中间补零（{@code SETBIT q43c 40 1} 之后 STRLEN 是 6、BITCOUNT 是 1，battery43 第 27—29 行）。
+     * <p>
+     * 判序：arity → 偏移 → bit → 类型。第三道有实测支撑：{@code SETBIT <list 键> 0 2} 回的是
+     * "bit is not an integer or out of range"，坏 bit 排在 WRONGTYPE 之前（battery43 第 3 行）。
+     * bit 那一栏只收 {@code 0} 和 {@code 1} 两种字面写法：{@code -0}、{@code 01}、{@code +1}
+     * 实测全拒（battery42 第 23/25/26 行）—— 这一档比 Redis 的整数语法还严，语法合不合法都不看，
+     * 按字符串比。
+     */
+    private Object handleSetbit(String[] args) {
+        if (args.length != 4) return RespError.wrongNumberOfArguments("SETBIT");
+        Long offset = parseBitOffset(args[2]);
+        if (offset == null) return RespError.bitOffsetInvalid();
+        if (!"0".equals(args[3]) && !"1".equals(args[3])) return RespError.bitValueInvalid();
+        RespError conflict = wrongTypeAfterParse(MemoryStore.DataType.STRING, args[1]);
+        if (conflict != null) return conflict;
+        return RespInteger.of(store.setbitDb(currentDb, args[1], offset.longValue(), "1".equals(args[3])));
     }
 
     private Object handleSetrange(String[] args) {
