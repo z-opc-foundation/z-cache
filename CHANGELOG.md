@@ -330,15 +330,20 @@ All notable changes to z-cache will be documented in this file.
   失败处就停，它下面那条"多键整条作废"的断言在这一支探针下从来没执行到（`gate_O4.log` 里
   `AssertionFailedError` 计数为 1）。这一支证明了"降级成只作废那一个键"会被看见，
   没证明看见它的是哪一条断言。
-- **反方向这一版没做，而且是量出来的**：stream 键对键空间**仍然不可见**。
+- ~~**反方向这一版没做，而且是量出来的**：stream 键对键空间**仍然不可见**。~~
+  —— **本轮已闭**（见下面《stream 键是键：TYPE / EXISTS / DBSIZE / KEYS / SCAN / RANDOMKEY /
+  RENAME / MOVE / FLUSHDB 共用一把尺》那一节，`battery68` 83 行两侧对拍，实测翻 30 行）。
+  当时那一份读留在这里，是为了记改前的形状从哪量来的：
   `MemoryStore.DataType` 只有 `{NONE, STRING, HASH, LIST, SET, ZSET}`，`typeOfDb` 从不问
   `StreamStore`，`streams()` 只被 stream 自己的 handler 引用 —— 于是 `battery54:41`
   `TYPE t53:ok` 回 `+none`、`:42` `EXISTS` 回 `:0`、`:43` `DBSIZE` 回 `:2`
   （那两枚是 `t53:l` 与 `t53:h`，有条目又有组的 `t53:ok` 一分不占）、`:44` `DEL t53:ok` 回 `:0`
   而 `:45` `XLEN` 仍回 `:1`、`:46` 还能继续 `XADD`。`TYPE` 报 `+none` 而 `XLEN` 报有条目，
   正是"同一个键名两种视图"的另一半。这一半要改的是 `MemoryStore` 的键空间而不是
-  `CommandHandler` 里加一句话，所以单独一票做；`streamTypeConflict` 的文档注释里写明了
-  前提（它问的是"这枚键名被别的类型占着吗"，不是"这是不是 stream"）。
+  `CommandHandler` 里加一句话，所以单独一票做 —— 本轮就是那一票，做的方式正是"让
+  `typeOfDb` 去问第六张表"，然后逐个读者复核。`streamTypeConflict` 的文档注释里写明的
+  前提（它问的是"这枚键名被别的类型占着吗"，不是"这是不是 stream"）仍然成立，
+  闭的是另一头。
 
 #### 错误码不是文本：`-ERR NOGROUP …` 对按码分支的客户端等于"未知错误"
 
@@ -959,6 +964,91 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
 
 
 
+#### stream 键是键：`TYPE` / `EXISTS` / `DBSIZE` / `KEYS` / `SCAN` / `RANDOMKEY` / `RENAME` / `MOVE` / `FLUSHDB` 共用一把尺
+
+- **上游只有一本账**：键空间就是 `c->db` 那一本 dict，stream 只是格子里装的 `type`。
+  `dbsizeCommand` `db.c:808` 答的是 `dictSize(c->db->dict)`；`typeCommand` `:816-839` 是
+  `switch (o->type)`，`OBJ_STREAM` 那一格 `:830` 交 `"stream"`；`renameGenericCommand`
+  `:869-907` 搬的是 robj 指针（`incrRefCount(o)` `:886` → `dbAdd(dst,o)` `:898` →
+  `dbDelete(src)` `:900`，过期时间在 `:887` 取、`:889` 挂到新键名上），
+  **全程没有一个类型分支**；`moveCommand` `:919`
+  同理；`flushdbCommand` `:432-437` 交回 `emptyDb(c->db->id, …)`（`:342`）把整本 dict 丢掉；
+  `randomkey` `:524`（走 `dbRandomKey` `:235`）、`keys` `:536`、`scan` `:802` 三问遍历的
+  也是同一本 dict。所以"stream 键对键空间不可见"在上游是问不出来的问题。
+- **改前我们有两本账**（`battery68` 83 行两侧各跑一遍，`真实不一致=30`、`顺序不同=0`，
+  逐行号与两侧原文见 `b68_diff.log`）：第 `3` 行 `TYPE k68:s` `+none`→`+stream`、
+  第 `4` 行 `EXISTS` `:0`→`:1`、第 `5` 行 `DEL` `:0`→`:1`、第 `7` 行 `XLEN` `:1`→`:0`
+  （`DEL` 说没删掉、`XLEN` 说还有条目 —— 同一枚键名两问两答的那一半）、
+  第 `11` 行 `DBSIZE` `:1`→`:2`、第 `13` 行 `KEYS k68:*` 少一枚、第 `15` 行 `RANDOMKEY`
+  回 `$-1` 而库里明明有流键、第 `83` 行 `SCAN` 只交一枚。
+  第 `20`–`27` 行那一组是"顶牛"最直白的形状：`RENAME k68:s k68:t` 回 `-ERR no such key`，
+  于是 `k68:t` 上一枚键名同时挂着流与 list，`GET` 回 `$-1`、`HGETALL` 回 `*[]`、
+  `LPUSH` 回 `:1` 而 `TYPE` 回 `+list`（流那一半还在，谁都不肯先承认）。
+- **修法只动一把尺**：`MemoryStore.DataType` 加第六型 `STREAM`，`typeOfDb` 现在也去问
+  第六张表（`:220`），而第六张表的主人仍然是 `ServerScope` —— `RedisServer` 把自己那一份
+  `StreamStore` 经 `bindStreams`（`:225`）**注入**给 store，而不是让 store 自己再 `new` 一份
+  （一台服务器的流只能有一个主人）。**没接上注入的那两种用法**（单测直接 `new MemoryStore`、
+  嵌入式自己组装）就维持注入前的形状、对 stream 一律答"没有这一枚键"，
+  而不是凭猜测给一个数 —— 这一半由 java 层用例 `streamTableIsBlindUntilItIsBound` 钉住
+  （它同时要求 `clearOtherTypes` 与 `flushDb` 在没接上的时候**不许**动到那张表）。
+- **逐个读者复核**，一共六处（每一处都单独有一支变异）：`keysDb`（`:784`）、`scan`（`:816`）、
+  `dbsizeDb`（`:873`）、`flushDb`（新增 `s.flushDb(db)`）、`moveKeyToDb` 的 `case STREAM`
+  （`:1015`）、`clearOtherTypes` 的第六路（`:1137`，javadoc 那句"其余五种"连同代码一起改）；
+  `CommandHandler` 这一侧三处：`deleteEveryType` 的第六路（`:636`）、`handleRename` 的
+  `case STREAM`（`:1295`）、`streamTypeConflict` 那道闸现在放行 `STREAM`（`:2451-2456`）。
+- **`RENAME` / `MOVE` 搬的是对象，不是条目快照**：上游 `dbRename` 换的是 dict 里的 value 指针，
+  对象里装着一整条流，所以表顶、消费组、PEL 一起走。测出来的形状（第 `63`–`66` 行）：
+  `XGROUP CREATE` + `XREADGROUP` 之后 `RENAME k68:g k68:gr` 改前回 `-ERR no such key`、
+  改后 `+OK`，紧跟的 `XPENDING k68:gr grp` 改前回 `-NOGROUP No such key`、改后交出那枚
+  未 ACK 的 `2-1`，`XINFO GROUPS` 改前回 `-ERR no such key`、改后 `consumers :1` /
+  `pending :1` / `last-delivered-id 2-1` 三对字段都在。**第 `66` 行是这一格里唯一一条
+  "改后新增的拒绝"**：`XADD k68:gr 2-1 a 9` 改前答 `2-1`（那一句 `RENAME` 根本没成，键名
+  `k68:gr` 上还没有流，`XADD` 是从零起凭空建出一枚新流），
+  改后回 `-ERR The ID specified in XADD is equal or smaller than the target stream top item`
+  —— 表顶跟着搬过来了，2-1 就不再"比表顶大"，这正是上游搬指针该有的后果。
+  `MOVE` 那一组（第 `74`/`77`/`78`/`79`/`80` 行）同理：改前 `:0` 且目标库三问全空，改后 `:1`
+  且目标库 `EXISTS :1` / `TYPE +stream` / `XLEN :1`，源库 `EXISTS` 归 `:0`。
+- **两处洞是我这把新尺自己暴露出来的，不是既有偏差**：① `flushDb` 原本不清第六张表 ——
+  只抬 `DBSIZE` 不抬它就是"清库之后 `DBSIZE` 归零而旧表顶还压着"，`FLUSHDB` 之后
+  `XADD 1-1` 反而吃"ID 太小"（第 `56` 行就是这一问的对照，改前 `XADD k68:f 1-1 a 1` 回
+  ID 太小而改后交出 `1-1`）；② `clearOtherTypes` 的 javadoc 写"其余五种"，漏的正是第六张表。
+  Z8 打 ①、Z7 打 ②（判反之后 `SET` 顶不掉流，一个键名两半并存，`DEL` 只删得掉一半）。
+- **一条量具的自新：第一版 Z6 打在死代码上**。`MemoryStore.randomKey(int)`（原 `:1023`）
+  全仓 **0 读者**（`grep -n randomKey` 实测只有定义那一行），RANDOMKEY 的活路径是
+  `CommandHandler.handleRandomkey` → `store.keysDb`。于是那支探针 `mvn rc=0`、
+  **SURVIVED** —— 而这**不是**"等价变异"，是量具自己骗自己：我拿一支"改了谁都不看"的探针
+  当"这一格有牙"的证据（日志留在 `b68_Z_family.log`，改指向之后是 `b68_Z_family2.log`）。
+  收法是**删掉那个方法**（不替它找读者、也不为它编断言），Z6 重新指向活路径：把随机池
+  换成空表 ⇒ 红在 `expected: <ks:s> but was: <$-1>`。顺带删掉的还有 `handleRandomkey` 里
+  `keysDb` 之外又并一遍 hash/list/set/zset 的**第二次枚举** —— 那四种键因此在随机池里被数
+  两次、抽中概率翻倍，而 string/stream 只算一次；上游 `dbRandomKey`（`db.c:235`）在同一本
+  dict 上取一格，每枚键等权。**这一条没有量具**：抽样是随机的，`ThreadLocalRandom` 没有
+  可注入的接缝，83 行对拍改前改后逐行相同（`battery68.post2` vs `post3`，`真实不一致=0`；
+  改后 jar 的 `CommandHandler.class` md5 `7e09e92b8c4e6c4d7ea2dc18c67c9d83`，
+  本轮改前那一份是 `2f8e8f5867a7277c7a69f8d769e62f5c`）只证明"内容没变"，
+  证明不了"权重回到等权"。记在**未覆盖**里。Z5 的锚点注释也跟着作废了一半（它当初带上
+  下一行是为了躲 `randomKey` 里逐字相同的那一句），锚点仍然唯一、仍然红，理由换掉了。
+- **已知不一致，钉现状而不是钉成合格**：TTL 一族还不会问第六张表。上游
+  `expireGenericCommand`（`expire.c:415-451`）唯一的存在性闸是 `:426` 的 `lookupKeyWrite`，
+  **没有类型分支** —— 所以 `EXPIRE` 打在流键（以及一切集合键）上回 `:1` 并真的挂上过期，
+  我们回 `:0`。用例末尾把 `TTL :-2` / `EXPIRE :0` / `PERSIST :0` 三行按现状钉住，
+  并拿一枚 **list 键**做对照（同一句在 list 上也回 `:0`），证明它是集合族共有的旧缺口、
+  不是 stream 这一支新引进的回归。
+- **取证一处，错在我这侧**：`RENAME` 之后 `XACK` 清空 PEL 那一问，我先按"第 4 项是空数组"
+  写期望，读了 `t_stream.c:2056-2062` 才改对 —— 上游交的是 `nullbulk`/`nullbulk`/
+  `nullmultibulk`，线上形状是 `[:0, $-1, $-1, *-1]`。实现本来就对，改的是断言。
+- **自证**：`code_mut.py` 的 Z 族 15 支（Z1-Z15）**15/15 KILLED**，十五次还原逐字节对账
+  （CH `bde83a2252efb01f73d8fa7ed8703e93`、SS `832816457d9567fa19f324193174709d`、
+  MS `35bb2d879b816b74607d3ad7af9a2ec7`、RS `13ae0ecda5a537be2f3305d24c2c6fd6`）。
+  红句互不相同：Z3 `expected: <:6> but was: <:5>`、Z14 "源键整个没了，不是留了一份副本"、
+  Z15 "源库里已经没有"、Z13 `expected: <+stream> but was: <+none>`。Z10 是唯一一支选取器
+  只点协议层（`bindStreams(this.scope.streamStore())` → `bindStreams(null)`）—— 它量的就是
+  接线本身，摘掉之后协议层全塌而 java 层照旧绿，所以那一支**不该**带 java 层的用例。
+  量具到 **110 支探针 / 111 个锚点**（Z 族 15 支是这一轮加的，之前 95 支），
+  TARGETS 新增两本文件：`MemoryStore.java`、`RedisServer.java`。
+
+
+
 ### Added
 - `RedisServer.serverScope()`：只读拿到本台那一份，测试与嵌入式据此判断作用域边界。
 - `StreamIdFormat`（z-cache-common）：stream ID 的唯一文法（uint64 两段、`-` / `+` 两种位置、
@@ -1287,12 +1377,63 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   `xinfo -2`、`xdel -3`、`xtrim -2`，而 **xautoclaim 不在表里**。
 - 全量反应堆：**883 例全绿，连跑两遍**（`358 + 389 + 134 + 2`，core 从 388 抬到 389 =
   本轮那一条新用例；`b67_full1.log` / `b67_full2.log` 尾都是 `BUILD SUCCESS`）。
+- `MemoryStore` 从此认识第六种键：`DataType.STREAM`、`typeOfDb` 会问 `StreamStore`
+  （`:220`），`bindStreams` / `hasStreams`（`:229`）/ `streamKeys`（`:235`）三个新缺口，
+  `keysDb` / `scan` / `dbsizeDb` / `flushDb` / `moveKeyToDb` / `clearOtherTypes` 六处读者
+  一起跟上。**注入是可选的**：没接上注入的 `MemoryStore` 对 stream 一律答"没有这一枚键"，
+  而不是猜一个数。
+- `StreamStore` 添三个键空间用的门面：`keySet(db)`（只读视图，供 `KEYS`/`DBSIZE`/`SCAN` 数）、
+  `rename(db, src, dst)`、`moveTo(fromDb, toDb, key)` —— 后两支搬的都是 `Stream` 对象本身，
+  所以表顶、消费组、PEL 跟着走。`RedisServer` 在构造里把 `ServerScope` 那一份流表注入
+  `store`（构造点全仓唯一：`grep -rn "ServerScope(" --include='*.java' .` 实测只有
+  `RedisServer.java:110-111` 那一处，写的是全限定名 `new com.zifang.z.cache.core.command.ServerScope(…)`
+  —— 拿 `new ServerScope` 这四个字去 grep 是 0 命中，别据此以为我编了）。
+- `CommandHandler`：`deleteEveryType` 的第六路、`handleRename` 的 `case STREAM`、
+  `streamTypeConflict` 放行 `STREAM`；`handleRandomkey` 不再在 `keysDb` 之外自己并一遍
+  另外四张表。
+- `RedisServerProtocolSemanticsTest.streamsAreOrdinaryKeysForKeyspaceCommands`（该类第 45 例）：
+  六张表各摆一枚后 `DBSIZE :6`、六种 `TYPE` 与 `EXISTS` 逐一对号、`KEYS kt:*` 与
+  `SCAN 0 COUNT 100` 各交出六枚、`DEL` 六枚回 `:6` 之后 `DBSIZE :0`；再钉 `RANDOMKEY`
+  抽得到流键、`SET` 顶掉流键之后 `DBSIZE` 只算一格、`RENAME` 带着消费组与 PEL 一起走
+  （`XINFO GROUPS` / `XPENDING` / `XACK` 三问都落在新键名上）、`MOVE` 之后两边各问一遍、
+  `FLUSHDB` 之后 `DBSIZE` / `KEYS` / `TYPE` 归零而 `XADD` 能从 `1-1` 重写，末尾一段是
+  TTL 那三行的**现状钉桩**（含一枚 list 键的对照）。
+- `MemoryStoreTest.streamTableIsBlindUntilItIsBound`（该类第 40 例）：注入前的形状
+  （`NONE` / `dbsizeDb 0` / `keysDb` 空，且 `clearOtherTypes` 与 `flushDb` 都不许动那张表）
+  与注入后的形状（`STREAM` / `dbsizeDb 1` / `keysDb` 点名）各钉一遍，`bindStreams(null)`
+  再退回前者。
+- 量具：`code_mut.py` 新增 Z 族 15 支（键空间的每一个读者一支，另有 Z10 单打"接线"），
+  到 110 支探针 / 111 个锚点；`battery68.txt` 从 39 行扩到 83 行，两侧对拍
+  `真实不一致=30`、`顺序不同=0`。
+- 全量反应堆：整个增量期间**跑过 9 遍**（`358 + 391 + 134 + 2 = 885`，core 从 389 抬到 391 =
+  本轮两条新用例）。**7 遍全绿**（`logs/b68_full1/2/3/5/6/7/9.log`），**2 遍红**
+  （`b68_full4.log`、`b68_full8.log`）。分账要分清：`1`、`2` 两遍是改注释之前的同一棵代码树，
+  `3` 之后所有判据字节就定了，最后那四处行号注释改完之后又跑了 `5/6/7/8/9` 五遍
+  —— **提交字节被量过 5 遍：4 绿 1 红**。两遍红是**同一个既有抖动**、都与本轮改动无关：
+  `RedisServerLifecycleTest` 的
+  `startAndWait:765` 抛 `IllegalStateException: server thread died before listening on
+  <port>` + `BindException: Address already in use`，而红的用例两遍不同（第 4 遍
+  `saveWithoutDataDirFailsHonestly:478`、第 8 遍 `blpopPopsOnlyRequestedKeyWithoutFreezingPeers:123`）。
+  取证：`lsof -nP -iTCP:64088` 在红过之后显示那枚端口挂在 `verge-mih` 的一条 `FIN_WAIT_2`
+  **出站**连接上 —— `freePort()` 的写法是"bind(0) 探一个端口、关掉、再交给服务器去 bind"，
+  中间那道空隙里操作系统会把同一个号码派给一条新的出站连接（本机常驻代理，出站端口消耗快）。
+  9 遍里中 2 遍 ≈ 两成（按"提交字节那 5 遍"算是 1/5），**这一条另立一票修**（测试侧，四个类里各有一份逐字相同的
+  `freePort()`），不许读成"本轮改坏了"。上一条 `883` 的读数是上一轮那棵树的，留着记账。
+- 变异自证与提交树的字节对账：Z 族那 15 支跑完之后，四本 TARGET 又各量一次 md5，与快照
+  逐字相同（CH `bde83a2252efb01f73d8fa7ed8703e93`、MS `35bb2d879b816b74607d3ad7af9a2ec7`、
+  SS `832816457d9567fa19f324193174709d`、RS `13ae0ecda5a537be2f3305d24c2c6fd6`），
+  且跑完全量再量一次仍是这四个值 —— 也就是"红过的那 15 支，打的就是要提交的这一版字节"。
+  两支测试文件在 Z 族之后只改过四处**注释/断言消息里的行号**（`第 41→46 行`、
+  `第 51→56 行`、`db.c:831→830` 两处），判据一条没动。
 
 ### 已知边界（这一版没动，说清楚）
 - RESP3 / `HELLO`、`EVAL` / `EVALSHA` / `SCRIPT` 依旧没有服务端实现，客户端 `DistributedLock`
   因此仍走"GET 校验后 DEL"的非原子路径。
-- Stream 不参与 RDB/AOF；只有 String 键的 TTL 进快照（集合键连 `EXPIRE` 都还不支持，
-  所以 `RENAME` 也只搬得动 String 的 TTL）。
+- Stream 不参与 RDB/AOF；只有 String 键的 TTL 进快照。**集合键（含 stream）连 `EXPIRE`
+  都还不支持** —— 上游那一问 `expireGenericCommand`（`expire.c:415-451`）只有 `:426`
+  的 `lookupKeyWrite` 一道闸、没有类型分支，所以它回 `:1` 并真的挂上过期，我们回 `:0`；
+  因此 `RENAME` 至今只搬得动 String 的 TTL（**流对象本身现在搬得动了**：表顶、消费组、
+  PEL 跟着指针走，见上面《stream 键是键》那一节，缺的只有 TTL 这一栏）。
 - Stream 这一族的**文法**、**XADD 的单调性**、**XREAD / XREADGROUP 的位置语义**、
   **取键那一问的类型闸门**、**错误码与 XREADGROUP 的 NOGROUP 那一问**这一版都收了。
   剩下的读侧边界全在**答复层**（文案与形状），下面每一条都标清依据档次：
@@ -1312,11 +1453,18 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
     那句"上游同样是"我也没读过源码。读了 :1967-1980 的结论正相反：
     `No key or group? Nothing to ack`，键或组不在都回 `:0`，所以我们的 `:0` 本来就对
     （`battery54:23`、`:35`，这一版 `battery56:14` 再量一次仍是 `:0`）。
-  - **键空间看不见 stream（本机现状实测，`battery54:41-46`）**：`TYPE t53:ok` 回 `+none`、
+  - ~~**键空间看不见 stream（本机现状实测，`battery54:41-46`）**：`TYPE t53:ok` 回 `+none`、
     `EXISTS` 回 `:0`、`DBSIZE` 回 `:2`（那两枚是 `t53:l`/`t53:h`）、`DEL t53:ok` 回 `:0`
-    而 `XLEN` 仍回 `:1` 且还能继续 `XADD`（"同一个键名两种视图"的另一半）。这一条要单独收口，
-    而且它与下面那条键空间记账是同一个改动面（`MemoryStore` 得先认识 stream 这一型，
-    `TYPE` / `EXISTS` / `DEL` / `DBSIZE` / `RENAME` 才谈得上把它们算进去）。
+    而 `XLEN` 仍回 `:1` 且还能继续 `XADD`（"同一个键名两种视图"的另一半）。~~
+    —— **本轮已闭**（见上面《stream 键是键》那一节：`battery68` 83 行两侧对拍，实测翻 30 行，
+    Z 族 15 支全 KILLED）。`battery54:41-46` 那一份读数留在原处，是为了记改前的形状从哪量来的。
+    **闭的只是"看得见"**，两个后继缺口各自还开着：① **TTL 一族仍不问第六张表**
+    （`expire.c:426` 只有一道 `lookupKeyWrite`、无类型分支 ⇒ 上游 `EXPIRE` 在流键上回 `:1`，
+    我们回 `:0`；这一条与上面集合键那条同源，用例末尾按现状钉桩并带一枚 list 键对照）；
+    ② **`RANDOMKEY` 的抽样权重没有量具**（本轮删掉了 `handleRandomkey` 里 `keysDb` 之外的
+    第二次枚举，那四种键原先在随机池里被数两次、抽中概率翻倍；抽样是随机的、
+    `ThreadLocalRandom` 无可注入接缝，83 行对拍对"权重"结构上无感 —— 见上面那一节的
+    "未覆盖"一段）。
   - **答复层剩余项（本机现状已逐条实测：`battery55` 46 行 / `battery56` 15 行，
     改前改后各一份；下面每行左边是我们答的原文，右边是上游行号）**：
     - ~~`XRANGE t55:ok - + COUNT 0` 与 `XREVRANGE … COUNT 0` 交出整表~~ —— **本轮已闭**
@@ -1351,8 +1499,10 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
       `code_mut.py S4` 打的就是那一问）。**MKSTREAM 的判据面补了一层间接证据**：
       `CREATE <不在的键> g 0-0 MKSTREAM` 回 `+OK` 之后，同组再 `CREATE` 必须回 `-BUSYGROUP`
       —— 组挂在这枚流上，说明流对象确实建出来了（`RedisServerProtocolSemanticsTest.java:3095-3098`）。
-      但"键空间看不见 stream"那一条仍在（下面单独一条）：`XLEN` 那一格区分不了空流与无键
-      （`battery59:10 :11 :12` 三格全是 `:0`），`TYPE` / `EXISTS` / `DBSIZE` / `DEL` 也照旧。
+      当年跟着这一句一起记的"键空间看不见 stream（`TYPE` / `EXISTS` / `DBSIZE` / `DEL` 照旧）"
+      **本轮已经闭上**（见上面《stream 键是键》那一节），剩下的只有 `XLEN` 这一问的取证限制：
+      它区分不了空流与无键（`battery59:10 :11 :12` 三格全是 `:0`），所以"MKSTREAM 建出了流对象"
+      这一问仍只能靠 `-BUSYGROUP` 那条间接证据，不能靠 `XLEN`。
     - 选项句四类**本轮已闭**（见上面《XREAD / XREADGROUP 的选项那一圈》，`battery64` 24 行实测
       翻 12 行）：`Unbalanced XREAD list of streams: …`（:1445-1449）、
       `Missing GROUP option for XREADGROUP`（:1481-1486）、

@@ -34,7 +34,7 @@ public class MemoryStore {
 
     /** 数据类型标识 */
     public enum DataType {
-        NONE, STRING, HASH, LIST, SET, ZSET
+        NONE, STRING, HASH, LIST, SET, ZSET, STREAM
     }
 
     // ==================== 多数据库支持 ====================
@@ -56,6 +56,16 @@ public class MemoryStore {
 
     /** 每个数据库的 SortedSet 存储 */
     private final SortedSetStore[] sortedSetStores;
+
+    /**
+     * Stream 那一族的存储：<b>由外部注入，可以为 null</b>。
+     * <p>
+     * 它不是本类自己 new 出来的第六张表 —— {@code StreamStore} 是"一台服务器一份"
+     * （{@code ServerScope}），而 {@code MemoryStore} 可以被拆开单用（单测、嵌入式）。
+     * 没接上时下面那一整套判据对 stream 一律"看不见"，行为退回注入之前的形状，
+     * 而不是退回一个更糟的猜测。
+     */
+    private volatile com.zifang.z.cache.core.stream.StreamStore streams;
 
     /** 键类型映射: key -> DataType (每个 DB 独立) */
     @SuppressWarnings("unchecked")
@@ -180,11 +190,16 @@ public class MemoryStore {
     }
 
     /**
-     * 这个键当前真正是哪一种类型 —— 以五个 store 里有没有它为准。
+     * 这个键当前真正是哪一种类型 —— 以六个 store 里有没有它为准。
      * <p>
      * 不读 {@code keyTypeMaps}：那张表只有 String 写入路径（{@code setKeyType}）维护过，
      * 集合类型从来没登记，所以它对"这是个 hash"永远说 NONE。EXISTS / TYPE / 类型闸门
      * 现在共用这一把尺，三者不可能再互相打脸。
+     * <p>
+     * stream 排在这一串的最后，是因为它不在本类的构造里（见 {@link #bindStreams}）：
+     * 前面五张表命中时压根不该去问它。反过来说，接上之后它就成了第六种能被这把尺答出来的
+     * 类型 —— 所有拿这把尺当判据的地方（TYPE / EXISTS / RENAME / MOVE / 中央类型闸门 /
+     * DBSIZE）从此都看得见 stream 键，这是"stream 键是键"这一格的落点。
      */
     public DataType typeOfDb(int db, String key) {
         if (key == null) {
@@ -202,7 +217,24 @@ public class MemoryStore {
         if (listStores[db].exists(key)) return DataType.LIST;
         if (setStores[db].exists(key)) return DataType.SET;
         if (sortedSetStores[db].exists(key)) return DataType.ZSET;
+        if (hasStreams(db, key)) return DataType.STREAM;
         return DataType.NONE;
+    }
+
+    /** 接上 stream 那一族；传 null 等于不接（本类对 stream 一律回答"没有这个键"）。 */
+    public void bindStreams(com.zifang.z.cache.core.stream.StreamStore streamStore) {
+        this.streams = streamStore;
+    }
+
+    private boolean hasStreams(int db, String key) {
+        com.zifang.z.cache.core.stream.StreamStore s = streams;
+        return s != null && s.exists(db, key);
+    }
+
+    /** stream 键的键名集合；没接 stream 存储就是空集（不是 null）。 */
+    private Set<String> streamKeys(int db) {
+        com.zifang.z.cache.core.stream.StreamStore s = streams;
+        return s == null ? java.util.Collections.<String>emptySet() : s.keySet(db);
     }
 
     // ==================== String 操作 (保持向后兼容) ====================
@@ -749,6 +781,11 @@ public class MemoryStore {
                 result.add(zk);
             }
         }
+        for (String tk : streamKeys(db)) {
+            if (tk.matches(regex)) {
+                result.add(tk);
+            }
+        }
         return result;
     }
 
@@ -776,6 +813,7 @@ public class MemoryStore {
         allKeys.addAll(listStores[db].keys());
         allKeys.addAll(setStores[db].keys());
         allKeys.addAll(sortedSetStores[db].keys());
+        allKeys.addAll(streamKeys(db));
 
         String regex = pattern == null ? null : globToRegex(pattern);
         List<String> sorted = new ArrayList<>(allKeys);
@@ -832,6 +870,7 @@ public class MemoryStore {
         count += listStores[db].dbsize();
         count += setStores[db].dbsize();
         count += sortedSetStores[db].dbsize();
+        count += streamKeys(db).size();
         return count;
     }
 
@@ -850,6 +889,12 @@ public class MemoryStore {
         setStores[db].flush();
         sortedSetStores[db].flush();
         keyTypeMaps[db].clear();
+        // stream 表也在这一问的范围里：DBSIZE / KEYS 现在数得到 stream 键，
+        // 那么 FLUSHDB 之后这两个必须归零，否则同一把尺在两句里给出两个数。
+        com.zifang.z.cache.core.stream.StreamStore s = streams;
+        if (s != null) {
+            s.flushDb(db);
+        }
     }
 
     public void flushAll() {
@@ -963,24 +1008,15 @@ public class MemoryStore {
                 }
                 return true;
             }
+            case STREAM: {
+                // 挪的是 Stream 对象本身（表顶、消费组、PEL 一起走），不是条目快照 ——
+                // 上游 moveKey 换的是 dict 里的 value 指针，没有"照条目重建一遍"这一说。
+                com.zifang.z.cache.core.stream.StreamStore s = streams;
+                return s != null && s.moveTo(fromDb, toDb, key);
+            }
             default:
                 return false;
         }
-    }
-
-    // ==================== RANDOMKEY ====================
-    public String randomKey(int db) {
-        // 从所有 store 中随机选择一个 key
-        List<String> allKeys = new ArrayList<>();
-        allKeys.addAll(stringStores[db].keySet());
-        allKeys.addAll(hashStores[db].keys());
-        allKeys.addAll(listStores[db].keys());
-        allKeys.addAll(setStores[db].keys());
-        allKeys.addAll(sortedSetStores[db].keys());
-        if (allKeys.isEmpty()) {
-            return null;
-        }
-        return allKeys.get(random.nextInt(allKeys.size()));
     }
 
     // ==================== 事务版本号 ====================
@@ -1052,10 +1088,10 @@ public class MemoryStore {
     }
 
     /**
-     * 保留 {@code keep} 那一种，把键名上其余四种清干净。
+     * 保留 {@code keep} 那一种，把键名上其余五种清干净。
      * <p>
      * {@code ZUNIONSTORE}/{@code ZINTERSTORE} 覆盖目标键要的就是这一把：Redis 在那里走
-     * {@code dbOverwrite}，先把旧值整个换成新 zset，所以目标键原本挂着 string/hash/list/set
+     * {@code dbOverwrite}，先把旧值整个换成新 zset，所以目标键原本挂着 string/hash/list/set/stream
      * 都不报 WRONGTYPE（实测 {@code SET d x; ZUNIONSTORE d 1 k 1 => 1} 且 {@code TYPE d => zset}）。
      * 目标键同时又是源键是这条命令的合法写法，因此调用方必须先读完源再清 —— 见
      * {@code SortedSetStore.aggregateStore}。
@@ -1078,6 +1114,12 @@ public class MemoryStore {
         }
         if (keep != DataType.ZSET) {
             sortedSetStores[db].del(key);
+        }
+        // 上游的 dbOverwrite 换的是 dict 里那个 value 指针：旧对象不管是什么类型都整个没掉。
+        // 这一条对 stream 同样是"顶掉"，不是"并存" —— 少了这一行，SET 一个 stream 键会留下
+        // 一个 TYPE 报 string、XLEN 报 WRONGTYPE、DEL 只删得掉一半的键名。
+        if (keep != DataType.STREAM && streams != null) {
+            streams.remove(db, key);
         }
     }
 

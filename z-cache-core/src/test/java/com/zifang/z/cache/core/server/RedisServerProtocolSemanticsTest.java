@@ -3917,6 +3917,223 @@ class RedisServerProtocolSemanticsTest {
         }
     }
 
+    /**
+     * stream 键是键 —— 键空间那一层十问从此把第六张表一起算进来。
+     * <p>
+     * 上游没有"stream 自己的一份键表"这种东西：一个 db 就一本 dict，这些命令全在那本 dict 上
+     * 做，除 {@code TYPE} 之外没有一处按类型分支（5.0.14 行号）——
+     * {@code dbsizeCommand} {@code db.c:808} 就一句 {@code dictSize(c->db->dict)}；
+     * {@code typeCommand} {@code db.c:816-839} 是一个 {@code switch(o->type)}，
+     * {@code OBJ_STREAM} 那一支写着 {@code "stream"}（:830）；
+     * {@code renameGenericCommand} {@code db.c:869-907} 搬的是 robj 指针
+     * （{@code incrRefCount(o)} → {@code dbAdd(dst,o)} → {@code dbDelete(src)}），
+     * 压根不知道搬的是哪种类型；{@code moveCommand} {@code db.c:919} 同样只问
+     * {@code lookupKeyWrite}；{@code flushdbCommand} {@code db.c:432-437} 交回
+     * {@code emptyDb(c->db->id, …)} 把整本 dict 丢掉。
+     * <p>
+     * 我们这一侧流住在 {@code ServerScope} 的第六张表里，而键空间用的那把尺
+     * （{@code MemoryStore.typeOfDb}）只翻前五张表，于是实测到的形状是
+     * "同一枚键名，两问两答"（battery68 两侧各 83 行，30 处真实不一致，全在这一格）：
+     * {@code TYPE} 回 {@code +none} 而 {@code XLEN} 回 {@code :1}；{@code DEL} 回 {@code :0}
+     * 而东西照旧在（第 5/7 行）；{@code SET} 顶掉流键之后 {@code DEL} 只删得掉 string 那半份，
+     * 剩下那半份 {@code XLEN} 还能数出旧条目（第 46 行）；{@code RENAME}/{@code MOVE}
+     * 回 {@code -ERR no such key}；{@code FLUSHDB} 之后旧表顶还在（第 56 行）。
+     * <p>
+     * 修法只动一把尺：{@code typeOfDb} 现在也问第六张表，凡是拿它当判据的地方一起跟上。
+     * 所以这一支的断言面不是"stream 命令能跑了"（那是 {@link
+     * #streamFamilyHoldsTheSameOneTypeInvariant()} 那一支），而是<b>不相干的那十问
+     * 现在必须把流键当一枚普通键</b>。
+     */
+    @Test
+    void streamsAreOrdinaryKeysForKeyspaceCommands() throws Exception {
+        int port = freePort();
+        RedisServer server = new RedisServer("127.0.0.1", port, 0);
+        Thread thread = startAndWait(server, port);
+        try (Socket socket = connect(port)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+
+            // ---- 一把尺的自证：六张表各摆一枚，十问给出的个数必须彼此咬合 ----
+            send(socket, "SET", "kt:string", "v");
+            assertEquals("+OK", readReply(in));
+            send(socket, "HSET", "kt:hash", "f", "v");
+            assertEquals(":1", readReply(in));
+            send(socket, "RPUSH", "kt:list", "x");
+            assertEquals(":1", readReply(in));
+            send(socket, "SADD", "kt:set", "x");
+            assertEquals(":1", readReply(in));
+            send(socket, "ZADD", "kt:zset", "1", "x");
+            assertEquals(":1", readReply(in));
+            send(socket, "XADD", "kt:stream", "1-1", "a", "1");
+            assertEquals("1-1", readReply(in));
+
+            send(socket, "DBSIZE");
+            assertEquals(":6", readReply(in), "少的那一枚一定是漏看了某张表；改之前这里是 :5");
+            for (String typeName : new String[]{"string", "hash", "list", "set", "zset", "stream"}) {
+                send(socket, "TYPE", "kt:" + typeName);
+                assertEquals("+" + typeName, readReply(in));
+                send(socket, "EXISTS", "kt:" + typeName);
+                assertEquals(":1", readReply(in), typeName + " 键不能只在 TYPE 那一问里存在");
+            }
+            // KEYS 的次序是按表走的（五张表走完才轮到 stream 表），SCAN 自己排过序。
+            // 钉这两串的次序不是上游承诺（dict 迭代序两边都不承诺），钉的是"流键不再被漏掉"。
+            send(socket, "KEYS", "kt:*");
+            assertEquals("[kt:string, kt:hash, kt:list, kt:set, kt:zset, kt:stream]", readReplyDeep(in));
+            send(socket, "SCAN", "0", "COUNT", "100");
+            assertEquals("[0, [kt:hash, kt:list, kt:set, kt:stream, kt:string, kt:zset]]", readReplyDeep(in));
+            // 六枚一起 DEL：改之前这一句只回 :5，流那枚既删不掉也不算数
+            send(socket, "DEL", "kt:string", "kt:hash", "kt:list", "kt:set", "kt:zset", "kt:stream");
+            assertEquals(":6", readReply(in));
+            send(socket, "DBSIZE");
+            assertEquals(":0", readReply(in), "一句都不剩");
+
+            // ---- EXISTS / DEL / 表顶：删掉的是整枚对象，不是"把条目清空" ----
+            send(socket, "XADD", "ks:s", "1-1", "a", "1");
+            assertEquals("1-1", readReply(in));
+            send(socket, "TYPE", "ks:s");
+            assertEquals("+stream", readReply(in), "db.c:830 那一支");
+            send(socket, "EXISTS", "ks:s");
+            assertEquals(":1", readReply(in));
+            send(socket, "DEL", "ks:s");
+            assertEquals(":1", readReply(in), "DEL 说没删掉而 XLEN 说还有一条，是修之前的形状");
+            send(socket, "EXISTS", "ks:s");
+            assertEquals(":0", readReply(in));
+            send(socket, "TYPE", "ks:s");
+            assertEquals("+none", readReply(in));
+            send(socket, "XLEN", "ks:s");
+            assertEquals(":0", readReply(in));
+            // 表顶跟着对象一起没了，所以 1-1 又能写进去。这一问只能排在 DEL 之后：
+            // 上面那一串已经让 ks:s 空过一轮，改成断言"清空"也照样绿。
+            send(socket, "XADD", "ks:s", "1-1", "b", "2");
+            assertEquals("1-1", readReply(in), "只清空不删对象的话，这一句会吃 ID 太小");
+
+            // ---- RANDOMKEY：库里只剩流键时它必须被选中（改之前这一问回 nil） ----
+            send(socket, "RANDOMKEY");
+            assertEquals("ks:s", readReply(in));
+
+            // ---- 中央类型闸门：别的族往流键上伸手，三问都得说 WRONGTYPE ----
+            // 改之前这三问是这一格里最坏的一段：GET 回 nil（客户端读成"键不存在"）、
+            // HGETALL 回空数组，而 LPUSH 干脆<b>办成了</b> —— 它看见 typeOfDb 说 NONE 就当新键建，
+            // 于是一枚键名下同时挂着流和 list（battery68 第 24/25/26 行）。
+            expectWrongType(socket, in, "GET", "ks:s");
+            expectWrongType(socket, in, "HGETALL", "ks:s");
+            expectWrongType(socket, in, "LPUSH", "ks:s", "x");
+            send(socket, "TYPE", "ks:s");
+            assertEquals("+stream", readReply(in), "拦下来不等于换掉了类型");
+            send(socket, "DBSIZE");
+            assertEquals(":1", readReply(in), "三问一起拒掉，也没有多开一格");
+
+            // ---- 一个键名只有一种类型：SET 顶掉流键，就得把流一起带走 ----
+            send(socket, "XADD", "ks:m", "1-1", "a", "1");
+            assertEquals("1-1", readReply(in));
+            send(socket, "SET", "ks:m", "hello");
+            assertEquals("+OK", readReply(in));
+            send(socket, "TYPE", "ks:m");
+            assertEquals("+string", readReply(in));
+            send(socket, "XLEN", "ks:m");
+            assertTrue(readReply(in).startsWith("-WRONGTYPE"), "旧的半份流不许还能数得出条目");
+            send(socket, "GET", "ks:m");
+            assertEquals("hello", readReply(in));
+            send(socket, "DBSIZE");
+            assertEquals(":2", readReply(in), "一个键名只占一格；改之前这里是 :3（两半各算一次）");
+            send(socket, "DEL", "ks:m");
+            assertEquals(":1", readReply(in));
+            send(socket, "EXISTS", "ks:m");
+            assertEquals(":0", readReply(in));
+            send(socket, "XLEN", "ks:m");
+            assertEquals(":0", readReply(in), "battery68 第 46 行：改之前这里回 :1，DEL 只删得掉 string 那半份");
+
+            // ---- RENAME 搬的是整条流：消费组、PEL、表顶一起走 ----
+            send(socket, "XADD", "ks:g", "1-1", "a", "0");
+            assertEquals("1-1", readReply(in));
+            send(socket, "XGROUP", "CREATE", "ks:g", "grp", "1-1");
+            assertEquals("+OK", readReply(in));
+            send(socket, "XADD", "ks:g", "2-1", "a", "1");
+            assertEquals("2-1", readReply(in));
+            send(socket, "XREADGROUP", "GROUP", "grp", "c1", "COUNT", "1", "STREAMS", "ks:g", ">");
+            assertEquals("[[ks:g, [[2-1, [a, 1]]]]]", readReplyDeep(in));
+            send(socket, "RENAME", "ks:g", "ks:gr");
+            assertEquals("+OK", readReply(in), "改之前这里是 -ERR no such key");
+            send(socket, "TYPE", "ks:gr");
+            assertEquals("+stream", readReply(in));
+            send(socket, "XLEN", "ks:gr");
+            assertEquals(":2", readReply(in));
+            send(socket, "XLEN", "ks:g");
+            assertEquals(":0", readReply(in), "源键整个没了，不是留了一份副本");
+            // 组跟着走：last-delivered 还停在 2-1，PEL 里那条仍压在 c1 手上。
+            // 汇总那四格与上游逐格对得上（t_stream.c:2056-2090）：个数是整数、
+            // 每个消费者那一格是 addReplyBulkLongLong（:2085）而不是整数 —— 所以是 "1" 不是 :1。
+            send(socket, "XINFO", "GROUPS", "ks:gr");
+            assertEquals("[[name, grp, consumers, :1, pending, :1, last-delivered-id, 2-1]]", readReplyDeep(in));
+            send(socket, "XPENDING", "ks:gr", "grp");
+            assertEquals("[:1, 2-1, 2-1, [[c1, 1]]]", readReplyDeep(in));
+            send(socket, "XACK", "ks:gr", "grp", "2-1");
+            assertEquals(":1", readReply(in), "确认的是搬过来那个组手上的条目");
+            // 清空后那三格上游交的是三个 nil（:2060-2062：nullbulk、nullbulk、nullmultibulk），
+            // 不是空串也不是空数组 —— 这一串钉的是"确认完 PEL 真的空了"，形状顺带对上了上游。
+            send(socket, "XPENDING", "ks:gr", "grp");
+            assertEquals("[:0, $-1, $-1, *-1]", readReplyDeep(in));
+            // 旧键名重新可用，而且不再记得旧表顶 —— 这是"搬走"而不是"复制"的另一面
+            send(socket, "XADD", "ks:g", "1-1", "z", "9");
+            assertEquals("1-1", readReply(in));
+            send(socket, "XPENDING", "ks:g", "grp");
+            assertTrue(readReply(in).startsWith("-NOGROUP"), "组也没有留在旧名上被接着用");
+
+            // ---- MOVE：跨库也是搬对象，源库那本表当场清账 ----
+            send(socket, "FLUSHDB");
+            assertEquals("+OK", readReply(in));
+            send(socket, "XADD", "ks:mv", "1-1", "a", "1");
+            assertEquals("1-1", readReply(in));
+            send(socket, "MOVE", "ks:mv", "1");
+            assertEquals(":1", readReply(in), "改之前这里是 :0，而键也确实没搬");
+            send(socket, "EXISTS", "ks:mv");
+            assertEquals(":0", readReply(in), "源库里已经没有");
+            send(socket, "SELECT", "1");
+            assertEquals("+OK", readReply(in));
+            send(socket, "TYPE", "ks:mv");
+            assertEquals("+stream", readReply(in));
+            send(socket, "XLEN", "ks:mv");
+            assertEquals(":1", readReply(in));
+            send(socket, "DBSIZE");
+            assertEquals(":1", readReply(in));
+            send(socket, "SELECT", "0");
+            assertEquals("+OK", readReply(in));
+
+            // ---- FLUSHDB 之后四问一起归零，旧表顶不再压着新写入 ----
+            send(socket, "XADD", "ks:mv", "9-9", "a", "1");
+            assertEquals("9-9", readReply(in), "回到 0 库，同名键是一枚新的空流");
+            send(socket, "FLUSHDB");
+            assertEquals("+OK", readReply(in));
+            send(socket, "DBSIZE");
+            assertEquals(":0", readReply(in));
+            send(socket, "KEYS", "*");
+            assertEquals("[]", readReplyDeep(in));
+            send(socket, "TYPE", "ks:mv");
+            assertEquals("+none", readReply(in));
+            send(socket, "XADD", "ks:mv", "1-1", "a", "1");
+            assertEquals("1-1", readReply(in), "battery68 第 56 行：改之前这里吃 ID 太小，9-9 那个表顶没人清");
+
+            // ---- 已知边界，钉现状而不是钉成合格：TTL 一族还不会问第六张表 ----
+            // expire.c:426 那一问只有 lookupKeyWrite、没有类型分支，所以上游 EXPIRE 在流键上
+            // 回 1 并真的挂上过期；我们回 0。同一句在 list 键上也回 0（下面两行是对照），
+            // 所以这是五种集合键共同的 TTL 缺口，不是这一格新开的洞，也不在这一格里修。
+            send(socket, "TTL", "ks:mv");
+            assertEquals(":-2", readReply(in), "这一问上游也是 -2：没有过期时间");
+            send(socket, "EXPIRE", "ks:mv", "100");
+            assertEquals(":0", readReply(in), "已知不一致：上游回 :1");
+            send(socket, "PERSIST", "ks:mv");
+            assertEquals(":0", readReply(in));
+            send(socket, "RPUSH", "ks:list", "x");
+            assertEquals(":1", readReply(in));
+            send(socket, "EXPIRE", "ks:list", "100");
+            assertEquals(":0", readReply(in), "对照：同一格缺口在 list 键上，与 stream 无关");
+            send(socket, "DBSIZE");
+            assertEquals(":2", readReply(in), "EXPIRE 回 0 之后两枚键都还在：没有半途挂上过期又答复失败");
+        } finally {
+            server.stop();
+            thread.join(DEADLINE_MS);
+        }
+    }
+
     /** 只解析测试用到的一层 RESP 形状：+/-/: 单行，$ bulk 按声明长度读满。 */
     private static String readReply(DataInputStream in) throws IOException {
         String line = readLine(in);

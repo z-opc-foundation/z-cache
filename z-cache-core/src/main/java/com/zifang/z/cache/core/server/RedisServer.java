@@ -109,6 +109,11 @@ public class RedisServer {
         scopeSlowLog.setSlowLogThresholdNanos(java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(scopeSlowlogMs));
         this.scope = new com.zifang.z.cache.core.command.ServerScope(
                 new StreamStore(16), scopeSlowLog);
+        // stream 表注入给 store，而不是让 store 自己 new 一份：这台服务器的流只有一个主人
+        // （ServerScope），TYPE / EXISTS / DBSIZE 只是替它回答"这一台有没有这个键"。
+        // 不注入的那些用法（单测直接 new MemoryStore、嵌入式）就维持注入前的形状 ——
+        // 对 stream 一律答"没有这个键"，而不是凭猜测给一个数。
+        this.store.bindStreams(this.scope.streamStore());
         logger.info("Slow log initialized (threshold: {} ms)", scopeSlowlogMs);
     }
 

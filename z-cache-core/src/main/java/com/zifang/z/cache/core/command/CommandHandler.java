@@ -618,11 +618,13 @@ public class CommandHandler {
     }
 
     /**
-     * 把一个键名下五张表全清一遍，返回是否真的删掉了东西。
+     * 把一个键名下六张表全清一遍，返回是否真的删掉了东西。
      * <p>
      * DEL 的"删干净"和 RENAME 的"旧值整个消失"是同一条语义，必须共用一把尺。以前五路里第一条
      * 命中就 continue：一个键名下真的并存两种类型时（1.3.4 及之前写出来的，或 {@code RENAME}
      * 造出来的）只删得掉一种，另一份既读不到也删不掉，DBSIZE 还把它多算一个。
+     * 第六路是 stream —— 它不在 {@code MemoryStore} 的数组里，而是这台服务器 scope 上那份
+     * {@link StreamStore}，所以这一格只能在这里接。
      */
     private boolean deleteEveryType(String k) {
         boolean removed = false;
@@ -631,6 +633,7 @@ public class CommandHandler {
         if (store.getListStore(currentDb).del(k)) removed = true;
         if (store.getSetStore(currentDb).del(k)) removed = true;
         if (store.getSortedSetStore(currentDb).del(k)) removed = true;
+        if (streams() != null && streams().remove(currentDb, k)) removed = true;
         return removed;
     }
 
@@ -1282,15 +1285,26 @@ public class CommandHandler {
                 }
                 break;
             }
+            case STREAM: {
+                // 挪的是 Stream 对象本身，不是条目快照：表顶 last_id、消费组、PEL 全在对象里，
+                // 上游 dbRename 换的也是 dict 里那个 value 指针。
+                // 这一支必须在 default 之前 —— 上面那句 deleteEveryType(dst) 已经把目标名清过了，
+                // 走到 default 会留下"dst 空了、src 还在、答复却是 no such key"这种半截状态。
+                StreamStore streamStore = streams();
+                if (streamStore == null) return RespError.of("ERR", "Stream not configured");
+                streamStore.rename(currentDb, src, dst);
+                break;
+            }
             default: return RespError.noSuchKey();
         }
         return nx ? RespInteger.of(1) : RespSimpleString.of("OK");
     }
 
     private Object handleRandomkey() {
-        List<String> all = new ArrayList<>(store.keysDb(currentDb, "*"));
-        all.addAll(store.getHashStore(currentDb).keys()); all.addAll(store.getListStore(currentDb).keys());
-        all.addAll(store.getSetStore(currentDb).keys()); all.addAll(store.getSortedSetStore(currentDb).keys());
+        // 只从 keysDb 这一把尺里抽样：上游 dbRandomKey 是在同一个 dict 上随机取一格，
+        // 每个键的权重相同。先前这里在 keysDb 之外又并了一遍 hash/list/set/zset，
+        // 那四种键因此被数了两次、抽中的概率翻倍，而 string/stream 只算一次。
+        List<String> all = store.keysDb(currentDb, "*");
         if (all.isEmpty()) return RespBulkString.nullBulkString();
         return RespBulkString.of(all.get(ThreadLocalRandom.current().nextInt(all.size())));
     }
@@ -2430,12 +2444,14 @@ public class CommandHandler {
      * {@code TYPE} 只报其中一种。这正是 1.3.5 给另外五族补 WRONGTYPE 时要修的那个形状，
      * stream 族是最后一扇开着的门。
      * <p>
-     * 判据只问"这枚键名被别的类型占着吗"：{@link MemoryStore#typeOfDb} 看不见 StreamStore，
-     * 所以反方向（{@code GET <stream 键>} 该回 WRONGTYPE 而不是 nil）要先把 stream 接进键空间，
-     * 那是另一件事，见 CHANGELOG 的已知边界。
+     * 判据只问"这枚键名被别的类型占着吗"：{@link MemoryStore#typeOfDb} 现在认得第六种类型，
+     * 所以这道闸与中央闸门（{@link #typeConflict}）是同一把尺的两端 —— 反方向
+     * （{@code GET <stream 键>} 该回 WRONGTYPE 而不是 nil）由那张表在分发前问掉，
+     * 不需要在这里再写一遍。
      */
     private RespError streamTypeConflict(String key) {
-        return store.typeOfDb(currentDb, key) == MemoryStore.DataType.NONE
+        MemoryStore.DataType actual = store.typeOfDb(currentDb, key);
+        return actual == MemoryStore.DataType.NONE || actual == MemoryStore.DataType.STREAM
                 ? null
                 : RespError.wrongType("Operation against a key holding the wrong kind of value");
     }

@@ -69,6 +69,43 @@ public class StreamStore {
         stores[db].clear();
     }
 
+    /**
+     * 这一库里所有 stream 键的键名 —— {@code KEYS} / {@code RANDOMKEY} / {@code DBSIZE}
+     * 要的是"这是个键"这一层，与 {@link #dbsize(int)} 同一把尺。
+     */
+    public java.util.Set<String> keySet(int db) {
+        return java.util.Collections.unmodifiableSet(stores[db].keySet());
+    }
+
+    /**
+     * {@code RENAME}：把整条流挪到另一个键名下，目标名上原来是什么一律顶掉。
+     * <p>
+     * 挪的是 {@link Stream} 那个对象本身，不是条目快照 —— 表顶 {@code last_id}、消费组、
+     * PEL 都要跟着走（上游 {@code dbRename} 换的是 dict 里的 value 指针，对象里装着什么就
+     * 带走什么）。源键不在返回 false，调用方据此回 {@code -ERR no such key}。
+     */
+    public boolean rename(int db, String src, String dst) {
+        Stream stream = stores[db].remove(src);
+        if (stream == null) {
+            return false;
+        }
+        stores[db].put(dst, stream);
+        return true;
+    }
+
+    /**
+     * {@code MOVE}：整条流换库，同样挪对象。目标库已经有同名键时调用方必须先挡掉
+     * （上游 {@code moveKey} 的"两边都保持原值、回 0"那一条）。
+     */
+    public boolean moveTo(int fromDb, int toDb, String key) {
+        Stream stream = stores[fromDb].remove(key);
+        if (stream == null) {
+            return false;
+        }
+        stores[toDb].put(key, stream);
+        return true;
+    }
+
     // ==================== XADD ====================
 
     /**

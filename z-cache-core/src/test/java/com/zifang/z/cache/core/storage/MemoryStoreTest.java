@@ -368,4 +368,54 @@ class MemoryStoreTest {
         assertTrue(latch.await(30, TimeUnit.SECONDS));
         assertEquals(0, errors.get());
     }
+
+    /**
+     * 第六张表是<b>注入</b>进来的（{@code bindStreams}），不是本类自己 new 的 —— 因为
+     * {@code StreamStore} 的归属是"一台服务器一份"（{@code ServerScope}），而 {@code MemoryStore}
+     * 可以被拆开单用。于是"没接上"那一支在协议层永远不可达，只有拆开了才碰得到，
+     * 而它恰恰是最需要钉的一支：嵌入式和单测就是直接 {@code new MemoryStore()} 的，
+     * 这一支要是红在 NPE 上，整条 String 路跟着一起倒。
+     */
+    @Test
+    void streamTableIsBlindUntilItIsBound() {
+        com.zifang.z.cache.core.stream.StreamStore streams =
+                new com.zifang.z.cache.core.stream.StreamStore(16);
+        java.util.Map<String, String> fields = new java.util.HashMap<>();
+        fields.put("a", "1");
+        assertEquals("1-1", streams.xadd(0, "inj:stream", fields, "1-1", -1));
+        assertEquals(1, streams.keySet(0).size(), "流表自己那一侧确实落了一枚键");
+
+        // 没接上：判据一律"没有这个键"，而不是凭猜测给一个数，也不是炸掉
+        assertEquals(MemoryStore.DataType.NONE, store.typeOfDb(0, "inj:stream"));
+        assertEquals(0L, store.dbsizeDb(0));
+        assertTrue(store.keysDb(0, "*").isEmpty());
+        store.clearOtherTypes(0, "inj:stream", MemoryStore.DataType.STRING);
+        store.flushDb(0);
+        assertEquals(1, streams.keySet(0).size(), "没接上就不归本类管，清库也不该动到它");
+
+        // 接上：TYPE / DBSIZE / KEYS 三把尺一起跟上，少任何一把都是另一处"同一键名两问两答"
+        store.bindStreams(streams);
+        assertEquals(MemoryStore.DataType.STREAM, store.typeOfDb(0, "inj:stream"));
+        assertEquals(1L, store.dbsizeDb(0));
+        assertEquals(java.util.Collections.singletonList("inj:stream"), store.keysDb(0, "*"));
+
+        // dbOverwrite 那一问也管得到它：SET 顶掉流键时，流整个没掉而不是并存
+        store.setDb(0, "inj:stream", "v".getBytes(StandardCharsets.UTF_8));
+        assertEquals(MemoryStore.DataType.STRING, store.typeOfDb(0, "inj:stream"));
+        assertNull(streams.getStream(0, "inj:stream"), "两半各存一份的话 DEL 只删得掉一半");
+        assertEquals(1L, store.dbsizeDb(0), "一个键名只占一格");
+
+        // FLUSHDB 与 DBSIZE 是同一把尺：接上之后它清得动第六张表
+        streams.xadd(0, "inj:second", fields, "1-1", -1);
+        assertEquals(2L, store.dbsizeDb(0));
+        store.flushDb(0);
+        assertEquals(0L, store.dbsizeDb(0));
+        assertTrue(streams.keySet(0).isEmpty());
+
+        // 拔掉（或压根没接过）就退回注入之前的形状：还是"看不见"，不是一支坏掉的尺
+        store.bindStreams(null);
+        streams.xadd(0, "inj:third", fields, "1-1", -1);
+        assertEquals(MemoryStore.DataType.NONE, store.typeOfDb(0, "inj:third"));
+        assertEquals(0L, store.dbsizeDb(0));
+    }
 }
