@@ -1191,15 +1191,32 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   摘 `setDb` 的覆盖清除 → 红在 `SET 覆盖后不许留着旧时刻`；
   把 `psetexDb` 的登记挪回 `putDb` 之后 → 红在 `淘汰之后：时刻表里给一个已经不存在的键名留着
   过期记录 -> k31`（那个号码每遍不同：挑谁是受害者是随机的，别把它当固定期望）。
-- 还没做的三件事，写在这里免得下一格漏：
+- 还没做的两件事，写在这里免得下一格漏：
   1. **这一格没有让任何一种集合键的 TTL 活起来。** `expireDb` / `ttlDb` 那五支仍然只看
      `stringStores`，上面那面 fence 原样留着，是下一格要翻的。
   2. 四个集合 store 自己的 `del`（`CommandHandler.deleteEveryType` 直接调它们）不碰时刻表。
      今天没有集合键的行可收，所以那一句在这四处是**空转**、也不在任何判据里 —— 记在**未覆盖**。
      下一格要么让删除统一走一个"六型通删"的口，要么这四处各补一句。
-  3. `GETSET` 仍然把 TTL 抹成永久（`getAndSetDb` 走的是整键覆盖那一条），而上游
-     `getSetCommand` 用的是 `dbOverwrite`（`db.c:189-206`，不清过期）。这一格是**照现状搬**的，
-     没有顺手改 —— 它是一条独立的、还没实测对拍过的缺口，不该混在搬迁这一格里。
+- 这一格原先还列了第 3 条"待修缺口"，**那条是我写反的，在此改口并留下证据**。原文：
+  "`GETSET` 仍然把 TTL 抹成永久……而上游 `getSetCommand` 用的是 `dbOverwrite`
+  （`db.c:189-206`，不清过期）"。对着 5.0.14 源码复核的三点：
+  1. `getSetCommand` 这个符号上游**不存在** —— 全 src 目录只有 `getsetCommand`
+     （`t_string.c:176`，命令表注册在 `server.c:227`）。写文档时我没 grep 过它，只凭形状编了个名字。
+  2. `getsetCommand` 换值用的是 `setKey`（`t_string.c:179`），而 `setKey`（`db.c:216-224`）
+     的文档第三条正是 "The expire time of the key is reset (the key is made persistent)"，
+     `removeExpire(db,key)` 就在 `:223`。**GETSET 抹掉 TTL 就是上游行为**；
+     `dbOverwrite`（`db.c:189`，文档 "does not modify the expire time"）是另一批路径用的
+     —— INCR / INCRBYFLOAT 那两处（`t_string.c:364`、`:416`），对应的正是我们
+     那五支就地改写、不碰时刻表的实现。
+  3. 所以 `getAndSetDb` 里那句 `clearExpireAtDb` 不是要摘的，是要钉的。缺的不是修复而是判据：
+     `CommandHandlerJunit5Test.testGetsetResetsTheTtlTheWayUpstreamSetKeyDoes`（SETEX →
+     `TTL > 0` 正面对照 → GETSET 回旧值 → `TTL` 回 **-1**（键在、不过期）而不是 -2（键没了）→
+     GET 回新值）。摘掉那句 `clearExpireAtDb` 的注入红在
+     `GETSET 之后回 -1（键还在、不过期），不是 -2（键不存在） ==> expected: <-1> but was: <100>`
+     —— 基线与还原 md5 同为 `d4a4425f8f32c67e3a46f0f2053ccb7a`，同一份字节上基线绿
+     （`~/.cache/zcache_gauges/ttl_mut/getset_teeth.py`）。
+  把这段错账留在文档里而不只是删掉，理由很直接：一句话读起来像"待修缺口"，下一格就会照着动手，
+  动手的结果是把正确的行为改成 bug。
 
 ### Added
 - `RedisServer.serverScope()`：只读拿到本台那一份，测试与嵌入式据此判断作用域边界。

@@ -381,6 +381,28 @@ class CommandHandlerJunit5Test {
         assertEquals(1, keys.size());
     }
 
+    /**
+     * GETSET 要把挂着的过期抹成永久。上游 {@code getsetCommand}（{@code t_string.c:176-182}）
+     * 调的是 {@code setKey}，而 setKey 的文档第三条就是 "The expire time of the key is reset
+     * (the key is made persistent)"（{@code db.c:216-224}，{@code removeExpire} 在 :223）。
+     * <p>
+     * 这一支钉的是<b>现状</b>：CHANGELOG 1.3.6 曾把"GETSET 抹掉 TTL"记成一条待修缺口，
+     * 依据是一个上游并不存在的符号名（{@code getSetCommand} + "dbOverwrite 不清过期"）。
+     * 对着 5.0.14 源码复核后发现搞反了 —— 抹掉才是上游的行为，`getAndSetDb` 一直是对的，
+     * 缺的不是修复而是这一句判据：没有它，下一格会把正确的行为"修"成 bug。
+     */
+    @Test
+    void testGetsetResetsTheTtlTheWayUpstreamSetKeyDoes() {
+        assertEquals("OK", ((RespSimpleString) handler.handle(cmd("SETEX", "gs:k", "100", "A"))).getValue());
+        long before = ((RespInteger) handler.handle(cmd("TTL", "gs:k"))).getValue();
+        assertTrue(before > 0, "前提：过期真的挂上了（这一句不成立时下面全是空跑）");
+
+        assertEquals("A", ((RespBulkString) handler.handle(cmd("GETSET", "gs:k", "B"))).getString());
+        assertEquals(-1L, ((RespInteger) handler.handle(cmd("TTL", "gs:k"))).getValue(),
+                "GETSET 之后回 -1（键还在、不过期），不是 -2（键不存在）");
+        assertEquals("B", ((RespBulkString) handler.handle(cmd("GET", "gs:k"))).getString());
+    }
+
     @Test
     void testMillisecondExpirationAndInfo() {
         handler.handle(cmd("SET", "short", "value"));
