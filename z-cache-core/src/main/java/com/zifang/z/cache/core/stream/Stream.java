@@ -191,20 +191,24 @@ public class Stream {
      */
     private synchronized String generateId() {
         long now = System.currentTimeMillis();
-        if (now > lastTimestamp.get()) {
+        // 两段都是 uint64 的位模式，比较必须按无符号走：一旦有人 XADD 过
+        // 18446744073709551615-1，有符号的 now > last 会重新变"真"，
+        // 自增 ID 就倒回到比表顶还小的位置。
+        if (Long.compareUnsigned(now, lastTimestamp.get()) > 0) {
             lastTimestamp.set(now);
             lastSequence.set(0);
         } else {
             lastSequence.incrementAndGet();
         }
-        return lastTimestamp.get() + "-" + lastSequence.get();
+        return Long.toUnsignedString(lastTimestamp.get()) + "-" + Long.toUnsignedString(lastSequence.get());
     }
 
     /**
      * 更新计数器以确保后续 auto-id 大于给定值。
      */
     private synchronized void updateCounters(long ts, long seq) {
-        if (ts > lastTimestamp.get() || (ts == lastTimestamp.get() && seq >= lastSequence.get())) {
+        if (Long.compareUnsigned(ts, lastTimestamp.get()) > 0
+                || (ts == lastTimestamp.get() && Long.compareUnsigned(seq, lastSequence.get()) >= 0)) {
             lastTimestamp.set(ts);
             lastSequence.set(seq);
         }

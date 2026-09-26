@@ -1,5 +1,7 @@
 package com.zifang.z.cache.core.stream;
 
+import com.zifang.z.cache.common.protocol.StreamIdFormat;
+
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -47,34 +49,31 @@ public final class StreamEntry {
     public long getSequence() { return sequence; }
 
     /**
-     * 解析 ID 为 [timestamp, sequence]。
+     * 解析 ID 为 [timestamp, sequence]，两段都是 uint64 的位模式。
+     *
+     * <p>文法只有一处：{@link StreamIdFormat}。这里过去是裸 {@code Long.parseLong}，
+     * 于是 {@code 18446744073709551615-1}（对岸收的写法）抛 {@code NumberFormatException}，
+     * 而那个异常一路冒到 handler 的 {@code catch (Exception)}，客户端拿到的是
+     * {@code -ERR For input string: "18446744073709551615"}——Java 的内部文本。
+     *
+     * <p>非法写法在这里退成 {@code {0,0}} 而不是抛出：命令这一侧已经在入口处按每个位置的
+     * strict / missingSeq 判过一轮（{@code CommandHandler} 的 streamIdArg），走到这里的
+     * 串都该是合法的；这一支兜底只服务内部调用，不参与对客判定。
      */
     public static long[] parseId(String id) {
-        if (id == null || id.isEmpty() || "-".equals(id)) {
-            return new long[]{0, 0};
-        }
-        if ("+".equals(id)) {
-            return new long[]{Long.MAX_VALUE, Long.MAX_VALUE};
-        }
-        int dash = id.indexOf('-');
-        if (dash < 0) {
-            return new long[]{Long.parseLong(id), 0};
-        }
-        long ts = Long.parseLong(id.substring(0, dash));
-        long seq = Long.parseLong(id.substring(dash + 1));
-        return new long[]{ts, seq};
+        long[] parsed = StreamIdFormat.parse(id, 0L, false);
+        return parsed == null ? new long[]{0L, 0L} : parsed;
     }
 
     /**
      * 比较两个 ID 的大小（用于范围查询）。
      *
-     * @return 负数 = id1 < id2，0 = 相等，正数 = id1 > id2
+     * @return 负数 = id1 &lt; id2，0 = 相等，正数 = id1 &gt; id2
      */
     public static int compareIds(String id1, String id2) {
         long[] p1 = parseId(id1);
         long[] p2 = parseId(id2);
-        int cmp = Long.compare(p1[0], p2[0]);
-        return cmp != 0 ? cmp : Long.compare(p1[1], p2[1]);
+        return StreamIdFormat.compare(p1[0], p1[1], p2[0], p2[1]);
     }
 
     /**
