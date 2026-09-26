@@ -26,23 +26,62 @@ All notable changes to z-cache will be documented in this file.
   EventExecutorGroup)`）：两参/三参/六参那三个在仓库里零调用方，留着只会让人以为
   "可以只传一个 pubSubManager"。
 
+#### `RENAME` 把源键"并进"目标键，而不是顶掉它
+- 五条类型分支里只有 String 那条走 `setDb`（经 `MemoryStore.putDb` 的 `clearOtherTypes` 抹掉旧值）。
+  四条集合分支是 `hgetall(src) → del(src) → hmset(dst, …)`：dst 原有内容原样留着。
+  socket 侧实测 `HSET d old 1; HSET s f v; RENAME s d` 之后 `HLEN d` 回 `:2`（Redis 是 `:1`），
+  `HEXISTS d old` 回 `:1`。
+- 跨类型更糟：dst 是 hash、src 是 list 时，list 写进 `listStores`、旧 hash 还留在 `hashStores`，
+  同一个键名下并存两种类型 —— 正是 1.3.5 类型闸门要消灭的状态，而 `RENAME` 是它现成的生产者
+  （`RENAME` 有意不在闸门表里，Redis 允许跨类型改名）。
+- 源键"在不在"的判据也从 `store.existsDb` 换成 `typeOfDb`：前者只认 String 表里记着的键，
+  对集合键回 false，等于五条支路五把尺。
+- `DEL` 与 `RENAME` 现在共用 `deleteEveryType`：一个键名底下五张表全清，`DBSIZE` 不会再
+  把一个跨类型残留多算一个键。
+
 ### Added
 - `RedisServer.serverScope()`：只读拿到本台那一份，测试与嵌入式据此判断作用域边界。
 - `RedisServerProtocolSemanticsTest` 增加 2 条端到端回归（`streamKeyspaceIsScopedToOneServerInstance`
   两头都量：B 读不到 A 的流，同时 A 读得到自己的流；
   `serverWithoutDataDirDoesNotDisableOtherServersPersistence` 先钉"带 dataDir 这台本来能 SAVE"
   再让第二台启动）。
-- 摘掉绑定的变异探针（`RedisServer` 传 `null` scope）在同一个文件里打出 **8 条命名判红**，
-  两条新回归与原来的 pub/sub 隔离回归都在其中；探针跑完按字节还原（md5 对账）。
-- 计数只认实测：`mvn clean test` 全量 **96 + 338 + 133 + 2 = 569 例全绿**；
-  这类跨实例作用域缺陷只在"整模块连跑"的形态下现形，所以再按 `-Dsurefire.runOrder=random`
-  把 common+core 连跑 3 次，三次都全绿。
+- `renameReplacesTheDestinationInsteadOfMergingIntoIt`（hash / list / set / zset 四种源键各自
+  "dst 有旧值"的形态 + 跨类型 + `RENAMENX` 看得到集合键）与
+  `renameMovesTheSourceTtlToTheDestination`（源键 TTL 搬过去、被顶掉的旧 hash 读不到）。
+- `ZCacheClientIntegrationTest` 不再"探测 6379 上有没有人，没有就整类跳过"——本仓库没有任何
+  东西会在 6379 起服务，于是这 12 条用例从来没执行过（surefire 报告里 `skipped=12`），
+  `ZCacheClient` 的公开 API 对真实服务器的往返是零覆盖；反过来万一本机真有一个 Redis，
+  它们会拿别人的实例当被测对象并把 `FLUSHDB` 打进人家的库。现在类自己起一台（临时端口，
+  `@AfterAll` 停掉），并把四条恒真判据钉成实数：`DEL` 回 2、`EXISTS` 回 2、`EXPIRE` 回 1、
+  `INCR`/`DECR` 回 1/0、5 线程 × 20 次"写完立刻读回"要 100/100 全部对上。
+- 两个服务器测试类的 `startAndWait`：启动线程已经死了就立刻报" died before listening on …"，
+  不再空转到 8 秒超时后甩一句"did not start listening"。`freePort()` 探到的端口在被 bind 之前
+  可能被内核分给别的连接（本轮 100 多次启动里遇到 1 次，`BindException` 只落在那个守护线程的
+  栈里），这属于量具问题，判据要能自己说清是哪一类。
+- 摘掉绑定的变异探针（`RedisServer` 传 `null` scope）：跑整个 core 模块（不是单个测试类）时
+  **12 条命名判红** —— 两条新 Stream / 持久化作用域回归、原来的 pub/sub 隔离回归、
+  `SLOWLOG` 接线、`CLIENT LIST`、四条 Stream 命令用例，以及 `RedisServerLifecycleTest` 里
+  AOF 三代重放 / 定时快照 / SAVE 全库 TTL / 无 dataDir 起 Stream 那四条。
+  `RENAME` 这一版另跑 5 支（摘 dst 整表清理 / 源键判据换回 `keyTypeMaps` / 不删源键 /
+  TTL 不搬 / `deleteEveryType` 退回"第一条命中就返回"），**5 支全部点名判红**。
+  探针跑完按字节还原（md5 对账），脚本留在 `~/.cache/zcache_mut/`。
+- 计数只认实测：`mvn clean test` 全量 **96 + 340 + 133 + 2 = 571 例全绿，0 skipped**
+  （上一版是 569 例、12 条被跳过）。这类跨实例作用域缺陷只在"整模块连跑"的形态下现形，
+  所以再按 `-Dsurefire.runOrder=random` 把 common+core 连跑 3 次：三次都是 96 + 340 全绿，
+  且三次的测试类执行顺序 md5 互不相同（`50f336…` / `722080…` / `dcdf08…`）——
+  随机确实生效了，不是只传了个开关。
 
 ### 已知边界（这一版没动，说清楚）
 - RESP3 / `HELLO`、`EVAL` / `EVALSHA` / `SCRIPT` 依旧没有服务端实现，客户端 `DistributedLock`
   因此仍走"GET 校验后 DEL"的非原子路径。
-- Stream 不参与 RDB/AOF；只有 String 键的 TTL 进快照。
+- Stream 不参与 RDB/AOF；只有 String 键的 TTL 进快照（集合键连 `EXPIRE` 都还不支持，
+  所以 `RENAME` 也只搬得动 String 的 TTL）。
 - `MemoryStore.keyVersions` 只增不减。
+- `MemoryStore.keyTypeMaps` 仍只有 String 写路径维护；`existsDb` / `checkKeyType` 这些读它的
+  方法对集合键一律"看不见"。`RENAME` 已经不读它了，但 `MemoryStore.rename()` / `renameDb()`
+  还在读，且那两个方法主代码零调用方（集合分支只 `del(newKey)`，真接上会毁数据）。
+- 测试端口仍是"先探一个空闲端口再 bind"，存在被抢占的窗口（频率见上）。彻底做法是
+  `RedisServer` 支持 `port 0` 并回读实际端口，改动面覆盖两个测试类约 25 处，本轮没做。
 
 ## [1.3.5] - 2026-09-26
 

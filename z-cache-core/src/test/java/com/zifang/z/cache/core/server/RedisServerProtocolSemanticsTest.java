@@ -674,6 +674,152 @@ class RedisServerProtocolSemanticsTest {
     }
 
     /**
+     * {@code RENAME} 是"目标键整个被源键顶掉"，不是"把源键并进目标键"。
+     * <p>
+     * {@code handleRename} 的五条类型分支里，只有 String 那一条走 {@code setDb}（会经
+     * {@code MemoryStore.putDb} 的 {@code clearOtherTypes} 抹掉旧值）。四条集合分支是
+     * {@code hgetall(src) → del(src) → hmset(dst, m)}：dst 原本有内容时被原样保留。
+     * 于是 {@code HSET d old 1; HSET s f 1; RENAME s d} 之后 dst 有两个域，Redis 只有 src 那一个；
+     * 跨类型更糟 —— dst 是 hash、src 是 list 时 list 写进 listStore 而 hashStore 里的旧 hash 还在，
+     * {@code TYPE} 报一种、另一张表里的数据读不出来也删不掉，正是 1.3.5 类型闸门想消灭的
+     * "同一键名并存两种类型"，而 RENAME 是它现成的生产者。
+     */
+    @Test
+    void renameReplacesTheDestinationInsteadOfMergingIntoIt() throws Exception {
+        int port = freePort();
+        RedisServer server = new RedisServer("127.0.0.1", port, 0);
+        Thread thread = startAndWait(server, port);
+        try (Socket socket = connect(port)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+
+            // 阳性对照：dst 本来不存在时 rename 一直是对的。这条不红，上面那些红才说明问题在 dst。
+            send(socket, "HSET", "rn:ctrl:src", "f", "v");
+            assertEquals(":1", readReply(in));
+            send(socket, "RENAME", "rn:ctrl:src", "rn:ctrl:dst");
+            assertEquals("+OK", readReply(in));
+            send(socket, "HGET", "rn:ctrl:dst", "f");
+            assertEquals("v", readReply(in));
+            send(socket, "EXISTS", "rn:ctrl:src");
+            assertEquals(":0", readReply(in), "rename 之后源键必须消失");
+
+            // 同类型：dst 上原有的成员必须跟着旧值一起消失
+            send(socket, "HSET", "rn:hash:dst", "old", "1");
+            assertEquals(":1", readReply(in));
+            send(socket, "HSET", "rn:hash:src", "f", "v");
+            assertEquals(":1", readReply(in));
+            send(socket, "RENAME", "rn:hash:src", "rn:hash:dst");
+            assertEquals("+OK", readReply(in));
+            send(socket, "HLEN", "rn:hash:dst");
+            assertEquals(":1", readReply(in), "dst 该只剩 src 带过来的那一个域");
+            send(socket, "HEXISTS", "rn:hash:dst", "old");
+            assertEquals(":0", readReply(in), "旧域不该还在");
+
+            send(socket, "RPUSH", "rn:list:dst", "old");
+            assertEquals(":1", readReply(in));
+            send(socket, "RPUSH", "rn:list:src", "a", "b");
+            assertEquals(":2", readReply(in));
+            send(socket, "RENAME", "rn:list:src", "rn:list:dst");
+            assertEquals("+OK", readReply(in));
+            send(socket, "LRANGE", "rn:list:dst", "0", "-1");
+            assertEquals("[a, b]", readReplyDeep(in), "旧元素不能排在前面（Redis 是整体替换）");
+
+            send(socket, "SADD", "rn:set:dst", "old");
+            assertEquals(":1", readReply(in));
+            send(socket, "SADD", "rn:set:src", "m");
+            assertEquals(":1", readReply(in));
+            send(socket, "RENAME", "rn:set:src", "rn:set:dst");
+            assertEquals("+OK", readReply(in));
+            send(socket, "SMEMBERS", "rn:set:dst");
+            assertEquals("[m]", readReplyDeep(in));
+
+            send(socket, "ZADD", "rn:zset:dst", "1", "old");
+            assertEquals(":1", readReply(in));
+            send(socket, "ZADD", "rn:zset:src", "5", "z");
+            assertEquals(":1", readReply(in));
+            send(socket, "RENAME", "rn:zset:src", "rn:zset:dst");
+            assertEquals("+OK", readReply(in));
+            send(socket, "ZCARD", "rn:zset:dst");
+            assertEquals(":1", readReply(in));
+            send(socket, "ZSCORE", "rn:zset:dst", "old");
+            assertEquals("$-1", readReply(in), "旧成员的分数不该跟着一起活下来");
+
+            // 跨类型：dst 是 hash、src 是 list ⇒ 只能剩 list，旧 hash 整份消失
+            send(socket, "HSET", "rn:cross:dst", "old", "1");
+            assertEquals(":1", readReply(in));
+            send(socket, "LPUSH", "rn:cross:src", "a");
+            assertEquals(":1", readReply(in));
+            send(socket, "RENAME", "rn:cross:src", "rn:cross:dst");
+            assertEquals("+OK", readReply(in));
+            send(socket, "TYPE", "rn:cross:dst");
+            assertEquals("+list", readReply(in));
+            send(socket, "HLEN", "rn:cross:dst");
+            assertTrue(readReply(in).startsWith("-WRONGTYPE"), "旧 hash 若还留在另一张表里，这条会回 :1");
+            send(socket, "LRANGE", "rn:cross:dst", "0", "-1");
+            assertEquals("[a]", readReplyDeep(in));
+            send(socket, "DBSIZE");
+            assertEquals(":6", readReply(in), "到这里共 6 个键名，跨类型的键不能被算成两个");
+            send(socket, "DEL", "rn:cross:dst");
+            assertEquals(":1", readReply(in));
+            send(socket, "EXISTS", "rn:cross:dst");
+            assertEquals(":0", readReply(in), "DEL 之后两种类型都不该留下");
+
+            // RENAMENX 的判据也要看得到集合键：dst 是 hash 时同样得回 0 且不动 src
+            send(socket, "HSET", "rn:nx:dst", "f", "v");
+            assertEquals(":1", readReply(in));
+            send(socket, "SET", "rn:nx:src", "keep");
+            assertEquals("+OK", readReply(in));
+            send(socket, "RENAMENX", "rn:nx:src", "rn:nx:dst");
+            assertEquals(":0", readReply(in), "dst 存在（只是不是 string），RENAMENX 不该动手");
+            send(socket, "GET", "rn:nx:src");
+            assertEquals("keep", readReply(in));
+        } finally {
+            server.stop();
+            thread.join(DEADLINE_MS);
+        }
+    }
+
+    /**
+     * {@code RENAME} 把源键的 TTL 一起搬过去，目标键原来带没带过期都要以源键为准。
+     * <p>
+     * String 分支本来就抄了 {@code pttlDb} → {@code pexpireDb}，这一条钉住它别在改替换语义时被顺手丢掉；
+     * 顺带确认覆盖集合键那一支（走 {@code setDb}）不会把旧 hash 留在另一张表里。
+     */
+    @Test
+    void renameMovesTheSourceTtlToTheDestination() throws Exception {
+        int port = freePort();
+        RedisServer server = new RedisServer("127.0.0.1", port, 0);
+        Thread thread = startAndWait(server, port);
+        try (Socket socket = connect(port)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+
+            // 阳性对照：没设过期的键 TTL 是 -1，"设了过期才 >0"这一判据才有意义
+            send(socket, "SET", "rn:ttl:plain", "v");
+            assertEquals("+OK", readReply(in));
+            send(socket, "TTL", "rn:ttl:plain");
+            assertEquals(":-1", readReply(in));
+
+            send(socket, "SET", "rn:ttl:src", "v", "EX", "100");
+            assertEquals("+OK", readReply(in));
+            send(socket, "HSET", "rn:ttl:dst", "old", "1");
+            assertEquals(":1", readReply(in));
+            send(socket, "RENAME", "rn:ttl:src", "rn:ttl:dst");
+            assertEquals("+OK", readReply(in));
+            send(socket, "TYPE", "rn:ttl:dst");
+            assertEquals("+string", readReply(in));
+            send(socket, "TTL", "rn:ttl:dst");
+            long ttl = Long.parseLong(readReply(in).substring(1));
+            assertTrue(ttl > 0 && ttl <= 100, "源键的 TTL 要跟着搬过来，实得 " + ttl);
+            send(socket, "HGET", "rn:ttl:dst", "old");
+            assertTrue(readReply(in).startsWith("-WRONGTYPE"), "被顶掉的旧 hash 不该还能读");
+            send(socket, "EXISTS", "rn:ttl:src");
+            assertEquals(":0", readReply(in));
+        } finally {
+            server.stop();
+            thread.join(DEADLINE_MS);
+        }
+    }
+
+    /**
      * 一台服务器的连接表与订阅态不能漏到另一台。
      * <p>
      * pub/sub 管理器和连接登记表以前是 {@code CommandHandler} 上的静态字段，每条新连接还会
@@ -872,6 +1018,13 @@ class RedisServerProtocolSemanticsTest {
 
         long deadline = System.currentTimeMillis() + DEADLINE_MS;
         while (System.currentTimeMillis() < deadline) {
+            if (!thread.isAlive()) {
+                // 端口被别人抢占时，bind 失败只会以"守护线程死了 + 一段没人在读的栈"出现，
+                // 调用方则空转到超时（8 秒后报"did not start listening"，看着像服务器的错）。
+                // 早退并点明这一类，别让它混进被测代码的缺陷里。
+                throw new IllegalStateException("server thread died before listening on " + port
+                        + " —— 端口探测与 bind 之间的窗口被抢占属于量具问题，重跑即可");
+            }
             try (Socket probe = new Socket()) {
                 probe.connect(new InetSocketAddress("127.0.0.1", port), 200);
                 return thread;

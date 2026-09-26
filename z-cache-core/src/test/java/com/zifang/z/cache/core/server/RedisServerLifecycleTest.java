@@ -695,6 +695,13 @@ class RedisServerLifecycleTest {
 
         long deadline = System.currentTimeMillis() + DEADLINE_MS;
         while (System.currentTimeMillis() < deadline) {
+            if (!thread.isAlive()) {
+                // bind 失败（freePort 探到的端口在这个窗口里被别人占走）会以"守护线程死了 +
+                // 一段没人在读的栈"的形态出现，调用方则一直空转到超时。早退并说清是哪一类，
+                // 免得下一次红被当成被测代码的缺陷去查。
+                throw new IllegalStateException("server thread died before listening on " + port
+                        + " —— 端口探测与 bind 之间的窗口被抢占属于量具问题，重跑即可");
+            }
             try (Socket probe = new Socket()) {
                 probe.connect(new InetSocketAddress("127.0.0.1", port), 200);
                 return thread;

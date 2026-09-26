@@ -523,20 +523,25 @@ public class CommandHandler {
     private Object handleDel(String[] args) {
         if (args.length < 2) return RespError.wrongNumberOfArguments("DEL");
         long count = 0;
-        for (int i = 1; i < args.length; i++) {
-            String k = args[i];
-            // 每种类型都要清：以前五路里第一条命中就 continue，万一某个键名下真的并存着两种类型
-            // （1.3.4 及之前写出来的、或手工塞进 store 的），DEL 会回 1 让调用方以为删干净了，
-            // 实际另一份数据还在，DBSIZE 也还把它算成一个键。
-            boolean removed = false;
-            if (store.delDb(currentDb, k)) removed = true;
-            if (store.getHashStore(currentDb).del(k)) removed = true;
-            if (store.getListStore(currentDb).del(k)) removed = true;
-            if (store.getSetStore(currentDb).del(k)) removed = true;
-            if (store.getSortedSetStore(currentDb).del(k)) removed = true;
-            if (removed) count++;
-        }
+        for (int i = 1; i < args.length; i++) if (deleteEveryType(args[i])) count++;
         return RespInteger.of(count);
+    }
+
+    /**
+     * 把一个键名下五张表全清一遍，返回是否真的删掉了东西。
+     * <p>
+     * DEL 的"删干净"和 RENAME 的"旧值整个消失"是同一条语义，必须共用一把尺。以前五路里第一条
+     * 命中就 continue：一个键名下真的并存两种类型时（1.3.4 及之前写出来的，或 {@code RENAME}
+     * 造出来的）只删得掉一种，另一份既读不到也删不掉，DBSIZE 还把它多算一个。
+     */
+    private boolean deleteEveryType(String k) {
+        boolean removed = false;
+        if (store.delDb(currentDb, k)) removed = true;
+        if (store.getHashStore(currentDb).del(k)) removed = true;
+        if (store.getListStore(currentDb).del(k)) removed = true;
+        if (store.getSetStore(currentDb).del(k)) removed = true;
+        if (store.getSortedSetStore(currentDb).del(k)) removed = true;
+        return removed;
     }
 
     private Object handleExists(String[] args) {
@@ -663,24 +668,57 @@ public class CommandHandler {
         String src = args[1], dst = args[2];
         if (src.equals(dst)) return RespError.of("ERR","source and destination objects are the same");
         if (nx && keyExists(dst)) return RespInteger.of(0);
-        if (store.existsDb(currentDb, src)) {
-            byte[] val = store.getDb(currentDb, src); Long ttlMs = store.pttlDb(currentDb, src); store.delDb(currentDb, src);
-            store.setDb(currentDb, dst, val); if (ttlMs > 0) store.pexpireDb(currentDb, dst, ttlMs);
-            return nx ? RespInteger.of(1) : RespSimpleString.of("OK");
-        }
-        if (store.getHashStore(currentDb).exists(src)) { Map<String,byte[]> m = store.getHashStore(currentDb).hgetall(src); store.getHashStore(currentDb).del(src); store.getHashStore(currentDb).hmset(dst, m); return nx?RespInteger.of(1):RespSimpleString.of("OK"); }
-        if (store.getListStore(currentDb).exists(src)) { List<byte[]> l = store.getListStore(currentDb).lrange(src,0,-1); store.getListStore(currentDb).del(src); store.getListStore(currentDb).rpush(dst, l.toArray(new byte[0][])); return nx?RespInteger.of(1):RespSimpleString.of("OK"); }
-        if (store.getSetStore(currentDb).exists(src)) { List<byte[]> s = store.getSetStore(currentDb).smembers(src); store.getSetStore(currentDb).del(src); store.getSetStore(currentDb).sadd(dst, s.toArray(new byte[0][])); return nx?RespInteger.of(1):RespSimpleString.of("OK"); }
-        if (store.getSortedSetStore(currentDb).exists(src)) {
-            List<byte[]> r = store.getSortedSetStore(currentDb).zrange(src, 0, -1, true);
-            store.getSortedSetStore(currentDb).del(src);
-            for (int i = 0; i < r.size(); i += 2) {
-                double score = Double.parseDouble(new String(r.get(i+1), StandardCharsets.UTF_8));
-                store.getSortedSetStore(currentDb).zadd(dst, score, r.get(i));
+        // 源键是什么类型、在不在，用 EXISTS / TYPE / 类型闸门那同一把尺 typeOfDb 判。
+        // 以前第一道判据是 store.existsDb，而它只认 String 表里的键，集合键一律"不存在"，
+        // 于是下面四条集合支路只能靠各自 store.exists 兜着，五条支路五把尺。
+        MemoryStore.DataType type = store.typeOfDb(currentDb, src);
+        if (type == MemoryStore.DataType.NONE) return RespError.noSuchKey();
+        // RENAME 是"目标键整个被顶掉"，不是"把源键并进目标键"，跟目标键原来是什么类型无关。
+        // 旧实现只有 String 支路走 setDb（经 MemoryStore.putDb 的 clearOtherTypes 抹掉旧值），
+        // 四条集合支路是直接往 dst 上写：同类型时 dst 的旧成员原样留着（HLEN 从 1 变 2），
+        // 跨类型时两张表各存一份 —— 1.3.5 类型闸门要消灭的"同一键名并存两种类型"，
+        // 而 RENAME 正是它现成的生产者。判据实测在 RedisServerProtocolSemanticsTest。
+        deleteEveryType(dst);
+        switch (type) {
+            case STRING: {
+                byte[] val = store.getDb(currentDb, src);
+                long ttlMs = store.pttlDb(currentDb, src);
+                deleteEveryType(src);
+                store.setDb(currentDb, dst, val);
+                // 源键的过期时间跟着一起搬；集合键的 TTL 这条实现本身还不支持（沿 1.3.5 的边界）。
+                if (ttlMs > 0) store.pexpireDb(currentDb, dst, ttlMs);
+                break;
             }
-            return nx ? RespInteger.of(1) : RespSimpleString.of("OK");
+            case HASH: {
+                Map<String, byte[]> m = store.getHashStore(currentDb).hgetall(src);
+                deleteEveryType(src);
+                store.getHashStore(currentDb).hmset(dst, m);
+                break;
+            }
+            case LIST: {
+                List<byte[]> l = store.getListStore(currentDb).lrange(src, 0, -1);
+                deleteEveryType(src);
+                store.getListStore(currentDb).rpush(dst, l.toArray(new byte[0][]));
+                break;
+            }
+            case SET: {
+                List<byte[]> s = store.getSetStore(currentDb).smembers(src);
+                deleteEveryType(src);
+                store.getSetStore(currentDb).sadd(dst, s.toArray(new byte[0][]));
+                break;
+            }
+            case ZSET: {
+                List<byte[]> r = store.getSortedSetStore(currentDb).zrange(src, 0, -1, true);
+                deleteEveryType(src);
+                for (int i = 0; i < r.size(); i += 2) {
+                    double score = Double.parseDouble(new String(r.get(i + 1), StandardCharsets.UTF_8));
+                    store.getSortedSetStore(currentDb).zadd(dst, score, r.get(i));
+                }
+                break;
+            }
+            default: return RespError.noSuchKey();
         }
-        return RespError.noSuchKey();
+        return nx ? RespInteger.of(1) : RespSimpleString.of("OK");
     }
 
     private Object handleRandomkey() {

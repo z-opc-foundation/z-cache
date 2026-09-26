@@ -8,6 +8,8 @@
 > 1.3.6（开发中，Central 上是 1.3.5）：同一 JVM 里多台服务器不再互相改写对方的一切 ——
 > Stream 键空间、慢查询账、RDB/AOF 与 LOADING 标记全部收成"一台一份"
 > （实测过的最贵一条：不带 `--data-dir` 的第二台一启动，就把正在跑的那台的 SAVE 变成报错）
+> · `RENAME` 改成整体替换（此前目标键的旧值会被"并"进去，跨类型时两张表各留一份）
+> · 客户端集成的 12 条用例不再"探测 6379 没人就整类跳过"，改成自带一台真服务器跑满 571 例
 
 [![Maven Central](https://img.shields.io/badge/Maven%20Central-1.3.5-blue?logo=apache-maven)](https://central.sonatype.com/search?q=g:io.github.yuku123+a:z-cache*)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
