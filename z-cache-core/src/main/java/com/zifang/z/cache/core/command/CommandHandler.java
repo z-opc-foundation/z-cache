@@ -2834,56 +2834,107 @@ public class CommandHandler {
     }
 
     /**
-     * XGROUP [CREATE key group id] [DESTROY key group] [CREATECONSUMER key group consumer] [DELCONSUMER key group consumer]
+     * XGROUP [CREATE key group id [MKSTREAM]] [DESTROY key group] [SETID key group id]
+     *        [DELCONSUMER key group consumer] [CREATECONSUMER key group consumer] [HELP]
+     *
+     * <p>上游 {@code xgroupCommand}（t_stream.c:1798-1926）的形状是<b>"先按参数个数问三道闸，
+     * 再按子命令分派"</b>，不是"先认子命令、再数参数"。顺序在这一支里就是行为本身：
+     * <ol>
+     *   <li>:1817-1824　六个字且是 CREATE 时，第六个字<b>必须</b>是 MKSTREAM，否则就是那句
+     *       "认不得的子命令"。这一问排在取键之前，所以 {@code XGROUP CREATE k g 0-0 EXTRA}
+     *       吃的是那一句，而不是把 EXTRA 当空气建组成功。</li>
+     *   <li>:1827-1834　{@code argc>=4} 才取键；键在才问类型。</li>
+     *   <li>:1837-1857　{@code argc>=4} 且没给 MKSTREAM 时键<b>必须</b>存在，SETID/DELCONSUMER
+     *       还要求组存在。这一问排在分派之前，所以 {@code XGROUP DESTROY <不在的键> g} 回的是
+     *       "键必须存在"那句，而不是 DESTROY 自己的 ":0"。</li>
+     *   <li>:1860-1925　分派时每个子命令把参数个数<b>钉死</b>（CREATE 只认 5/6、DESTROY 只认 4、
+     *       DELCONSUMER 只认 5），个数不对同样落回那一句 —— 上游没有 "for 'xgroup create' command"
+     *       这种自造的 arity 句，改前三行（{@code CREATE k g}、{@code CREATE k}、
+     *       {@code CREATE k g id EXTRA}）各回各的假句（实测 {@code battery59.pre:14 :15 :16}）。</li>
+     * </ol>
+     * {@code DELCONSUMER} 交的是<b>那个消费者手上还压着几条</b>（:1916-1917 的
+     * {@code streamDelConsumer} 返回值），不是"删没删掉"。
+     *
+     * <p>有意超出对岸的一条：{@code CREATECONSUMER} 是 6.2 才有的（5.0.14 没有这一支，
+     * 拿它去问分派会落回"认不得的子命令"），这里保留它并让它共用上面三道闸；
+     * "消费者已存在就回 :0" 那一档我手上没有尺，未动。
+     * 尚未兑现的两条：{@code SETID}（闸门已同上游，分派仍落回"认不得的子命令"）与
+     * {@code HELP}（见 {@code handleDebug} 里那份"HELP 只列真做得到的"的既有口径）。
      */
     private Object handleXgroup(String[] args) {
         if (streams() == null) return RespError.of("ERR", "Stream not configured");
+        // server.c:320 的 arity 是 -2：只有光杆 XGROUP 吃命令表那句。
         if (args.length < 2) return RespError.wrongNumberOfArguments("XGROUP");
-        String sub = args[1].toUpperCase(Locale.ROOT);
-        // :1828-1831：只要键名给到了（argc>=4），就先问一次类型，且这一问排在"键在不在"
-        // 与"组在不在"之前 —— 否则 {@code XGROUP DESTROY <string 键> g} 会被答成 ":0"，
-        // 让客户端以为动过一台其实不相干的键。
+        String typed = args[1];
+        String sub = typed.toUpperCase(Locale.ROOT);
+        boolean mkstream = false;
+        if (args.length == 6 && "CREATE".equals(sub)) {
+            if (!"MKSTREAM".equalsIgnoreCase(args[5])) return unknownXgroupSubcommand(typed);
+            mkstream = true;
+        }
+        com.zifang.z.cache.core.stream.Stream groupHost = null;
+        com.zifang.z.cache.core.stream.ConsumerGroup group = null;
         if (args.length >= 4) {
             RespError conflict = streamTypeConflict(args[2]);
             if (conflict != null) return conflict;
+            groupHost = streams().getStream(currentDb, args[2]);
+            if (groupHost != null) group = groupHost.getGroup(args[3]);
+        }
+        if (args.length >= 4 && !mkstream) {
+            if (groupHost == null) {
+                return RespError.of("ERR", "The XGROUP subcommand requires the key to exist. "
+                        + "Note that for CREATE you may want to use the MKSTREAM option to create "
+                        + "an empty stream automatically.");
+            }
+            if (group == null && ("SETID".equals(sub) || "DELCONSUMER".equals(sub))) {
+                // :1852-1854 是 addReplyErrorFormat("-NOGROUP …")，码就是 NOGROUP 本身。
+                return RespError.of("NOGROUP", "No such consumer group '" + args[3]
+                        + "' for key name '" + args[2] + "'");
+            }
         }
         switch (sub) {
             case "CREATE": {
-                if (args.length < 5) return RespError.wrongNumberOfArguments("XGROUP CREATE");
-                if (!"$".equals(args[4]) && StreamIdFormat.parse(args[4], 0L, true) == null) {
+                if (args.length != 5 && args.length != 6) return unknownXgroupSubcommand(typed);
+                String start = args[4];
+                // ID 那一问排在 MKSTREAM 建流之前：:1873-1879 那句注释
+                // "Handle the MKSTREAM option now that the command can no longer fail" 钉的就是这个顺序。
+                if (!"$".equals(start) && StreamIdFormat.parse(start, 0L, true) == null) {
                     return invalidStreamId();
                 }
-                boolean ok = streams().xgroupCreate(currentDb, args[2], args[3], args[4]);
+                boolean ok = streams().xgroupCreate(currentDb, args[2], args[3], start);
                 // :1888-1889 那句是 addReplySds("-BUSYGROUP …")，码就是 BUSYGROUP 本身；
                 // 多包一层 ERR 会让按码分支的客户端把"组重名"读成未知错误（实测 battery55:17）。
                 return ok ? RespSimpleString.of("OK")
                         : RespError.of("BUSYGROUP", "Consumer Group name already exists");
             }
             case "DESTROY": {
-                if (args.length < 4) return RespError.wrongNumberOfArguments("XGROUP DESTROY");
-                boolean ok = streams().xgroupDestroy(currentDb, args[2], args[3]);
-                return RespInteger.of(ok ? 1 : 0);
+                if (args.length != 4) return unknownXgroupSubcommand(typed);
+                return RespInteger.of(streams().xgroupDestroy(currentDb, args[2], args[3]) ? 1 : 0);
             }
             case "CREATECONSUMER": {
-                if (args.length < 5) return RespError.wrongNumberOfArguments("XGROUP CREATECONSUMER");
-                com.zifang.z.cache.core.stream.Stream stream = streams().getStream(currentDb, args[2]);
-                if (stream == null) return RespInteger.of(0);
-                com.zifang.z.cache.core.stream.ConsumerGroup cg = stream.getGroup(args[3]);
-                if (cg == null) return RespInteger.of(0);
-                cg.getOrCreateConsumer(args[4]);
+                if (args.length != 5) return unknownXgroupSubcommand(typed);
+                // 闸门不为它查组，所以"组不在"仍按本实现既有的口径回 :0，不给空指针留路。
+                if (group == null) return RespInteger.of(0);
+                group.getOrCreateConsumer(args[4]);
                 return RespInteger.of(1);
             }
             case "DELCONSUMER": {
-                if (args.length < 5) return RespError.wrongNumberOfArguments("XGROUP DELCONSUMER");
-                com.zifang.z.cache.core.stream.Stream stream = streams().getStream(currentDb, args[2]);
-                if (stream == null) return RespInteger.of(0);
-                com.zifang.z.cache.core.stream.ConsumerGroup cg = stream.getGroup(args[3]);
-                if (cg == null) return RespInteger.of(0);
-                return cg.destroyConsumer(args[4]) ? RespInteger.of(1) : RespInteger.of(0);
+                if (args.length != 5) return unknownXgroupSubcommand(typed);
+                return RespInteger.of(group.destroyConsumer(args[4]));
             }
             default:
-                return RespError.syntaxError();
+                return unknownXgroupSubcommand(typed);
         }
+    }
+
+    /**
+     * :1923-1924 的 {@code addReplySubcommandSyntaxError}，句子在 networking.c:623-630。
+     * 第一个占位是<b>照原样</b>的那个字（{@code XGROUP foo k g} 里回的是 {@code 'foo'}，
+     * 不是大写形），第二个才是大写后的命令名。
+     */
+    private RespError unknownXgroupSubcommand(String typed) {
+        return RespError.of("ERR", "Unknown subcommand or wrong number of arguments for '" + typed
+                + "'. Try XGROUP HELP.");
     }
 
     /**

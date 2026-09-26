@@ -2,6 +2,7 @@ package com.zifang.z.cache.core.stream;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -72,16 +73,28 @@ public class ConsumerGroup {
     }
 
     /**
-     * 删除消费者。
+     * 删除消费者，交回<b>它手上还压着多少条没 ACK</b>。
+     * <p>
+     * 对齐上游 {@code streamDelConsumer}（t_stream.c:1765-1788）：消费者不在就是 0，
+     * 在就是它那份 PEL 的大小 —— {@code XGROUP DELCONSUMER} 的答复正是这个数
+     * （:1916-1917），不是"删没删掉"。以前这里回 boolean、命令层翻成 1/0，
+     * 于是"压着两条没 ACK"和"一条都没有"在客户端看来是同一个答复。
+     * <p>
+     * 条数从 {@link #pendingEntries} 现数，不信 {@code Consumer.pendingCount} 那个自增计数器
+     * （与 {@link #perConsumerPending()} 同一个理由：两边口径一旦漂移，报出去的就是一份对不上账的数）。
      */
-    public boolean destroyConsumer(String consumerName) {
+    public long destroyConsumer(String consumerName) {
         Consumer removed = consumers.remove(consumerName);
-        if (removed != null) {
-            // 移除该消费者的 pending entries
-            pendingEntries.values().removeIf(v -> v.equals(consumerName));
-            return true;
+        if (removed == null) return 0L;
+        long pending = 0L;
+        Iterator<Map.Entry<String, String>> it = pendingEntries.entrySet().iterator();
+        while (it.hasNext()) {
+            if (consumerName.equals(it.next().getValue())) {
+                it.remove();
+                pending++;
+            }
         }
-        return false;
+        return pending;
     }
 
     /**

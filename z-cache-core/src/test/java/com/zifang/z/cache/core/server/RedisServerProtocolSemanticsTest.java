@@ -1271,7 +1271,15 @@ class RedisServerProtocolSemanticsTest {
             send(socket, "XGROUP", "CREATECONSUMER", "sem:ty:stream", "g", "c9");
             assertEquals(":1", readReply(in));
             send(socket, "XGROUP", "DELCONSUMER", "sem:ty:stream", "g", "c9");
-            assertEquals(":1", readReply(in));
+            // 这一格量的是"这个消费者手上还压着几条"（t_stream.c:1916-1917 的
+            // streamDelConsumer 返回值），而 c9 是 CREATECONSUMER 凭空建出来的、手上没东西，
+            // 所以是 :0。1.3.5 那轮把它钉成 :1，钉的是我们自己的布尔答复（"删掉了"翻成 1），
+            // 那一版把"压着两条"和"一条没有"混成同一格。删没删掉改由下面那一问来证。
+            assertEquals(":0", readReply(in));
+            send(socket, "XINFO", "CONSUMERS", "sem:ty:stream", "g");
+            String consumersAfterDelete = readReplyDeep(in);
+            assertTrue(consumersAfterDelete.contains("c1"), "c1 还在");
+            assertFalse(consumersAfterDelete.contains("c9"), "c9 真被删掉了：" + consumersAfterDelete);
             send(socket, "XGROUP", "DESTROY", "sem:ty:stream", "g");
             assertEquals(":1", readReply(in));
             send(socket, "XREAD", "STREAMS", "sem:ty:stream", "0-0");
@@ -3037,6 +3045,162 @@ class RedisServerProtocolSemanticsTest {
             assertEquals("[[3-3, [c, 3, d, 4]]]", readReplyDeep(in));
             send(socket, "GET", "sem:xcstr");
             assertEquals("hello", readReply(in), "被闸门拦下的 XRANGE/XTRIM 不改写别的键");
+        } finally {
+            server.stop();
+            thread.join(2000);
+        }
+    }
+
+    /**
+     * XGROUP 的三道闸与分派（上游 {@code t_stream.c:1798-1926}，句子在
+     * {@code networking.c:623-630}）。这一支钉的是<b>顺序</b>而不是"认不认得子命令"：
+     * 第六个字必须是 MKSTREAM（:1817-1824）→ 取键问类型（:1827-1834）→ 键必须存在、
+     * SETID/DELCONSUMER 还要求组存在（:1837-1857）→ 最后才轮到分派，而分派把每个子命令的
+     * 参数个数钉死（CREATE 只认 5/6、DESTROY 只认 4、DELCONSUMER 只认 5）。
+     * 改前实测（{@code battery59.pre}，39 行）翻 14 行：{@code :7 :14 :15 :16 :17 :18 :20
+     * :24 :25 :27 :28 :29 :31 :37}（其中 {@code :18 :27} 只是换了形状的假句，HELP 与 SETID
+     * 的分派仍未兑现，记在已知边界）。
+     */
+    @Test
+    void xgroupGatesRunBeforeSubcommandDispatch() throws Exception {
+        int port = freePort();
+        RedisServer server = new RedisServer("127.0.0.1", port, 0);
+        Thread thread = startAndWait(server, port);
+        try (Socket socket = connect(port)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+
+            // ---- 阳性对照：建流、建组、重名 ----
+            send(socket, "SET", "xg:str", "hello");
+            assertEquals("+OK", readReply(in));
+            send(socket, "XADD", "xg:s", "1-1", "a", "1");
+            assertEquals("1-1", readReply(in));
+            send(socket, "XADD", "xg:s", "2-2", "b", "2");
+            assertEquals("2-2", readReply(in));
+            send(socket, "XGROUP", "CREATE", "xg:s", "g1", "0-0");
+            assertEquals("+OK", readReply(in));
+            send(socket, "XGROUP", "CREATE", "xg:s", "g1", "0-0");
+            assertEquals("-BUSYGROUP Consumer Group name already exists", readReply(in));
+            send(socket, "XGROUP", "create", "xg:s", "g1", "0-0");
+            assertEquals("-BUSYGROUP Consumer Group name already exists", readReply(in),
+                    ":1860 的 strcasecmp：子命令名大小写不敏感，落回那一句时才是照原样的那一格");
+
+            // ---- 第一道闸：六个字里第六个必须是 MKSTREAM（:1817-1824，排在取键之前） ----
+            send(socket, "XGROUP", "CREATE", "xg:s", "g2", "0-0", "EXTRA");
+            assertEquals("-ERR Unknown subcommand or wrong number of arguments for 'CREATE'."
+                    + " Try XGROUP HELP.", readReply(in), "改前这一行是 +OK：EXTRA 被当空气");
+            send(socket, "XGROUP", "CREATE", "xg:s", "g2", "0-0");
+            assertEquals("+OK", readReply(in), "被拒的那一次没把组留下");
+            send(socket, "XGROUP", "CREATE", "xg:s", "g3", "0-0", "MKSTREAM");
+            assertEquals("+OK", readReply(in), "键本来就在，MKSTREAM 是白给的");
+            send(socket, "XGROUP", "CREATE", "xg:mk", "g4", "0-0", "MKSTREAM");
+            assertEquals("+OK", readReply(in), "键不在时 MKSTREAM 才顶住那道存在性闸");
+            send(socket, "XGROUP", "CREATE", "xg:mk", "g4", "0-0");
+            assertEquals("-BUSYGROUP Consumer Group name already exists", readReply(in),
+                    "键不在时 XLEN 量不出区别（空流与无键都是 :0），所以拿组重名当 MKSTREAM 的阳性对照");
+            send(socket, "XGROUP", "CREATE", "xg:mk2", "g5", "bad-id", "MKSTREAM");
+            assertEquals("-ERR Invalid stream ID specified as stream command argument", readReply(in),
+                    ":1869 的 ID 那一问排在 :1873-1879 的建流之前");
+            send(socket, "XGROUP", "CREATE", "xg:mk3", "g88", "0-0", "mkstream");
+            assertEquals("+OK", readReply(in), ":1818 也是 strcasecmp");
+            send(socket, "XGROUP", "CREATE", "xg:mk3", "g88", "0-0");
+            assertEquals("-BUSYGROUP Consumer Group name already exists", readReply(in),
+                    "小写那一次确实把流和组建出来了");
+
+            // ---- 第二、三道闸：类型 → 键存在 → 组存在（:1827-1857） ----
+            send(socket, "XGROUP", "CREATE", "xg:ghost", "g9", "0-0");
+            assertEquals("-ERR The XGROUP subcommand requires the key to exist. Note that for CREATE"
+                    + " you may want to use the MKSTREAM option to create an empty stream automatically.",
+                    readReply(in), "改前这一行是 +OK，键被顺手建了出来");
+            send(socket, "XGROUP", "DESTROY", "xg:ghost", "g9");
+            assertEquals("-ERR The XGROUP subcommand requires the key to exist. Note that for CREATE"
+                    + " you may want to use the MKSTREAM option to create an empty stream automatically.",
+                    readReply(in), "闸在分派之前，所以 DESTROY 自己那句 :0 轮不到说话");
+            send(socket, "XGROUP", "DELCONSUMER", "xg:ghost", "g9", "c1");
+            assertEquals("-ERR The XGROUP subcommand requires the key to exist. Note that for CREATE"
+                    + " you may want to use the MKSTREAM option to create an empty stream automatically.",
+                    readReply(in));
+            send(socket, "XGROUP", "CREATECONSUMER", "xg:ghost", "g9", "c1");
+            assertEquals("-ERR The XGROUP subcommand requires the key to exist. Note that for CREATE"
+                    + " you may want to use the MKSTREAM option to create an empty stream automatically.",
+                    readReply(in), "改前 :0");
+            send(socket, "XGROUP", "DESTROY", "xg:s", "nosuchgroup");
+            assertEquals(":0", readReply(in), "键在而组不在：DESTROY 不在 :1849-1850 那份名单里，才是 :0");
+            send(socket, "XGROUP", "DELCONSUMER", "xg:s", "nosuchgroup", "c1");
+            assertEquals("-NOGROUP No such consumer group 'nosuchgroup' for key name 'xg:s'",
+                    readReply(in), ":1852-1854，码就是 NOGROUP 本身");
+            send(socket, "XGROUP", "SETID", "xg:s", "nosuchgroup", "0-0");
+            assertEquals("-NOGROUP No such consumer group 'nosuchgroup' for key name 'xg:s'",
+                    readReply(in));
+            send(socket, "XGROUP", "SETID", "xg:ghost", "g1", "0-0");
+            assertEquals("-ERR The XGROUP subcommand requires the key to exist. Note that for CREATE"
+                    + " you may want to use the MKSTREAM option to create an empty stream automatically.",
+                    readReply(in), "键那一问排在组那一问之前");
+            send(socket, "XGROUP", "CREATE", "xg:str", "g9", "0-0");
+            assertEquals("-WRONGTYPE Operation against a key holding the wrong kind of value",
+                    readReply(in));
+            send(socket, "XGROUP", "DELCONSUMER", "xg:str", "g9", "c1");
+            assertEquals("-WRONGTYPE Operation against a key holding the wrong kind of value",
+                    readReply(in), "类型那一问也在键存在与组存在之前");
+
+            // ---- 分派：个数钉死，落回的都是同一句（:1860 :1902 :1913 :1923-1924） ----
+            String unknown = "Unknown subcommand or wrong number of arguments";
+            send(socket, "XGROUP");
+            assertEquals("-ERR wrong number of arguments for 'xgroup' command", readReply(in),
+                    "server.c:320 的 arity 是 -2：只有光杆吃命令表那一句");
+            send(socket, "XGROUP", "CREATE", "xg:s");
+            assertEquals("-ERR " + unknown + " for 'CREATE'. Try XGROUP HELP.", readReply(in),
+                    "三个字：够不着取键那一问（:1827 要 argc>=4），也够不着分派，落回同一句");
+            send(socket, "XGROUP", "CREATE", "xg:s", "g8");
+            assertEquals("-ERR " + unknown + " for 'CREATE'. Try XGROUP HELP.", readReply(in),
+                    "改前是自造的 for 'xgroup create' command");
+            send(socket, "XGROUP", "CREATE", "xg:s", "g8", "0-0", "A", "B");
+            assertEquals("-ERR " + unknown + " for 'CREATE'. Try XGROUP HELP.", readReply(in),
+                    "七个字：既不是 5 也不是 6");
+            send(socket, "XGROUP", "DESTROY", "xg:s", "g1", "EXTRA");
+            assertEquals("-ERR " + unknown + " for 'DESTROY'. Try XGROUP HELP.", readReply(in));
+            send(socket, "XGROUP", "DESTROY", "xg:s", "g1");
+            assertEquals(":1", readReply(in), "上面那次拒绝没动到 g1");
+            send(socket, "XGROUP", "DESTROY", "xg:s", "g1");
+            assertEquals(":0", readReply(in));
+            send(socket, "XGROUP", "FOO", "xg:s", "g2");
+            assertEquals("-ERR " + unknown + " for 'FOO'. Try XGROUP HELP.", readReply(in), "改前是 syntax error");
+            send(socket, "XGROUP", "foo", "xg:s", "g2");
+            assertEquals("-ERR " + unknown + " for 'foo'. Try XGROUP HELP.", readReply(in),
+                    "networking.c:627 的第一个占位是 argv[1] 照原样的那个字，只有命令名才大写");
+            // 组不在的 DELCONSUMER 只有四个字：闸（:1848）排在分派（:1913）之前，所以先答 NOGROUP。
+            send(socket, "XGROUP", "DELCONSUMER", "xg:s", "nosuchgroup");
+            assertEquals("-NOGROUP No such consumer group 'nosuchgroup' for key name 'xg:s'",
+                    readReply(in));
+
+            // ---- DELCONSUMER 交的是"还压着几条"（:1916-1917），不是"删没删掉" ----
+            send(socket, "XGROUP", "CREATE", "xg:s", "g6", "0-0");
+            assertEquals("+OK", readReply(in));
+            send(socket, "XREADGROUP", "GROUP", "g6", "c1", "COUNT", "2", "STREAMS", "xg:s", ">");
+            assertEquals("[[xg:s, [[1-1, [a, 1]], [2-2, [b, 2]]]]]", readReplyDeep(in));
+            send(socket, "XGROUP", "DELCONSUMER", "xg:s", "g6", "c1");
+            assertEquals(":2", readReply(in), "改前 :1 —— 布尔答复把\"压着两条\"和\"一条没有\"混成一格");
+            send(socket, "XGROUP", "DELCONSUMER", "xg:s", "g6", "c1");
+            assertEquals(":0", readReply(in), "消费者已经不在");
+            send(socket, "XGROUP", "CREATECONSUMER", "xg:s", "g6", "c2");
+            assertEquals(":1", readReply(in));
+            send(socket, "XGROUP", "DELCONSUMER", "xg:s", "g6", "c2");
+            assertEquals(":0", readReply(in), "删掉一个手上没东西的消费者也是 :0：这一格量的确实是条数");
+            // 再钉一层"条数是现数的、不是发过几条"：换个新组重发两条、ACK 掉一条，答复要跟着降到 :1。
+            send(socket, "XGROUP", "CREATE", "xg:s", "g7", "0-0");
+            assertEquals("+OK", readReply(in));
+            send(socket, "XREADGROUP", "GROUP", "g7", "c3", "COUNT", "2", "STREAMS", "xg:s", ">");
+            assertEquals("[[xg:s, [[1-1, [a, 1]], [2-2, [b, 2]]]]]", readReplyDeep(in));
+            send(socket, "XACK", "xg:s", "g7", "1-1");
+            assertEquals(":1", readReply(in));
+            send(socket, "XGROUP", "DELCONSUMER", "xg:s", "g7", "c3");
+            assertEquals(":1", readReply(in), "不是\"发过两条\"，是\"还剩一条\"");
+            // 清账与否用历史读来验，不去碰 XPENDING 摘要那一套形状。
+            send(socket, "XREADGROUP", "GROUP", "g6", "c1", "STREAMS", "xg:s", "0-0");
+            assertEquals("[[xg:s, []]]", readReplyDeep(in),
+                    "c1 名下的账已经跟着消费者一起销了");
+
+            send(socket, "GET", "xg:str");
+            assertEquals("hello", readReply(in), "被闸门拦下的 XGROUP 不改写别的键");
         } finally {
             server.stop();
             thread.join(2000);

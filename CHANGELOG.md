@@ -481,7 +481,7 @@ All notable changes to z-cache will be documented in this file.
   `field_pos = i+1`（:1281）→ arity（:1284）→ **0-0 那一问（:1292-1295）**→ 取键
   （:1300 的 `streamTypeLookupWriteOrCreate`，WRONGTYPE 在 :1135）。
   **所以 0-0 排在 arity 之后**：`XADD k 0-0 a 1 b 2 3` 字段数是 3（奇数），:1284 先答，
-  而 `XADD k 0-0 a 1` 才轮到那句 must be greater than 0-0。这两行各钉一条断言（`:2991`、`:2994`）。
+  而 `XADD k 0-0 a 1` 才轮到那句 must be greater than 0-0。这两行各钉一条断言（`:3000`、`:3003`）。
 - **XTRIM 是反的，别顺手统一**：`lookupKeyWriteOrReply(c, argv[1], shared.czero)` + `checkType`
   排在选项解析**之前**（:2461-2462）。于是"键不在"根本问不着值 ——
   `XTRIM <不在> MAXLEN abc`、`XTRIM <不在> FOO`、`XTRIM <不在> MAXLEN -1` 一律 `:0`
@@ -502,12 +502,12 @@ All notable changes to z-cache will be documented in this file.
   `:44 :45 :46`（真裁一刀 `:1`、`XLEN :2`、`GET` 仍 `hello` —— 闸门不改写字节）。
 - **收口时我先错过一次**：多 field 条目的答复形状我按"每对再套一层"写了期望，当场红。
   读上游 `:985-1009` 才确认 `addReplyMultiBulkLen(c, numfields*2)`（:1000）交的是**平铺的 2n 个数**，
-  红的是断言不是代码，我们的字节本来是对的那一方（`RedisServerProtocolSemanticsTest.java:3033-3037`
+  红的是断言不是代码，我们的字节本来是对的那一方（`RedisServerProtocolSemanticsTest.java:3042-3045`
   把这段记在注释里）。
 - **回归**：`xaddAndXtrimOptionCircleAnswersInUpstreamOrder`
-  （`RedisServerProtocolSemanticsTest.java:2935-3044`）—— 两组阳性对照（多 field 收、`MAXLEN = 2` 真裁到
+  （`RedisServerProtocolSemanticsTest.java:2935-3052`）—— 两组阳性对照（多 field 收、`MAXLEN = 2` 真裁到
   `XLEN :2`）、arity 两形四行、MAXLEN 值三行（负数原文 ×2、`abc`）、"被拒的 XADD 不建键"
-  （:2981-2984 的 `XLEN sem:xcnew` → `:0`，就是上游 :1289-1291 那段注释要防的事）、
+  （:2989-2992 的 `XLEN sem:xcnew` → `:0`，就是上游 :1289-1291 那段注释要防的事）、
   XADD 判序三行、XTRIM 取键四行、XTRIM 三种"认不得"五行、收尾真裁一刀加 `GET`。
   全量 `mvn -o -B clean test`：**358 + 381 + 134 + 2 = 875，failures/errors/skipped 全 0**
   （`b58_full2.log`，core 一档从 380 抬到 381）。
@@ -535,6 +535,102 @@ All notable changes to z-cache will be documented in this file.
   - **R13 证明"取键那一问"内部也有可观测的先后**：被 String 占着的键在 store 那一层
     `getStream` 同样返回 null，所以"键不在"与"类型不对"换一下顺序就会把 WRONGTYPE 答成 `:0`
     —— 这一对不是那种"结构上等价的变异"，是独立可观测的（`battery58:38` 也翻这一行）。
+
+#### XGROUP 的三道闸：MKSTREAM 那一格、"键必须存在"排在分派之前，而 `DELCONSUMER` 答的是条数
+
+依据是上游 `xgroupCommand`（`t_stream.c:1798-1926`，本机 `redis-5.0.14/src/` 那份，md5
+`3b67522e…`）与 `addReplySubcommandSyntaxError`（`networking.c:604-630`）。**流族没有参照实例**
+（4.0.9 根本不认 stream），所以这一支的真值只有源码行号，下面每条都带着它。
+
+- **上游的形状是"先按参数个数问三道闸，再按子命令分派"**，而我们是"先认子命令再数参数"——
+  顺序本身就是行为，改前三格各自答各的：
+  - `XGROUP CREATE <不在的键> g 0-0` 回 `+OK`（顺手把键建了出来）；上游 :1837-1845 要求键必须存在，
+    那句 `The XGROUP subcommand requires the key to exist. Note that for CREATE you may want to use
+    the MKSTREAM option to create an empty stream automatically.` 是三段字符串拼出来的原文。
+    `DESTROY`/`DELCONSUMER`/`SETID`/`CREATECONSUMER` 的"键不在"同一句（闸门共用），改前分别回
+    `:0`、`:0`、syntax err、`:0`。
+  - `XGROUP CREATE k g 0-0 EXTRA` 回 `+OK`；上游 :1817-1824 里六个字且是 CREATE 时，
+    第六个字**必须**是 MKSTREAM，否则那句"认不得的子命令"，而且这一问排在取键之前。
+  - `XGROUP CREATE k g` / `XGROUP CREATE k` 回自造的 `wrong number of arguments for 'xgroup create'
+    command`：命令表 `xgroup` 的 arity 是 `-2`（`server.c:320`），上游根本没有这一句，
+    分派处 CREATE 只认 `argc==5 || argc==6`（:1860）、DESTROY 只认 4（:1902）、
+    DELCONSUMER 只认 5（:1913），个数不对一律落回 `Unknown subcommand or wrong number of arguments
+    for '<原样那一格>'. Try XGROUP HELP.`（第一个占位是 **argv[1] 照原样**，只有命令名大写）。
+  - `XGROUP FOO k g` 回 `-ERR syntax error`，`XGROUP DELCONSUMER k <不在的组> c` 与
+    `XGROUP SETID k <不在的组> 0-0` 也回 `-ERR syntax error`；上游后者是
+    `addReplyErrorFormat("-NOGROUP No such consumer group '%s' for key name '%s'")`（:1848-1856），
+    码就是 NOGROUP 本身。
+- **`DELCONSUMER` 的答复值取错过**：上游 :1916-1917 交的是 `streamDelConsumer` 的返回值
+  （:1765-1788，"这个消费者手上还压着几条"，消费者不在才 0），我们 `ConsumerGroup.destroyConsumer`
+  返回 boolean、命令层翻成 1/0。实测 `battery59:37`：c7 名下压着两条没 ACK，我们回 `:1`、
+  上游回 `:2`。改成返回**被清掉的条数**，且条数从 `pendingEntries` 现数而不是信 `Consumer.pendingCount`
+  那个自增计数器（与 `perConsumerPending()` 同一个理由）。
+- **实测翻行**：`battery59.txt` 39 行（`:1 :2` PING 与建 String、`:3-:6` 建流建组、
+  `:38` 重复 DELCONSUMER 的 `:0`、`:39` 收尾 `GET`）——改前 `battery59.pre` 由
+  `jar_xaddtrim`（= HEAD `7960050` 那棵树，class `51b20f9a…`）量得，改后 `battery59.post`
+  由 `jar_xgroup`（class `0828479e…`）量得，两侧各 `wrote=39 lost=none`（`b59_replay.log`）。
+  翻 **14** 行：`:7`（键不在该那句原文，改前 `+OK`）、`:14 :15 :16`（三种 CREATE 的字数形，
+  改前各回自造 arity / `+OK` / 自造 arity）、`:17`（`FOO` 该那句"认不得"，改前 syntax err）、
+  `:18`（`HELP`，见下面那条"仍差一层"）、`:20`（`DESTROY <不在的键>` 该那句原文，改前 `:0`）、
+  `:24 :25`（组不在的 NOGROUP、键不在的那句原文）、`:27 :28 :29`（SETID 三格）、
+  `:31`（`CREATECONSUMER <不在的键>`）、`:37`（DELCONSUMER 的 `:2`）。
+  **对照组 25 行一条都没动**：`:4 :5`（建组与 BUSYGROUP）、`:8`（MKSTREAM 该收）、
+  `:9`（`bad-id` + MKSTREAM 仍回 invalid ID，钉住":1869 排在 :1873-1879 建流之前"）、
+  `:10 :11 :12`（三枚 XLEN 全 `:0` —— 这就是下面那条键空间盲的判据缺口）、
+  `:13`（String 键仍 WRONGTYPE）、`:19`（光杆 `XGROUP` 仍吃命令表那句）、`:21 :22`（DESTROY 的 `:1`/`:0`）、
+  `:23`（String 键的 DESTROY 仍 WRONGTYPE）、`:26`（组在而消费者不在仍 `:0`）、
+  `:30`（`CREATECONSUMER` 在闸门之后照旧回 `:1`）、`:32-:36 :38 :39`。
+- **收口时我先错过一次，这次红的是我自己的期望**：写完断言先按"`:2`"跑，第一次真红在
+  `:2` vs `:1` —— 因为我在 `XREADGROUP` 发了两条之后先 `XACK` 掉一条，那一刻"还压着几条"就是 1，
+  上游同样回 1。**这次是代码对、断言错**，修法是补一格而不是改代码：现在两格并钉
+  （不发 ACK 的那组回 `:2`，ACK 掉一条的那组回 `:1`），前者打得住"布尔答复"，
+  后者打得住"把发过的条数当剩余条数"。
+- **回归**：`xgroupGatesRunBeforeSubcommandDispatch`（`RedisServerProtocolSemanticsTest.java:3054-3208`）。
+  两组大小写阳性对照（`XGROUP create …` 与 `… 0-0 mkstream`，都落 `:1818`/`:1860` 的 strcasecmp）、
+  MKSTREAM 三格（白给的、顶闸的、`bad-id` 抢先的）、"键不在"四格（CREATE/DESTROY/DELCONSUMER/
+  CREATECONSUMER 共用一问）、类型闸排在存在闸之前两格（CREATE 与 DELCONSUMER 各一）、
+  组不在的 NOGROUP 三格、五种字数形落回同一句、"照原样那一格"一格、DELCONSUMER 条数四格
+  （`:2`/`:0`/`:0`/`:1`）加收尾 `GET`。
+  全量 `mvn -o -B clean test`：**358 + 382 + 134 + 2 = 876，failures/errors/skipped 全 0**
+  （`b59_full3.log`，core 从 381 抬到 382；提交前又在待提交的那三个字节上重跑一遍，
+  `b59_full4.log` 同为 876 全绿、`rc=0`，跑前跑后三个文件的 md5 逐个不变
+  —— `CommandHandler 2529fd07…`、`ConsumerGroup 91296cfc…`、测试 `00f15bd2…`）。
+  **第一遍红在旧断言上**（`b59_full.log`：`Tests run: 382, Failures: 1`）——
+  `streamFamilyHoldsTheSameOneTypeInvariant:1274` 钉的是 `XGROUP DELCONSUMER <刚凭空建出的消费者>`
+  回 `:1`，钉的正是被本轮换掉的那个布尔答复。重钉成 `:0`（`RedisServerProtocolSemanticsTest.java:1273-1282`），
+  并把"删没删掉"这件事改由 `XINFO CONSUMERS` 里 c9 不再出现来证 —— 旧断言的信息量不能一起删掉。
+- **14 支具名变异，14 支全部点名判红**（`code_mut.py S`，S1-S14；快照 `2529fd07…` + `91296cfc…`
+  逐支还原对账；S2-S14 与 S1 的第一遍记在 `xgroup_S_family.log`，S1 补对照后那一遍单独记在
+  `s1_rerun.log`，末行 `还原: 2529fd07… 与副本逐字节同`）。S1 入口 arity 摘到 `< 1`、S2 MKSTREAM 那一问整块摘掉、
+  S3 MKSTREAM 变大小写敏感、S4 "键必须存在"摘掉、S5 "组必须存在"摘掉、S6 那一问只认 DELCONSUMER、
+  S7 类型闸挪到两道存在闸之后、S8 CREATE 分派松回 `< 5`、S9 只认 5 不认 6、S10 CREATE 的 ID 那一问摘掉、
+  S11 条数在命令层窄化成布尔、S12 删了人不清账、S13 "照原样"退成大写、S14 分派大小写敏感。
+  三条要说清楚：
+  - **S1 第一遍 SURVIVED，且原因不是等价**：那三个字的 `XGROUP CREATE k` 与光杆 `XGROUP` 在改前
+    没有任何一条断言读它们（光杆那一句在 1.3.5 起就是对的），所以摘掉 `< 2` 之后 2 条选取器用例
+    照绿。补了两行对照（光杆吃命令表那句、三个字落回"认不得"）再打才 KILLED，
+    红的是兜底 catch 的 JVM 文本（`-ERR internal error: Index 1 out of bounds for length 1`），
+    与 R2/R4、Q5/Q10 同源 —— 入口闸同时是"不漏 JVM 文本"那一族的闸。
+    这是 P5 那一条的第二种形态：**"没人读这行"与"这行改不动行为"是两件事，判红之前先问断言在不在**。
+    重跑那一遍里同一批的邻居格 `streamFamilyHoldsTheSameOneTypeInvariant` 也报了错，报的是
+    `startAndWait` 的 `BindException`（临时端口被本机代理抢走，成因与判据见"已知边界"里那一格），
+    不是断言红。S1 的判定只认具名那一条（`xgroupGatesRunBeforeSubcommandDispatch:3148`，
+    即"光杆 `XGROUP` 该吃命令表那句"），这条红的正是本轮新加的那一行对照；
+    而未变异的树拿同一支选取器连跑 8 次全绿，所以"这一格的红"不是选取器本身带的。
+  - **S5 的红是 `-ERR internal error: Cannot invoke "ConsumerGroup.destroyConsumer(…)"`**：
+    摘掉"组必须存在"那一问之后 DELCONSUMER 拿着 null 组直接调，落到兜底 catch。
+    这条不是"红得难看"，是那条闸还兼着防空指针 —— 所以 `CREATECONSUMER`（不在上游那份名单里）
+    自己留了一问 `group == null → :0`，没让闸门替它兜。
+  - **S7 证明"类型 vs 键存在"在 XGROUP 这一族也可观测**：被 String 占着的键在 store 那一层
+    `getStream` 同样返回 null，顺序一换就会把 WRONGTYPE 答成"键必须存在"那句
+    （`battery59:13 :23` 钉的是同一对，S7 两支红分别落在新旧两个方法里）。
+- **仍差一层，没修**（不是漏网，是单独一次提交的面）：`XGROUP SETID` 的分派（闸门已经同上游，
+  `argc==5` 那一支会把上一步的键、组两问答对，然后落回"认不得的子命令"）与 `XGROUP HELP`
+  （同样落回那一句，且那句自指）。HELP 那一条要先解决"清单里能列哪几条"：本仓在 `DEBUG HELP`
+  那里立的口径是"只列真做得到的，照抄对岸那份等于对外承诺实现 segfault"
+  （`CommandHandler.java:2198`），而把 SETID 列进 XGROUP HELP 就正好违反这条。
+  另有 `CREATECONSUMER` 是有意超出 5.0.14 的那一条（6.2 才有），本轮只让它共用闸门，
+  "已存在的消费者回 :0" 仍未动 —— 我手上没有 6.2 的尺。
 
 ### Added
 - `RedisServer.serverScope()`：只读拿到本台那一份，测试与嵌入式据此判断作用域边界。
@@ -627,6 +723,10 @@ All notable changes to z-cache will be documented in this file.
   端口探测与 bind 之间被抢占是**嫌疑**而不是证据；3 连跑第 2 次当时脚本没留住失败名，
   只剩一个 `Errors: 1`，无法归因。为此三个服务器测试类的 `startAndWait` 现在把那条
   服务器线程带回来的异常一起报出来（旧版只留下一段没人在读的栈），下次红由异常自己说。
+  **下一轮就用上了**：XGROUP 那支变异重跑时同一批的邻居格报出
+  `server thread died before listening on 63670 —— 该线程带回来的异常: java.net.BindException`，
+  紧接着 `lsof -nP -iTCP:63670` 抓到占用者是本机代理的一条 `FIN_WAIT_2` 出向连接
+  （详见"已知边界"里那一格）—— 那句由异常自己说出来的话，正是这一轮从"嫌疑"变成"实证"的入口。
 - `CommandHandler.streamTypeConflict(key)`：stream 一族"这枚键名被别的类型占着吗"的单一实现，
   按上游的 11 个位置各插一处（XADD / XLEN / XRANGE+XREVRANGE / XDEL / XTRIM / XREAD /
   XREADGROUP / XGROUP / XACK / XPENDING / XINFO，`CommandHandler.java:2491,2535,2567,2592,2617,2670,2734,2789,2838,2865,2903`）。
@@ -661,9 +761,25 @@ All notable changes to z-cache will be documented in this file.
   即本轮的改前面）与 `jar_xaddtrim`（整包 `7f579dc5…`、class `51b20f9a…` = 工作树
   `7f335e12…`）。**整包 md5 只作参照不作身份**：这枚 shaded jar 不是字节可复现的（zip 时间戳会漂），
   跨重建判同一律取 class 级 md5。
+- XGROUP 这一支的电池 `battery59.txt` 39 行（`:1` PING、`:2` 留一枚 String 键给类型闸与收尾、
+  `:3-:6` 建流与两个组、`:7-:31` 三道闸加分派的判据、`:32-:36` 为 DELCONSUMER 造一份 2 条的 PEL、
+  `:37 :38` 首删回条数 / 再删回 `:0`、`:39` 收尾核 `GET` 的副作用没被波及）：改前 `battery59.pre` 由
+  `jar_xaddtrim`（整包 `7f579dc5…`、class `51b20f9a…` = HEAD `7960050` 那棵树）量得，
+  改后 `battery59.post` 由 `jar_xgroup`（整包 `9bf2cb4c…`、`CommandHandler.class` `0828479e…`、
+  `ConsumerGroup.class` `afba9667…`）量得。**翻 14 行**：`:7 :14 :15 :16 :17 :18 :20 :24 :25 :27 :28 :29 :31 :37`；
+  其余 25 行逐字节未动（这一列是"没被波及"的对照，不是"没看"）。两侧各 `wrote=39 lost=none`
+  记在 `b59_replay.log`。
 - 量具 `code_mut.py` 从 25 支涨到 **38 支**（新增 XADD/XTRIM 那一族 R1-R13，`python3 code_mut.py R`
-  分族跑；`anchors` 现为 38 支 / 39 个锚点）。分族不换快照文件，所以 R 族打的仍是本轮工作树那份
-  （`7f335e12…`），13 支的还原行逐支回读都对得上。
+  分族跑）。分族不换快照文件，所以 R 族打的仍是上一轮工作树那份（`7f335e12…`），
+  13 支的还原行逐支回读都对得上。
+- 本轮再涨到 **52 支 / 53 个锚点**（新增 XGROUP 那一族 S1-S14，`python3 code_mut.py S` 分族跑；
+  量具第一次有了第二个目标文件 —— `stream/ConsumerGroup.java`，因为 DELCONSUMER 那条"回条数"
+  的语义长在 `destroyConsumer` 里，只在命令层打桩抓不到）。快照记的是本轮工作树的
+  `CommandHandler.java` `2529fd07…` 与 `ConsumerGroup.java` `91296cfc…`；14 支跑完后
+  `code_snapshot/*.orig` 与工作树逐个 md5 对账，两个文件都 `SAME`（即一条变异都没残留）。
+  加 S 族时 `anchors` 当场 FAIL：P2（XREADGROUP 的 NOGROUP）那 1 行锚点被我新写的 :1852 那一句
+  撞成了两处 —— 上游两处本就是同一句话，把 P2 的锚点扩到含 `// :2562 …` 那两行注释才唯一。
+  **这次 FAIL 是量具自己先红，不是被测代码红**，且在建任何 jar 之前就被抓住。
 
 ### 已知边界（这一版没动，说清楚）
 - RESP3 / `HELLO`、`EVAL` / `EVALSHA` / `SCRIPT` 依旧没有服务端实现，客户端 `DistributedLock`
@@ -722,12 +838,13 @@ All notable changes to z-cache will be documented in this file.
       够单独一次提交，所以留到下一轮。
       （注意依据档次：我们答 `:1` 是本机实测；"上游答 `:0`"是 :1240/:1268/:1327 的源码推导，
       参照实例 4.0.9 根本不认 stream，这一支没有可对拍的真值。）
-    - `XGROUP CREATE t55:nokey g9 0-0` 回 `+OK`（`battery55:14`）；上游 :1837-1845 要求键必须存在
-      （除非带 MKSTREAM），那句是
-      `The XGROUP subcommand requires the key to exist. Note that for CREATE you may want to use the MKSTREAM option…`。
-      **MKSTREAM 这条现在是判据缺口而不是已实现**：`:15`（带 MKSTREAM）与 `:14`（不带）都回 `+OK`，
-      `:16` `XLEN t55:nokey2` 也回 `:0` —— "有没有真建出一枚空流"从键空间一侧读不出来，
-      原因就是要单独收口的那条"键空间看不见 stream"。
+    - ~~`XGROUP CREATE t55:nokey g9 0-0` 回 `+OK`（`battery55:14`）；上游 :1837-1845 要求键必须存在
+      （除非带 MKSTREAM）~~ —— **本轮已闭**（见上面《XGROUP 的三道闸》，`battery59` 39 行实测翻 14 行，
+      `code_mut.py S4` 打的就是那一问）。**MKSTREAM 的判据面补了一层间接证据**：
+      `CREATE <不在的键> g 0-0 MKSTREAM` 回 `+OK` 之后，同组再 `CREATE` 必须回 `-BUSYGROUP`
+      —— 组挂在这枚流上，说明流对象确实建出来了（`RedisServerProtocolSemanticsTest.java:3095-3098`）。
+      但"键空间看不见 stream"那一条仍在（下面单独一条）：`XLEN` 那一格区分不了空流与无键
+      （`battery59:10 :11 :12` 三格全是 `:0`），`TYPE` / `EXISTS` / `DBSIZE` / `DEL` 也照旧。
     - 选项句四类各回各的：`battery55:20`/`:21`（`XREADGROUP STREAMS …` / 缺 GROUP）与 `:22`
       （`XREAD STREAMS t55:ok`，1 键 0 ID）都回 arity 句，`:23`（2 键 1 ID）回
       `Invalid stream ID specified as stream command argument`，`:24`/`:25`/`:26`
@@ -747,6 +864,12 @@ All notable changes to z-cache will be documented in this file.
       那一支 :1913），
       **根本没有 `CREATECONSUMER`**（6.2 才加）。所以这一条既不能写成缺陷也不能写成"已对齐"，
       要么换 6.2 的源码当权威，要么把它标成我们自己的扩展。
+      本轮把三道闸装好之后，量出来的越界范围收窄了：**只在"键存在"那一支才越界**。
+      `battery59:31`（键不存在）现在回"键必须存在"那句，而 5.0.14 走的正是同一条路径
+      （闸排在分派之前，压根轮不到报"认不得子命令"），这一行是重合的；
+      `battery59:30`（键存在）我们回 `:1`，5.0.14 会回 `Unknown subcommand … 'CREATECONSUMER'`。
+      另外那一支"消费者已存在该回 `:0`"（6.2 的语义）我们无条件回 `:1`，
+      手头的 5.0.14 判不了它对不对，要动这一条得先把权威换成 6.2 的源码。
   - **`delivery_count` / `delivery_time`**：上游每次经 PEL 重交条目都会抬这两个值
     （:1111-1113），`XPENDING` 的逐条目形式与 `XCLAIM` 都读它。我们的 PEL 只有
     `Map<String, String>`（条目 → 消费者），这两个值没有读者，所以这一支不写；
@@ -770,7 +893,14 @@ All notable changes to z-cache will be documented in this file.
   `ZCacheServerMain` 的命令行面：`--password` / `--password-file`（33/39 行）确实实现了，
   但全仓库测试树 grep 它只有一处注释提到 —— 参数解析、鉴权开关、`HealthCheck`
   全部零回归，于是"默认值不够硬"那一条至今没有兜底。
-- 测试端口仍是"先探一个空闲端口再 bind"，存在被抢占的窗口（频率见上）。彻底做法是
+- 测试端口仍是"先探一个空闲端口再 bind"，存在被抢占的窗口。**本轮把这一扇窗口的成因量出来了**：
+  红的那一格报 `server thread died before listening on 63670 —— BindException: Address already in use`，
+  事后 `lsof -nP -iTCP:63670` 抓到占着它的是**本机代理**的一条出向连接
+  （`verge-mih … 127.0.0.1:7897->127.0.0.1:63670 (FIN_WAIT_2)`）—— 代理客户端把
+  `freePort()` 刚放掉的临时端口拿去当了本地端口，而我们探到的号正好落在
+  `net.inet.ip.portrange.first/last = 49152/65535` 这一段里，与它抢的是同一个池。
+  同一支两例选取器在**未变异的树**上连跑 8 次：`rc=0` × 8、`BindException` 计数 0（`portflake.log`）。
+  彻底做法是
   `RedisServer` 支持 `port 0` 并回读实际端口，改动面覆盖两个测试类约 25 处，本轮没做。
 
 ## [1.3.5] - 2026-09-26
