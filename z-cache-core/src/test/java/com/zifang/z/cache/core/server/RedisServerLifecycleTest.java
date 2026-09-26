@@ -700,7 +700,7 @@ class RedisServerLifecycleTest {
             send(socket, "BITOP", "OR", "bit:dest", "bit:pad", "bit:src");
             assertEquals(":13", readReply(in), "前置条件: 最长源是 13 字节的 bit:pad");
             send(socket, "BITCOUNT", "bit:dest");
-            assertEquals(":1", readReply(in));
+            assertEquals(":22", readReply(in), "battery48:7 实测，不是手算");
         } finally {
             gen1.stop();
             t1.join(DEADLINE_MS);
@@ -722,7 +722,7 @@ class RedisServerLifecycleTest {
             send(socket, "STRLEN", "bit:dest");
             assertEquals(":13", readReply(in), "BITOP 的目标键必须活过重启");
             send(socket, "BITCOUNT", "bit:dest");
-            assertEquals(":1", readReply(in));
+            assertEquals(":22", readReply(in), "重算出来的内容要和重启前逐位相同 (battery48:7)");
             send(socket, "GETRANGE", "bit:dest", "0", "4");
             assertEquals("hello", readReply(in), "重放是按同样的源重算，不是把结果当字符串抄回来");
         } finally {
