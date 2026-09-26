@@ -24,6 +24,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
@@ -50,13 +51,6 @@ class ZCachePoolTest {
 
     @BeforeAll
     static void startEmbeddedServer() throws InterruptedException {
-        // Find a free port
-        try (ServerSocket s = new ServerSocket(0)) {
-            testPort = s.getLocalPort();
-        } catch (Exception e) {
-            testPort = 16379; // fallback
-        }
-
         bossGroup = new NioEventLoopGroup(1);
         workerGroup = new NioEventLoopGroup();
         final MemoryStore store = new MemoryStore();
@@ -74,8 +68,12 @@ class ZCachePoolTest {
                         ch.pipeline().addLast(new RedisServerHandler(commandHandler, null, null, null));
                     }
                 });
-        ChannelFuture f = b.bind(testPort).sync();
+        // 号码由这只 listen socket 自己拿（bind(0)），再从它身上读回来：中间没有"探一枚、
+        // 放开、再交给服务器去 bind"的空隙，所以操作系统没有机会把同一个号码转手给出站连接。
+        // 退回旧写法时丢掉的也不只是那扇窗 —— catch 里的退路是一枚写死的 16379。
+        ChannelFuture f = b.bind(0).sync();
         serverChannel = f.channel();
+        testPort = ((InetSocketAddress) serverChannel.localAddress()).getPort();
     }
 
     @AfterAll
@@ -102,6 +100,25 @@ class ZCachePoolTest {
     void tearDown() {
         if (pool != null) {
             pool.close();
+        }
+    }
+
+    @Test
+    void advertisedPortIsHeldByOurOwnListeningSocket() throws Exception {
+        // 交给连接池的那枚号码，必须是**我们自己的 listen socket 正拿着**的那一枚。三问各打一种来路：
+        // 号码合法（回读拿到 0 或越界就是没 bind 上）；回读的号码等于 listen socket 的号码
+        // （旧写法这里装的是探针报过的号码，与真正 bind 上的那一枚之间隔着"探完放开"的空隙，
+        // 而探针失败那一支干脆写死成 16379）；第二只 socket 想 bind 同一枚必须失败
+        // —— 它成功就说明这台嵌入式根本没在听，后面每条用例会去连别人家的号码。
+        assertTrue(testPort > 0 && testPort < 65536, "回读的号码不合法：" + testPort);
+        assertEquals(testPort, ((InetSocketAddress) serverChannel.localAddress()).getPort(),
+                "回读的号码不等于 listen socket 实际拿到的号码");
+        try (ServerSocket second = new ServerSocket()) {
+            second.setReuseAddress(false);
+            second.bind(new InetSocketAddress("127.0.0.1", testPort));
+            fail("第二只 socket 竟然 bind 得上 " + testPort + " —— 那台嵌入式服务器没在听这枚号码");
+        } catch (java.io.IOException expected) {
+            // 正是想要的：号码已被自己的 listen socket 占住
         }
     }
 

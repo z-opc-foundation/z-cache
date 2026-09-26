@@ -1096,7 +1096,57 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
 - **同一个来路还剩一处，这一票没做**：`ZCachePoolTest.startEmbeddedServer`（client 模块）自己写了
   第五份 `new ServerSocket(0)`（它那份不叫 `freePort()`，所以前面那批逐字相同的漏了它），探完关掉
   再让 Netty 去 bind 同一个号码；而它 catch 里的退路是 `testPort = 16379` —— 一枚**写死端口**，
-  跨跑互撞时的表现是"起不来"或"读到上一轮残留"。已登记为下一票。
+  跨跑互撞时的表现是"起不来"或"读到上一轮残留"。已登记为下一票，**下一票已跑完**：见下面
+  《让 listen socket 自己挑号码》那一格。
+
+#### 让 listen socket 自己挑号码：取号这一族在这里可以连根拔掉（量具侧，不是服务器行为）
+
+- **来路**：上一格登记的那一处 —— `ZCachePoolTest.startEmbeddedServer`（client 模块）自己写了
+  第五份 `new ServerSocket(0)`，探完关掉再让 Netty 去 bind 同一个号码；而它 `catch` 里的退路是
+  `testPort = 16379`。这一处的退路比窗口更糟：窗口只在"代理恰好抢走同一枚号码"时发作，
+  退路则是一枚**写死端口**，本机同时跑两遍 surefire 就是同一条地址，
+  或者更糟 —— 连上上一轮残留的那台。
+- **修法**：`b.bind(0).sync()`，然后从**已经 bind 上的那只 channel** 读回号码
+  （`ZCachePoolTest.java:74` 与它后面那一行）。这里不需要"低位窗口"那套绕法：
+  号码由 listen socket 自己拿，"探一枚、放开、再交给服务器 bind"那道空隙**根本不存在**，
+  所以操作系统没有转手的机会。`catch` 整段删掉，16379 也随之从测试树消失
+  （`grep -rn 16379 --include='*.java' */src/test` 现在只剩我自己那两句注释）。
+- **为什么这一处能连根拔而四份 `freePort()` 不能**：这个类自己握着 Netty 的 `ServerBootstrap`，
+  读回端口是它手上那行代码的事；而 `RedisServer` 明确拒收 `port 0`
+  （`RedisServer.java:98-100`：`if (port < 1 || port > 65535) throw new IllegalArgumentException`），
+  也没有"起完之后我实际听在哪一枚"的可读出口。真要按这条路收，得先给它加 `boundPort()`，
+  再改测试侧 **71** 处构造点（`grep -rc "new RedisServer("` 实测：
+  `RedisServerProtocolSemanticsTest` 48、`RedisServerLifecycleTest` 20、
+  `RedisServerReferenceParityTest` 2、`ZCacheClientIntegrationTest` 1；另有 main 侧 1 处不算）。
+  上面《已知边界》里原先写的"约 25 处"是估的，这次量出来了，已按实测改正。
+- **回读的号码落在出站区间里，这是对的**：两次实测拿回的是 `55974`、`56043`，都在 macOS 的
+  49152-65535 里。缺陷从来不是"号码在哪一段"，而是"号码有没有一秒钟不在自己手上"。
+  上一格那条守卫断言 `port < 32768`，管的是**探针**交出去的号码，两件事别混。
+- **守卫**：`ZCachePoolTest.advertisedPortIsHeldByOurOwnListeningSocket`（`:107`）三问 ——
+  号码合法、`assertEquals(testPort, listen socket 的号码)`（`:115`）、以及第二只
+  `setReuseAddress(false)` 的 socket 去 bind 同一枚**必须失败**（`:119`）。第三问是"这台服务器
+  真的在听我们 advertise 的那一枚"，与前面几格里"就绪的判据不能只是连得上"同一个来路。
+- **两支注入，各打中一问**（都是 `cp` 备份 + `cp` 还原 + md5 对账，**不走 `git checkout`**；
+  还原当时 `/tmp/ZPT.orig.java` 与盘上文件同为 `afc41ece8c09ba1df3b2babef3a9bf81`。
+  那 7 遍量完之后这个文件又改过一次**守卫方法内部的注释**（判据一条没动，改动前的注释里
+  "旧写法在这里读不回号码"那句说过头了 —— 旧写法在号码没被转手时两问都会等值通过，
+  真正咬得住的是"回读的号码是不是 listen socket 手上那一枚"），提交时的字节是
+  `7140d5d2f2205b5baba0b7cb2658ee67`，下面那两遍全量是按这一版字节重跑的）：
+  - **A**（`testPort = 16399`，模拟旧写法的固定退路）⇒ 红在
+    `回读的号码不等于 listen socket 实际拿到的号码 ==> expected: <16399> but was: <55974>`
+    （`logs/zpt_mutA.log`，rc=1，1 例 1 红）。
+  - **B**（把第三问的 bind 目标改指到一枚 `lsof -nP -iTCP:16399` 验过空白的号码，
+    即"这号码不在我们手上"）⇒ 红在
+    `第二只 socket 竟然 bind 得上 …`（`logs/zpt_mutB.log`，rc=1，1 例 1 红）。
+    这一支**证的是那句 `fail(...)`  reachable、不是恒绿**：本机上一枚没人在听的号码确实 bind 得上。
+    顺带说清一处读日志时容易误会的细节 —— 那句消息里印的是 `testPort`（`56043`），
+    而注入只换了 bind 的目标号码，所以"红句里的号码"和"注入指的号码"在这支里**故意不相等**。
+- **改后重测**：全量**连跑 7 遍，7 绿 0 红**，`Address already in use` 在 7 份日志里 0 命中
+  （`logs/zpt_full1.log` … `logs/zpt_full7.log`，每遍都是 `358 + 392 + 135 + 2 = 887`，
+  client 从 134 抬到 135 = 那条守卫；`ZCachePoolTest` 单类从 22 例到 23 例）。
+  那 7 遍之后只剩一处注释改动，于是**按提交的字节又重跑 2 遍**：`logs/zpt_final2.log`、
+  `logs/zpt_final3.log` 都是 `887 / 0 失败 / BUILD SUCCESS / Address already in use 0 命中`。
+  这一处从此没有窗口，所以它不需要像上一格那样"靠多跑几遍来赌" —— 9 遍只是不退别的判据。
 
 ### Added
 - `RedisServer.serverScope()`：只读拿到本台那一份，测试与嵌入式据此判断作用域边界。
@@ -1468,7 +1518,8 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   中间那道空隙里操作系统会把同一个号码派给一条新的出站连接（本机常驻代理，出站端口消耗快）。
   9 遍里中 2 遍 ≈ 两成（按"提交字节那 5 遍"算是 1/5），**这一条另立一票修**（测试侧，四个类里各有一份逐字相同的
   `freePort()`），不许读成"本轮改坏了"。**那一票已经跑完并闭合**：见上面《测试取号压在操作系统出站区间之下》
-  那一格（改后 12 遍全绿、基线抬到 886，同一来路还剩 `ZCachePoolTest` 一处已登记为下一票）。
+  那一格（改后 12 遍全绿、基线抬到 886）；同一来路还剩的 `ZCachePoolTest` 那一处也已闭合，
+  见《让 listen socket 自己挑号码》（基线再抬到 887）。
   上一条 `883` 的读数是上一轮那棵树的，留着记账。
 - 变异自证与提交树的字节对账：Z 族那 15 支跑完之后，四本 TARGET 又各量一次 md5，与快照
   逐字相同（CH `bde83a2252efb01f73d8fa7ed8703e93`、MS `35bb2d879b816b74607d3ad7af9a2ec7`、
@@ -1476,6 +1527,14 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   且跑完全量再量一次仍是这四个值 —— 也就是"红过的那 15 支，打的就是要提交的这一版字节"。
   两支测试文件在 Z 族之后只改过四处**注释/断言消息里的行号**（`第 41→46 行`、
   `第 51→56 行`、`db.c:831→830` 两处），判据一条没动。
+- 取号一族的最后一处也拔掉了（`ZCachePoolTest`，见上面《让 listen socket 自己挑号码》那一格）：
+  `b.bind(0)` + 从 listen socket 读回号码，第五份 `new ServerSocket(0)` 和 `testPort = 16379`
+  的退路一起删；新增守卫 `advertisedPortIsHeldByOurOwnListeningSocket`（该类 22 例 → 23 例）。
+  全量**连跑 7 遍 7 绿**，基线 **886 → 887**（`358 + 392 + 135 + 2`），7 份日志里
+  `Address already in use` 合计 0 命中（`logs/zpt_full1.log` … `zpt_full7.log`）；
+  注释微调之后按提交的字节再跑 2 遍（`logs/zpt_final2.log`、`zpt_final3.log`，同 887 同 0 命中）。
+  两支注入各打中一问（`logs/zpt_mutA.log`、`logs/zpt_mutB.log`），还原按字节 `cp` 并 md5 对账
+  `afc41ece8c09ba1df3b2babef3a9bf81`。
 
 ### 已知边界（这一版没动，说清楚）
 - RESP3 / `HELLO`、`EVAL` / `EVALSHA` / `SCRIPT` 依旧没有服务端实现，客户端 `DistributedLock`
@@ -1632,19 +1691,23 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   `ZCacheServerMain` 的命令行面：`--password` / `--password-file`（33/39 行）确实实现了，
   但全仓库测试树 grep 它只有一处注释提到 —— 参数解析、鉴权开关、`HealthCheck`
   全部零回归，于是"默认值不够硬"那一条至今没有兜底。
-- 测试端口"先探一个空闲端口再 bind"的窗口**已按号码段规避**（见上面《测试取号压在操作系统出站区间之下》
-  那一格：四份 `freePort()` 换进低位窗口，另有 `ZCachePoolTest` 自己那份尚未换）。
-  **本轮把这一扇窗口的成因量出来了**：
+- 测试端口"先探一个空闲端口再 bind"的窗口：五处里有**四处按号码段规避**（见上面
+  《测试取号压在操作系统出站区间之下》那一格：四份 `freePort()` 换进低位窗口），第五处
+  （`ZCachePoolTest`）**已连根拔掉**（见《让 listen socket 自己挑号码》：`bind(0)` + 从
+  listen socket 读回号码，不再有探针也不再有 16379 退路）。
+  **把这一扇窗口的成因量出来的那一次**：
   红的那一格报 `server thread died before listening on 63670 —— BindException: Address already in use`，
   事后 `lsof -nP -iTCP:63670` 抓到占着它的是**本机代理**的一条出向连接
   （`verge-mih … 127.0.0.1:7897->127.0.0.1:63670 (FIN_WAIT_2)`）—— 代理客户端把
   `freePort()` 刚放掉的临时端口拿去当了本地端口，而我们探到的号正好落在
   `net.inet.ip.portrange.first/last = 49152/65535` 这一段里，与它抢的是同一个池。
   同一支两例选取器在**未变异的树**上连跑 8 次：`rc=0` × 8、`BindException` 计数 0（`portflake.log`）。
-  还有一条没做：彻底做法是
-  `RedisServer` 支持 `port 0` 并回读实际端口，改动面覆盖两个测试类约 25 处。低位窗口只保证
-  "探针放掉的号码不会被派给出站连接"，不保证"不会撞上本机另一个常驻服务"（实测窗口里已有一枚
-  被 `*:25170` 占着）—— 撞上就换下一枚，而 `port 0` 是让内核自己挑、根本没有那道窗口。
+  还剩的一条：**彻底做法是把 `RedisServer` 也支持 `port 0` 并回读实际端口**，那四份探针就能
+  像 `ZCachePoolTest` 一样整段删掉。它现在拒收 0（`RedisServer.java:98-100`），测试侧的构造点
+  实测是 **71 处**（`grep -rc "new RedisServer("` 四个测试类 48/20/2/1），不是这里原先估的"约 25 处"。
+  低位窗口只保证"探针放掉的号码不会被派给出站连接"，不保证"不会撞上本机另一个常驻服务"
+  （本轮 `lsof` 实测窗口里确有一枚被 `*:25170` 占着）—— 撞上就换下一枚，而 `port 0` 是让内核
+  自己挑、根本没有那道窗口。
 
 ## [1.3.5] - 2026-09-26
 
