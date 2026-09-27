@@ -672,6 +672,343 @@ class RedisServerLifecycleTest {
     }
 
     /**
+     * AOF 重写换上去的那一份，必须是"当前状态的最小命令集"。
+     * <p>
+     * 上游同处 {@code rewriteAppendOnlyFileRio}（{@code aof.c:1299}）逐库补 {@code SELECT j}、
+     * 逐键按类型补 {@code SET}/{@code RPUSH}/{@code SADD}/{@code HMSET}/{@code ZADD}，值之后紧跟一条
+     * 绝对时刻的 {@code PEXPIREAT}（{@code :1352-1356}），变参命令一条至多 64 个成员
+     * （{@code server.h:100}）。重写之所以存在，是因为日志里堆的是<em>流水</em>：同一个键写 61 次，
+     * 恢复只需要最后一次。所以判据分两层 —— 行为层问"重启之后还在不在"，结构层问"塌没塌"：
+     * 只判前者会放过"原样抄一份旧日志"这一支（数据一字不少，体积一点不降，重写等于白做）。
+     * </p>
+     */
+    @Test
+    void aofRewriteExportsTheDatasetInsteadOfEmptyingTheLog() throws Exception {
+        java.nio.file.Path dir = java.nio.file.Files.createTempDirectory("zcache-aof-rewrite");
+        java.nio.file.Path aof = dir.resolve("appendonly.aof");
+
+        int p1 = freePort();
+        RedisServer gen1 = new RedisServer("127.0.0.1", p1, 0);
+        gen1.setDataDir(dir.toString());
+        Thread t1 = startAndWait(gen1, p1);
+        Map<String, String> shape = new LinkedHashMap<>();
+        Map<String, String> shapeWrong = new LinkedHashMap<>();
+        try (Socket socket = connect(p1)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+            for (int i = 0; i < 60; i++) {
+                send(socket, "SET", "r_str", "churn-" + i);
+                assertEquals("+OK", readReply(in));
+            }
+            send(socket, "SET", "r_str", "final");
+            assertEquals("+OK", readReply(in));
+            send(socket, "EXPIRE", "r_str", "3600");
+            assertEquals(":1", readReply(in), "前置条件: r_str 挂得上时刻");
+            send(socket, "SETEX", "r_setex", "3600", "v");
+            assertEquals("+OK", readReply(in));
+            send(socket, "LPUSH", "r_list", "a");
+            assertEquals(":1", readReply(in));
+            send(socket, "LPUSH", "r_list", "b");
+            assertEquals(":2", readReply(in));
+            send(socket, "LPUSH", "r_list", "c");
+            assertEquals(":3", readReply(in));
+            send(socket, "HSET", "r_hash", "f1", "v1");
+            assertEquals(":1", readReply(in));
+            send(socket, "HSET", "r_hash", "f2", "v2");
+            assertEquals(":1", readReply(in));
+            for (int i = 0; i < 130; i++) {
+                send(socket, "SADD", "r_set", "m" + i);
+                assertEquals(":1", readReply(in), "前置条件: 第 " + i + " 个成员要写得进去");
+            }
+            send(socket, "ZADD", "r_zset", "1", "alpha");
+            assertEquals(":1", readReply(in));
+            send(socket, "ZADD", "r_zset", "2.5", "beta");
+            assertEquals(":1", readReply(in));
+            send(socket, "SET", "r_crlf", "first\r\nsecond");
+            assertEquals("+OK", readReply(in), "前置条件: 含换行的值写得进去");
+            send(socket, "SET", "r_dead", "x");
+            assertEquals("+OK", readReply(in));
+            send(socket, "DEL", "r_dead");
+            assertEquals(":1", readReply(in));
+            send(socket, "SELECT", "3");
+            assertEquals("+OK", readReply(in));
+            send(socket, "SET", "r_in3", "v3");
+            assertEquals("+OK", readReply(in));
+            send(socket, "SELECT", "0");
+            assertEquals("+OK", readReply(in));
+            // 重写之前日志的最后一次<em>落盘</em>要在 DB 0（SELECT 本身不进日志，光切回去不算）。
+            // 少了这一笔，"换完日志要把落点抹回未知"那一判就没有猎物：重写前最后写的是 DB 3、
+            // 重写后第一条也写在 DB 3 的话，即使标志是陈的，补出的前缀碰巧还是对的。
+            send(socket, "SET", "r_tail", "t");
+            assertEquals("+OK", readReply(in));
+
+            java.util.List<String[]> before = new java.util.ArrayList<>();
+            new AofPersistence().loadAof(aof.toString(), before::add);
+            int churnRecords = countRecordsFor(before, "SET", "r_str");
+            long bytesBeforeRewrite = java.nio.file.Files.size(aof);
+            shape.put("重写前记录数", String.valueOf(before.size()));
+            shape.put("重写前 SET r_str 次数", String.valueOf(churnRecords));
+            // 这一格是下面那条"塌成一条"的猎物：流水本来不止一条，"等于 1"才不是白写的判据。
+            assertTrue(churnRecords > 50, "前置条件: 61 次 SET 要在日志里留下 61 条流水，实际 "
+                    + churnRecords + " 条");
+
+            gen1.getAofPersistence().rewriteAof(aof.toString());
+
+            java.util.List<String[]> records = new java.util.ArrayList<>();
+            new AofPersistence().loadAof(aof.toString(), records::add);
+            java.util.List<String> selectDbs = new java.util.ArrayList<>();
+            java.util.List<String> relativeVerbs = new java.util.ArrayList<>();
+            int saddChunks = 0;
+            int setMembers = 0;
+            int deadMentions = 0;
+            int longest = 0;
+            for (String[] record : records) {
+                String verb = record[0];
+                longest = Math.max(longest, record.length);
+                if ("SELECT".equals(verb) && record.length > 1) {
+                    selectDbs.add(record[1]);
+                }
+                if ("SADD".equals(verb) && record.length > 1 && "r_set".equals(record[1])) {
+                    saddChunks++;
+                    setMembers += record.length - 2;
+                }
+                if (record.length > 1 && "r_dead".equals(record[1])) {
+                    deadMentions++;
+                }
+                if (verb.equals("EXPIRE") || verb.equals("PEXPIRE") || verb.equals("EXPIREAT")
+                        || verb.equals("SETEX") || verb.equals("PSETEX")) {
+                    relativeVerbs.add(verb);
+                }
+            }
+            shape.put("重写后记录数", String.valueOf(records.size()));
+            shape.put("重写后 SET r_str 次数", String.valueOf(countRecordsFor(records, "SET", "r_str")));
+            shape.put("SADD r_set", saddChunks + " 片 / " + setMembers + " 个成员");
+            shape.put("SELECT 库号", selectDbs.toString());
+            shape.put("PEXPIREAT 条数", String.valueOf(countVerb(records, "PEXPIREAT")));
+            shape.put("提到 r_dead 的记录", String.valueOf(deadMentions));
+            shape.put("最长记录参数数", String.valueOf(longest));
+            shape.put("相对时间动词", relativeVerbs.toString());
+            shape.put("字节", java.nio.file.Files.size(aof) + "（重写前 " + bytesBeforeRewrite + "）");
+            if (java.nio.file.Files.size(aof) >= bytesBeforeRewrite) {
+                shapeWrong.put("体积", "重写的全部意义就是把流水塌小，实际 " + shape.get("字节"));
+            }
+            if (countRecordsFor(records, "SET", "r_str") != 1) {
+                shapeWrong.put("塌成一条", "同一个键的 61 次 SET 重写之后该只剩一条，实际 "
+                        + shape.get("重写后 SET r_str 次数"));
+            }
+            if (saddChunks != 3 || setMembers != 130) {
+                shapeWrong.put("分片", "130 个成员按上游 64 一片该是 3 片共 130 个，实际 "
+                        + shape.get("SADD r_set"));
+            }
+            if (!selectDbs.equals(java.util.Arrays.asList("0", "3"))) {
+                shapeWrong.put("逐库 SELECT", "只该给非空的库补 SELECT，实际 " + selectDbs);
+            }
+            if (countVerb(records, "PEXPIREAT") != 2) {
+                shapeWrong.put("时刻记录", "r_str 与 r_setex 各一条 PEXPIREAT，实际 "
+                        + shape.get("PEXPIREAT 条数"));
+            }
+            if (deadMentions != 0) {
+                shapeWrong.put("删掉的键", "r_dead 已经被 DEL，重写之后日志里不该再提它，实际 "
+                        + deadMentions + " 条");
+            }
+            if (longest > 66) {
+                shapeWrong.put("单条上限", "一条记录至多 2 + 64 个参数（上游 AOF_REWRITE_ITEMS_PER_CMD），实际最长 "
+                        + longest);
+            }
+            if (!relativeVerbs.isEmpty()) {
+                shapeWrong.put("绝对时刻", "重写出来的过期记录只许是 PEXPIREAT，实际 " + relativeVerbs);
+            }
+            assertTrue(shapeWrong.isEmpty(), "AOF 重写之后日志本身的形状（重写就是把流水塌成当前状态）: " + shape
+                    + " 不合格: " + shapeWrong);
+
+            // 换完文件还要能接着写：旧句柄指的是那个已经被换掉的 inode。
+            send(socket, "SET", "r_after", "v");
+            assertEquals("+OK", readReply(in));
+        } finally {
+            gen1.stop();
+            t1.join(DEADLINE_MS);
+        }
+        // 只留 AOF，别拿快照当恢复的功劳
+        java.nio.file.Files.deleteIfExists(dir.resolve("dump.rdb"));
+
+        int p2 = freePort();
+        RedisServer gen2 = new RedisServer("127.0.0.1", p2, 0);
+        gen2.setDataDir(dir.toString());
+        Thread t2 = startAndWait(gen2, p2);
+        Map<String, String> seen = new LinkedHashMap<>();
+        Map<String, String> wrong = new LinkedHashMap<>();
+        try (Socket socket = connect(p2)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+            expectCell(seen, wrong, socket, in, "GET r_str", "final", "GET", "r_str");
+            expectTtlCell(seen, wrong, socket, in, "r_str", 3_600);
+            expectCell(seen, wrong, socket, in, "STRLEN r_setex", ":1", "STRLEN", "r_setex");
+            expectTtlCell(seen, wrong, socket, in, "r_setex", 3_600);
+            expectListCell(seen, wrong, socket, in, "LRANGE r_list",
+                    java.util.Arrays.asList("c", "b", "a"), "LRANGE", "r_list", "0", "-1");
+            expectCell(seen, wrong, socket, in, "HGET r_hash f1", "v1", "HGET", "r_hash", "f1");
+            expectCell(seen, wrong, socket, in, "HGET r_hash f2", "v2", "HGET", "r_hash", "f2");
+            expectCell(seen, wrong, socket, in, "SCARD r_set", ":130", "SCARD", "r_set");
+            // 分片边界上的三个成员：头片、片与片之间、尾片 —— 少一片就有一头读不回来
+            expectCell(seen, wrong, socket, in, "SISMEMBER m0", ":1", "SISMEMBER", "r_set", "m0");
+            expectCell(seen, wrong, socket, in, "SISMEMBER m63", ":1", "SISMEMBER", "r_set", "m63");
+            expectCell(seen, wrong, socket, in, "SISMEMBER m64", ":1", "SISMEMBER", "r_set", "m64");
+            expectCell(seen, wrong, socket, in, "SISMEMBER m129", ":1", "SISMEMBER", "r_set", "m129");
+            expectCell(seen, wrong, socket, in, "ZSCORE beta", "2.5", "ZSCORE", "r_zset", "beta");
+            expectCell(seen, wrong, socket, in, "ZCARD r_zset", ":2", "ZCARD", "r_zset");
+            expectCell(seen, wrong, socket, in, "GET r_crlf", "first\r\nsecond", "GET", "r_crlf");
+            expectCell(seen, wrong, socket, in, "EXISTS r_dead", ":0", "EXISTS", "r_dead");
+            expectCell(seen, wrong, socket, in, "EXISTS r_in3 在 0 库", ":0", "EXISTS", "r_in3");
+            expectCell(seen, wrong, socket, in, "GET r_tail", "t", "GET", "r_tail");
+            expectCell(seen, wrong, socket, in, "GET r_after", "v", "GET", "r_after");
+            send(socket, "SELECT", "3");
+            assertEquals("+OK", readReply(in));
+            expectCell(seen, wrong, socket, in, "GET r_in3 在 3 库", "v3", "GET", "r_in3");
+        } finally {
+            gen2.stop();
+            t2.join(DEADLINE_MS);
+        }
+        assertTrue(wrong.isEmpty(), "AOF 重写之后重启，每一格都要带着值回来（缺哪一格就知道那一支导出没做）: "
+                + seen + " 不合格: " + wrong);
+    }
+
+    /**
+     * 没接 {@code StoreAccessor} 的实例导不出任何东西 —— 那一支 rewriteAof 必须拒绝，
+     * 而不是写一份<em>空</em>日志再把真的有内容的那份换掉（这一格改动前的实际形状：
+     * 注释自陈"实际实现需要依赖 StoreAccessor"，然后把 {@code appendonly.aof} 删了）。
+     */
+    @Test
+    void rewriteWithoutStoreAccessorRefusesInsteadOfWipingTheLog() throws Exception {
+        java.nio.file.Path dir = java.nio.file.Files.createTempDirectory("zcache-aof-bare");
+        java.nio.file.Path aof = dir.resolve("appendonly.aof");
+        AofPersistence seeded = new AofPersistence();
+        seeded.start(aof.toString());
+        seeded.appendCommand(new String[]{"SET", "kept", "v"});
+        seeded.shutdown();
+        byte[] before = java.nio.file.Files.readAllBytes(aof);
+        assertTrue(before.length > 0, "前置条件: 日志里先要有内容，\"不许换掉它\"才不是空话");
+
+        AofPersistence bare = new AofPersistence();
+        bare.start(aof.toString());
+        try {
+            IllegalStateException thrown = assertThrows(IllegalStateException.class,
+                    () -> bare.rewriteAof(aof.toString()),
+                    "导不出状态就不许换日志 —— 换成空的那一份等于抹掉整个数据集");
+            assertTrue(thrown.getMessage().contains("StoreAccessor"),
+                    "红消息要点名缺的是谁，实际: " + thrown.getMessage());
+            org.junit.jupiter.api.Assertions.assertArrayEquals(before,
+                    java.nio.file.Files.readAllBytes(aof), "拒绝重写之后日志的字节一个字都不许动");
+        } finally {
+            bare.shutdown();
+        }
+    }
+
+    /**
+     * 两条连接交替写时，日志里的每一段都要落回<em>它自己那一库</em>。
+     * <p>
+     * 上游 {@code server.aof_selected_db}（{@code server.h:1087}）记的是<b>日志</b>当前的落点，
+     * 不是连接的当前库：{@code feedAppendOnlyFile} 拿目标库和它比（{@code aof.c:586}），不同才补
+     * {@code SELECT} 并更新（{@code :592}）。"我这条连接在不在 DB 0"是另一回事 —— 日志只有一份，
+     * 一条连接切去 DB 3 写过之后，留在 DB 0 的那条连接补不出前缀，它的每一次写都会在重放时
+     * 落进 DB 3（而 DB 3 里那些键对它不可见，等于数据静默失踪）。
+     * </p>
+     * <p>
+     * 判据分两层：结构层只读日志、按日志自己的 SELECT 走一遍算出"每个键重放时会落在哪一库"，
+     * 顺带钉住"同库连写不重复打前缀"；行为层删掉快照、只留 AOF 重启，逐格问它到底在不在。
+     * </p>
+     */
+    @Test
+    void aofPositionFollowsEachConnectionsOwnDatabase() throws Exception {
+        java.nio.file.Path dir = java.nio.file.Files.createTempDirectory("zcache-aof-position");
+        java.nio.file.Path aof = dir.resolve("appendonly.aof");
+
+        int p1 = freePort();
+        RedisServer gen1 = new RedisServer("127.0.0.1", p1, 0);
+        gen1.setDataDir(dir.toString());
+        Thread t1 = startAndWait(gen1, p1);
+        Map<String, String> shape = new LinkedHashMap<>();
+        Map<String, String> shapeWrong = new LinkedHashMap<>();
+        try (Socket a = connect(p1); Socket b = connect(p1)) {
+            DataInputStream ain = new DataInputStream(a.getInputStream());
+            DataInputStream bin = new DataInputStream(b.getInputStream());
+            send(a, "SELECT", "3");
+            assertEquals("+OK", readReply(ain), "前置条件: a 这条连接切到 DB 3");
+            send(a, "SET", "a_in3", "v3");
+            assertEquals("+OK", readReply(ain));
+            // b 是一条全新的连接，它一个字都没 SELECT 过 —— 它就在 DB 0
+            send(b, "SET", "b_in0", "v0");
+            assertEquals("+OK", readReply(bin));
+            send(b, "SET", "c_in0", "v1");
+            assertEquals("+OK", readReply(bin));
+            send(a, "SET", "d_in3", "v4");
+            assertEquals("+OK", readReply(ain));
+
+            java.util.List<String[]> records = new java.util.ArrayList<>();
+            new AofPersistence().loadAof(aof.toString(), records::add);
+            java.util.List<String> selectDbs = new java.util.ArrayList<>();
+            Map<String, String> keyDb = new LinkedHashMap<>();
+            int position = 0;   // 重放用的是一个全新连接，起点恒为 DB 0
+            for (String[] record : records) {
+                if ("SELECT".equals(record[0]) && record.length > 1) {
+                    position = Integer.parseInt(record[1]);
+                    selectDbs.add(record[1]);
+                } else if (record.length > 1 && "SET".equals(record[0])) {
+                    keyDb.put(record[1], Integer.toString(position));
+                }
+            }
+            shape.put("记录数", String.valueOf(records.size()));
+            shape.put("SELECT 序列", selectDbs.toString());
+            shape.put("键重放时所在库", keyDb.toString());
+            assertTrue(records.size() >= 4, "前置条件: 四次写至少要在日志里留下四条记录，实际 "
+                    + records.size() + " 条");
+            // 库号一共变了三次（→3、→0、→3），所以前缀恰好三条：多一条 = 每条写都重复打前缀，
+            // 少一条 = 有一次换库没被记下来，那一格下面的 keyDb 对照会点名是哪一库。
+            if (!selectDbs.equals(java.util.Arrays.asList("3", "0", "3"))) {
+                shapeWrong.put("SELECT 序列", "日志里的落点该是 3→0→3 各补一条前缀，实际 " + selectDbs);
+            }
+            Map<String, String> expectedDb = new LinkedHashMap<>();
+            expectedDb.put("a_in3", "3");
+            expectedDb.put("b_in0", "0");
+            expectedDb.put("c_in0", "0");
+            expectedDb.put("d_in3", "3");
+            for (Map.Entry<String, String> cell : expectedDb.entrySet()) {
+                String actual = keyDb.get(cell.getKey());
+                if (!cell.getValue().equals(actual)) {
+                    shapeWrong.put(cell.getKey(), "重放时该落在 DB " + cell.getValue() + "，实际日志把它放在 "
+                            + actual);
+                }
+            }
+            assertTrue(shapeWrong.isEmpty(), "AOF 里每一段的落点（前缀跟着日志的落点走，不是跟着连接走）: "
+                    + shape + " 不合格: " + shapeWrong);
+        } finally {
+            gen1.stop();
+            t1.join(DEADLINE_MS);
+        }
+        java.nio.file.Files.deleteIfExists(dir.resolve("dump.rdb"));
+
+        int p2 = freePort();
+        RedisServer gen2 = new RedisServer("127.0.0.1", p2, 0);
+        gen2.setDataDir(dir.toString());
+        Thread t2 = startAndWait(gen2, p2);
+        Map<String, String> seen = new LinkedHashMap<>();
+        Map<String, String> wrong = new LinkedHashMap<>();
+        try (Socket socket = connect(p2)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+            expectCell(seen, wrong, socket, in, "GET b_in0", "v0", "GET", "b_in0");
+            expectCell(seen, wrong, socket, in, "GET c_in0", "v1", "GET", "c_in0");
+            expectCell(seen, wrong, socket, in, "EXISTS a_in3 在 0 库", ":0", "EXISTS", "a_in3");
+            send(socket, "SELECT", "3");
+            assertEquals("+OK", readReply(in));
+            expectCell(seen, wrong, socket, in, "GET a_in3", "v3", "GET", "a_in3");
+            expectCell(seen, wrong, socket, in, "GET d_in3", "v4", "GET", "d_in3");
+            expectCell(seen, wrong, socket, in, "EXISTS b_in0 在 3 库", ":0", "EXISTS", "b_in0");
+        } finally {
+            gen2.stop();
+            t2.join(DEADLINE_MS);
+        }
+        assertTrue(wrong.isEmpty(), "只留 AOF 重启之后，四个键要各自回到自己那一库（串库 = 数据在原库里失踪）: "
+                + seen + " 不合格: " + wrong);
+    }
+
+    /**
      * 没配 dataDir 时 SAVE 不能装作成功。
      * <p>
      * 旧实现里 SAVE / BGSAVE 都直接返回一个写死的 OK，LASTSAVE 返回当前时间 —— 三个命令
@@ -958,6 +1295,68 @@ class RedisServerLifecycleTest {
     }
 
     // ==================== helpers ====================
+
+    /** 数一个动词在日志里出现了几条。 */
+    private static int countVerb(java.util.List<String[]> records, String verb) {
+        int count = 0;
+        for (String[] record : records) {
+            if (verb.equals(record[0])) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    /** 数"某动词 + 某键"的记录条数 —— 流水塌没塌就问这一句。 */
+    private static int countRecordsFor(java.util.List<String[]> records, String verb, String key) {
+        int count = 0;
+        for (String[] record : records) {
+            if (record.length > 1 && verb.equals(record[0]) && key.equals(record[1])) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    /** 打一条命令、按单值形状读回、和期望比对；读数一律留档，红的时候一次看整张表。 */
+    private static void expectCell(Map<String, String> seen, Map<String, String> wrong, Socket socket,
+                                   DataInputStream in, String label, String expected,
+                                   String... command) throws IOException {
+        send(socket, command);
+        String actual = readReply(in);
+        seen.put(label, actual);
+        if (!expected.equals(actual)) {
+            wrong.put(label, "期望 " + expected + "，实际 " + actual);
+        }
+    }
+
+    /** 多值那一格（LRANGE 之类）：整份顺序都要一样，不是"里面有没有"。 */
+    private static void expectListCell(Map<String, String> seen, Map<String, String> wrong, Socket socket,
+                                       DataInputStream in, String label, java.util.List<String> expected,
+                                       String... command) throws IOException {
+        send(socket, command);
+        java.util.List<String> actual = readArray(in);
+        seen.put(label, actual.toString());
+        if (!expected.equals(actual)) {
+            wrong.put(label, "期望 " + expected + "，实际 " + actual);
+        }
+    }
+
+    /**
+     * 时刻那一格：还活着，且剩余时间不超过当初挂上的那个数。
+     * 上界钉的是"记相对时间就会白续一期"（13d 那条规矩在重写这一支的落点），
+     * 下界钉的是"导出没带上时刻" —— 那会让 TTL 读成 -1（永久键）。
+     */
+    private static void expectTtlCell(Map<String, String> seen, Map<String, String> wrong, Socket socket,
+                                      DataInputStream in, String key, int seededSeconds) throws IOException {
+        send(socket, "TTL", key);
+        String reply = readReply(in);
+        seen.put("TTL " + key, reply);
+        long remaining = reply.startsWith(":") ? Long.parseLong(reply.substring(1)) : Long.MIN_VALUE;
+        if (remaining <= 3_000L || remaining > seededSeconds) {
+            wrong.put("TTL " + key, "期望落在 (3000, " + seededSeconds + "]，实际 " + reply);
+        }
+    }
 
     /** 探测用的端口窗口：只在操作系统**出站**区间之下取，见 {@link #freePort()}。 */
     private static final int PORT_BASE = 20000, PORT_SPAN = 10000;

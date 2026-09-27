@@ -3458,19 +3458,18 @@ public class CommandHandler {
     }
 
     /**
-     * 落一组 AOF 记录（一条命令可以换写出多条）。当前连接不在 DB 0 时必须先写 SELECT：
-     * AOF 重放用的是一个全新连接（db 恒为 0），不带上库号的话 {@code SELECT 3} 之后
-     * 写进去的数据会全部落到 DB 0。SELECT 只在前缀打一次，不必每条记录都重复。
+     * 落一组 AOF 记录（一条命令可以换写出多条）。每条都带着<em>当前库号</em>交给日志：AOF 重放
+     * 用的是一个全新连接（它的 DB 由日志里的 SELECT 决定），所以库号必须跟着进日志，否则
+     * {@code SELECT 3} 之后写进去的数据会全部落到 DB 0。
+     * <p>
+     * "要不要补 SELECT"这一判不在这里做，交给 {@link AofPersistence#appendCommand(int, String[])}
+     * —— 前缀取决于<em>日志当前的落点</em>（上游 {@code server.aof_selected_db}），而落点是日志的
+     * 属性：两条连接交替写、或者中间换过一次日志（{@code rewriteAof}），都会让"这条连接在不在
+     * DB 0"这个本地判断失真。
      */
     private void writeAofRecords(java.util.List<String[]> records) throws java.io.IOException {
-        if (records.isEmpty()) {
-            return;
-        }
-        if (currentDb != 0) {
-            aof().appendCommand(new String[]{"SELECT", Integer.toString(currentDb)});
-        }
         for (String[] record : records) {
-            aof().appendCommand(record);
+            aof().appendCommand(currentDb, record);
         }
     }
 

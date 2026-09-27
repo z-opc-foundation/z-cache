@@ -219,7 +219,8 @@ public class RedisServer {
 
         // 初始化 RDB 持久化
         rdbPersistence = new RdbPersistence();
-        rdbPersistence.setStoreAccessor(new MemoryStoreAccessor(store));
+        MemoryStoreAccessor accessor = new MemoryStoreAccessor(store);
+        rdbPersistence.setStoreAccessor(accessor);
         String rdbPath = dataDir + "/dump.rdb";
         // load() 只吃路径参数、不记住它；不显式 setDbFilePath 的话 save() 会写到
         // 默认相对路径 ./dump.rdb（进程 cwd），也就是 --data-dir 之外的另一个文件，
@@ -229,6 +230,9 @@ public class RedisServer {
 
         String aofPath = dataDir + "/appendonly.aof";
         aofPersistence = new AofPersistence();
+        // 重写要导出的就是快照导的同一份状态。不接它，rewriteAof 只能导出<em>空</em>命令集，
+        // 而它接下来会把有内容的 appendonly.aof 换成那份空的。
+        aofPersistence.setStoreAccessor(accessor);
         // fsync 策略必须在 start() 之前定：start() 按当时的策略决定要不要起每秒 fsync 的调度。
         // 配错不静默采纳（原来是"写什么都是 EVERYSEC"）。
         String fsync = System.getProperty("zcache.appendfsync");

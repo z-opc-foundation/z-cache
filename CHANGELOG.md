@@ -1621,9 +1621,88 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   `truncateAndReopen()`。它今天零调用方（全仓 `grep -rn rewriteAof` 只有定义那一行），但方法是 `public`：
   谁把它接上 `BGREWRITEAOF` 或体积自动重写，谁就在抹整个数据集。要么按上游那一遍补全
   （逐键导出 + 每键一条绝对时刻 `PEXPIREAT`），要么连 `rewriting` / `rewriteExecutor` 一起删掉。
+  **这一格由下面的 13e 关闭**（那一处的 `:319` 与下面的 `:3470 / :3473` 都是当时现读的行号，
+  13e 之后分别移到 `AofPersistence:420` 与 `CommandHandler:3470`）。
   对照记录：`appendCommand` 的调用点只有两处（`CommandHandler:3470 / :3473`），都在 `writeAofRecords` 里，
   所以这一格的换写没有被绕过的第二条写入路径。
 - 250 那一侧仍然没有实测：它还是拒绝 ssh（`kex_exchange_identification` 直接 reset），本轮全部读数单机。
+
+#### AOF 重写导出的是空日志，接上它的人就是在抹数据集；顺手把"日志的落点"从连接身上搬回日志（13e）
+
+- **来账**：上一格末尾登记的那条待办 —— `AofPersistence.rewriteAof()` 写一份**空**命令集再删掉真有内容的
+  `appendonly.aof`。**这一格由本格关闭**。它当时零调用方，所以没坏过任何东西；坏东西的是"下一版接上它"：
+  `BGREWRITEAOF` 一旦补上，或者按体积触发自动重写，第一条就是抹库。
+- **改动**（`AofPersistence`）：`rewriteAof()`（`:420`）现在真的导出当前状态 ——
+  `exportMinimalCommandSet()`（`:477`）逐库补 `SELECT j`（只给非空的库，上游 `aof.c:1306 / :1308`）、
+  逐键按类型补 `SET` / `HMSET` / `RPUSH` / `SADD` / `ZADD`，每个键之后紧跟一条**绝对时刻**的
+  `PEXPIREAT`（`:557`，上游 `aof.c:1352-1356`），变参命令按 `REWRITE_ITEMS_PER_CMD = 64`（`:146`，
+  上游 `server.h:100`）分片（`:538`）。写出去走的是追加路径那一份 RESP 编码器（`writeRecords :573`），
+  所以两侧的字节形状同源。落盘是"写临时文件 → 关旧句柄 → `renameTo` → 重开追加句柄"，全在
+  `appendCommand` 用的那把锁里；`renameTo` 失败也先把句柄接回去再抛（留着 `writer == null` 会让之后
+  每一条写命令在判空里静默丢掉，比不重写更糟）。没接 `StoreAccessor` 时**拒绝**：抛
+  `IllegalStateException` 且一个字节都不写 —— 导不出状态就只能导出"空"，而空日志接下来会盖掉真的那一份。
+  `RedisServer:222` 把那一份 `MemoryStoreAccessor` 提出来共用：快照在 `:223` 接，重写在 `:235` 接，
+  两侧导的是同一份状态。
+- **同时改掉的第二格（这一格是判据自己走上来的）**：`writeAofRecords()`（`CommandHandler:3470`）原来按
+  "这条连接在不在 DB 0"决定补不补 `SELECT`。上游比的不是这个 —— 它比的是**日志当前的落点**：
+  `if (dictid != server.aof_selected_db)`（`aof.c:586`）才补 `SELECT` 并更新（`:592`），字段声明在
+  `server.h:1087`（"Currently selected DB in AOF"），换过一次日志之后抹回 `-1`
+  （`aof.c:1771`，注释原文 "Make sure SELECT is re-issued"），启动与停机同理（`server.c:1602` /
+  `aof.c:241`）。落在连接上有两个洞，都在本轮现形：
+  ① 两条连接交替写时，一条切去 DB 3 写过之后，留在 DB 0 的那条补不出前缀 —— 它的每一次写重放时全部
+  落进 DB 3，而在原库里读不见了；
+  ② 重写之后日志整个换了一份，"我上一条写在哪个库"这个本地记忆与磁盘上的位置脱节。
+  现在落点是日志自己的属性：`lastJournaledDb`（`AofPersistence:132`，初值 -1）+ `appendCommand(int, String[])`
+  （`:335`），`start()`（`:221`）/ `stop()`（`:250`）/ 换完文件（`:461`）三处抹回 -1。
+- 判据三支（全在 `RedisServerLifecycleTest`，全部走真实进程边界 + 真实文件）：
+  `aofRewriteExportsTheDatasetInsteadOfEmptyingTheLog`（`:686`）—— 61 次同键流水 + 五种类型 + 130 成员的
+  集合 + 含 CRLF 的值 + 一个已删的键 + DB 3 里的键，结构层八格（`:820`：塌成一条 / 分片 3 片共 130 个 /
+  只给非空库补 SELECT / `PEXPIREAT` 恰两条 / 删掉的键不再提 / 单条至多 66 参数 / 不得留相对时间 / 体积必须降），
+  行为层在删掉 `dump.rdb` 重启之后逐格读回 20 格（`:869`）。
+  `aofPositionFollowsEachConnectionsOwnDatabase`（`:919`）—— 两条连接交替写，结构层（`:979`）按日志自己的
+  SELECT 走一遍算出"每个键重放时会落在哪一库"，顺带钉"同库连写不重复打前缀"（前缀恰好三条）；
+  行为层（`:1007`）只留 AOF 重启后逐格问它在不在。
+  `rewriteWithoutStoreAccessorRefusesInsteadOfWipingTheLog`（`:879`）—— 拒绝式判据 + 断言日志的字节一个都不动。
+- 改前的形状（在 `git archive HEAD`（`3da16d8`）解出来的独立树上跑本轮这三份判据，不碰工作区，
+  日志 `logs/rw_headshape.log`）：`Tests run: 3, Failures: 3`；重写那一跑报
+  `重写前记录数=207 → 重写后记录数=0`、`字节=0（重写前 7344）`（整个数据集没了）；
+  落点那一跑报 `SELECT 序列=[3, 3]`、`b_in0 / c_in0 实际日志把它放在 3`；
+  拒绝那一跑报 `Expected java.lang.IllegalStateException to be thrown, but nothing was thrown.`。
+- 牙（第八份量具 `~/.cache/zcache_gauges/aof_rw_mut/aof_rw_teeth.py`；被量字节
+  `AofPersistence.java f8f40cecff9d9cf37d7ab7a3cf722dd3` + `CommandHandler.java 5e81c49fe782d4708e7bfd3896b8788c`，
+  每支还原后 md5 对账 `match=True`；日志 `logs/aof_rw_*.log`）：
+  W1 导出摘掉 → `塌成一条`；W2 逐库 SELECT 摘掉 → `逐库 SELECT`；W3 分片上限抬到无穷 → `分片, 单条上限`
+  （读数 `1 片 / 130 个成员`、`最长 132`）；W4 空库不再跳过 → `逐库 SELECT`（读数 16 个库全在）；
+  W5 导出不带时刻 → `时刻记录`；W6 时刻换成相对 `EXPIRE` → `绝对时刻`；W7 拒绝改成静默返回 →
+  `IllegalStateException to be thrown`；P1 前缀回到"看连接在不在 DB 0" → `b_in0=重放时该落在 DB 0` + `GET r_after`
+  （两支判据各自红，正好说明两个洞是同一条判据的两半）；P2 每条记录都补前缀 → `SELECT 序列`；
+  P3 永不补前缀 → `SELECT 序列`；P4 换完日志不抹回 -1 → `GET r_after`。`SUMMARY mutants=11 bad=0`。
+  过程中三处量具/判据自己的毛病，记下来免得重犯：
+  ① P4 第一版报 **SURVIVED** —— 那不是等价变异，是**判据没有猎物**：重写前最后一次落盘在 DB 3、重写后
+  第一条也写在 DB 3，陈标志碰巧补出了对的前缀。补一笔 `SET r_tail`（`:741`）把"重写前最后一次落盘"挪到
+  DB 0，P4 才红在 `GET r_after`。**"标志复位"这一类判据，猎物必须是"标志的值恰好与复位之后一样"的那种排布。**
+  ② `joined = "\n".join(reds)` 是按物理行拼证据，而判据里那条 `GET r_crlf` 的值自带 CRLF，一条断言在日志里
+  会劈成好几个物理行 ⇒ P1 被误判成 RED-WRONG。现在 expects 只在 surefire 的 `Failures:` 那一段里找
+  （`red_text()`），既跨得住劈行，又不会把 INFO 级日志里的 AOF 流水算进证据。
+  ③ 冒烟（`control.py`：把判据里一格的期望值改成 9，量具必须报 GAUGE-HAS-TEETH）第一版报 **GAUGE-BLIND** ——
+  尺是好的，hint 是我凭测试源码模板写的（"该落在 DB 0"），注入后的真红行是"该落在 DB 9，实际…0"。
+  从实测日志逐字抄之后 `注入红=1 / GAUGE-HAS-TEETH`，还原 `match=True`。
+- 未覆盖面（记账，不当分）：`renameTo` 失败那一支（重开句柄后抛 `IOException`）没有猎物 —— 本机没有可移植
+  的办法让同目录改名失败；`rewriting` 的并发标志（"rewrite already in progress"）同样零判据。
+- 与上游的差别（记账）：① 不 fork，导出与换文件全在写锁里，代价是重写期间写侧被堵住，换来的是不需要
+  `aofRewriteBuffer`；② 键的导出顺序按类型分五趟，上游是一库里逐键问类型（`aof.c:1314` 那个
+  `while((de = dictNext(di)) != NULL)`），**记录集合一致、只有先后不同**，所以两侧判据都不许钉键的先后；
+  ③ Stream 键导不出来（`StoreAccessor` 没有 stream 的枚举口：同文件里 `getAll` 命中 6 处、`Stream` 命中 0 处），
+  也就是说**一份含 stream 键的库过一遍重写，那一族键会从日志里消失** —— 与 #20（stream 进不了 RDB 快照）
+  同根，登记为下一格。
+- 仍然没接上的（记账）：`BGREWRITEAOF` 这个命令在 `z-cache-core/src/main` 里 0 命中（同尺阳性对照：
+  `BGSAVE` 3 命中、`FLUSHALL` 在 `CommandHandler` 里接线），所以本轮修好的一版重写至今只在测试里跑；
+  `rewriteExecutor`（`:114 / :157 / :172`）除了 shutdown 没有任何调度方；`syncFile()` 的注释自陈
+  "这里通过 flush 保证数据写入操作系统缓冲区" —— 也就是 `FSYNC_ALWAYS` 与每秒 fsync 都**没有真的 fsync**，
+  宣传的持久化强度还没兑现（新格）。
+- 基线 `903`（`358 + 408 + 135 + 2`，全量 `mvn -o -B clean test` rc=0 / BUILD SUCCESS / Total time 34.2s，
+  日志 `logs/rw_full2.log`）：core 405 → 408，本格新增 3 个 `@Test`。
+- 250 那一侧仍然没有实测：本轮全部读数单机（判据、牙、基线都在这一台机器上）。
 
 ### Added
 - `RedisServer.serverScope()`：只读拿到本台那一份，测试与嵌入式据此判断作用域边界。
