@@ -15,6 +15,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
@@ -466,13 +467,7 @@ arg2\r
      * @throws IOException 导出、落盘或换文件失败
      */
     public void rewriteAof(String aofFilePath) throws IOException {
-        if (aofFilePath == null || aofFilePath.isEmpty()) {
-            throw new IllegalArgumentException("aofFilePath cannot be null or empty");
-        }
-
-        if (!started.get()) {
-            throw new IllegalStateException("AOF not started");
-        }
+        checkRewriteArguments(aofFilePath);
 
         if (!rewriting.compareAndSet(false, true)) {
             // 上游这里回 "-ERR Background append only file rewriting already in progress"。
@@ -480,6 +475,77 @@ arg2\r
             throw new IllegalStateException("AOF rewrite already in progress");
         }
 
+        rewriteInternal(aofFilePath);
+    }
+
+    /**
+     * 这一份日志现在<em>能不能</em>被重写 —— 只读，不抛。
+     * <p>
+     * 命令层需要它：上游 {@code bgrewriteaofCommand}（{@code aof.c:1629-1640}）除了"已经有人在重写"
+     * （{@code :1630-1631}）之外不查任何档位 —— 整个函数里没有 {@code AOF_OFF} 判断，它只需要一个
+     * 写得出去的路径。我们的路径只在带 dataDir 启动时才成立，所以"没配 dataDir"就是"没有一份日志
+     * 可换"的对应物，那一支必须如实回错而不是默默回一个 {@code +OK}。
+     * </p>
+     */
+    public boolean isRewriteSupported() {
+        String path = aofFilePath;
+        return started.get() && path != null && !path.isEmpty();
+    }
+
+    /**
+     * 把重写排到 {@link #rewriteExecutor} 上，立刻回调用方 —— 上游 {@code BGREWRITEAOF} 的
+     * 形状是"回一句 {@code +Background append only file rewriting started}，活在后头干"
+     * （{@code aof.c:1635-1636} 打的是 {@code addReplyStatus}，是一个简单字符串而不是错误）。
+     * <p>
+     * 与上游的差别仍然是"不 fork"：上游由子进程写临时文件、父进程期间继续写旧日志；我们那一次
+     * 重写会在 {@link #appendCommand} 的那把锁里堵住写侧。所以标志必须<em>在入队之前</em>抢：
+     * 线程池里的任务什么时候排到不可知，标志晚了半步，期间进来的 {@code BGREWRITEAOF} 就会看到
+     * "没人重写"而再排一份。
+     * </p>
+     *
+     * @return {@code true} 表示已经排上；{@code false} 表示这一份日志不可重写或已经有人在重写
+     */
+    public boolean rewriteAsync() {
+        String path = aofFilePath;
+        if (!started.get() || path == null || path.isEmpty()) {
+            return false;
+        }
+        if (!rewriting.compareAndSet(false, true)) {
+            return false;
+        }
+        try {
+            rewriteExecutor.execute(() -> {
+                try {
+                    // 标志的归还只有<em>一处</em>：{@link #rewriteInternal} 自己的 finally。
+                    // 这里原先也还了一次，两处归还看着更保险，实际是让"忘了归还"这一种坏法
+                    // 在任何一处都测不出来 —— 只留一处，谁漏了立刻看得见。
+                    rewriteInternal(path);
+                } catch (Throwable t) {
+                    // 线程池里抛出去的东西没人接：不许静默。标志已经还了，但日志的形状
+                    // 停在"重写之前那一份"，除了这一行日志之外没有任何一面看得见它失败过。
+                    LOGGER.log(Level.WARNING, "Background AOF rewrite failed", t);
+                }
+            });
+            return true;
+        } catch (RejectedExecutionException e) {
+            // 排不上就必须把标志还回去，否则这一份日志从此"永远有人在重写"。
+            rewriting.set(false);
+            return false;
+        }
+    }
+
+    private void checkRewriteArguments(String aofFilePath) {
+        if (aofFilePath == null || aofFilePath.isEmpty()) {
+            throw new IllegalArgumentException("aofFilePath cannot be null or empty");
+        }
+
+        if (!started.get()) {
+            throw new IllegalStateException("AOF not started");
+        }
+    }
+
+    /** 调用方必须<em>已经</em>抢到 {@link #rewriting} 标志；这一支在结束时把它清掉。 */
+    private void rewriteInternal(String aofFilePath) throws IOException {
         try {
             LOGGER.info("Starting AOF rewrite");
             StoreAccessor accessor = storeAccessor;

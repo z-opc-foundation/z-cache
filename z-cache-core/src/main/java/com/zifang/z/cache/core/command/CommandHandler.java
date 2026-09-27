@@ -429,6 +429,7 @@ public class CommandHandler {
                 case "PUBLISH":      result = handlePublish(args);      break;
                 case "PUBSUB":       result = handlePubsub(args);       break;
                 case "BGSAVE":  result = handleBgsave(); break;
+                case "BGREWRITEAOF": result = handleBgrewriteaof(); break;
                 case "SAVE":    result = handleSave(); break;
                 case "LASTSAVE":result = handleLastsave(); break;
                 case "SLOWLOG": result = handleSlowlog(args); break;
@@ -1941,6 +1942,33 @@ public class CommandHandler {
             return RespError.of("ERR", "Background save already in progress. Please wait");
         }
         return RespSimpleString.of("Background saving started");
+    }
+
+    /**
+     * BGREWRITEAOF — 受理后台日志重写。
+     * <p>
+     * 上游 {@code bgrewriteaofCommand}（{@code aof.c:1629-1640}）只有三支：已经有人在重写回错误
+     * （{@code :1631}）、fork 成功回一句<em>状态</em>（{@code :1636} 打的是 {@code addReplyStatus}，
+     * 也就是简单字符串 {@code +Background append only file rewriting started}），否则回 {@code -ERR}。
+     * 1.3.6 之前这一支<em>根本不存在</em>：重写机制整套都在（{@code AofPersistence.rewriteAof}、
+     * 专门的 {@code rewriteExecutor}），但没有任何命令能触发它，那个线程池从头到尾没人提交过任务。
+     * </p>
+     * <p>
+     * 与上游的一处差别：那一支不查 {@code appendonly} 档位（整个函数没有 {@code AOF_OFF} 判断，
+     * 5.0.14 里也搜不到"append only mode is disabled"这类文案），它只要有一个写得出去的路径。
+     * 我们的路径只在带 dataDir 启动时才成立，所以"没配 dataDir"就是"没有一份日志可换"的对应物 ——
+     * 宁可如实报错，也不许回一句 {@code +...started} 却什么都没干。
+     * </p>
+     */
+    private Object handleBgrewriteaof() {
+        AofPersistence a = aof();
+        if (a == null || !a.isRewriteSupported()) {
+            return RespError.of("ERR", "BGREWRITEAOF is not supported: no data directory configured");
+        }
+        if (!a.rewriteAsync()) {
+            return RespError.of("ERR", "Background append only file rewriting already in progress");
+        }
+        return RespSimpleString.of("Background append only file rewriting started");
     }
 
     /** LASTSAVE — 最近一次成功快照的 Unix 秒；从未成功过则为 0，不再拿当前时间冒充。 */

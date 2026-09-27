@@ -1445,6 +1445,192 @@ class RedisServerLifecycleTest {
                 + "；不合格: " + wrong + " [RED_CELLS=" + String.join("|", wrong.keySet()) + "]");
     }
 
+    /**
+     * {@code BGREWRITEAOF} 得真的把重写跑起来 —— 13g 修好的那一份导出，此前只有 Java 能调。
+     * <p>
+     * 上游 {@code bgrewriteaofCommand}（{@code aof.c:1629-1640}）三支：正在重写 →
+     * {@code -ERR Background append only file rewriting already in progress}（{@code :1631}）；
+     * 有 BGSAVE 在跑 → 排到它后面（{@code :1633-1634}）；否则起子进程并回
+     * {@code +Background append only file rewriting started}（{@code :1636}）。我们不 fork
+     * （"导出 + 换文件 + 重开追加句柄"整段都在追加那把锁里，见
+     * {@link com.zifang.z.cache.core.persistence.AofPersistence#rewriteAof}），所以没有
+     * "排在 BGSAVE 之后"那一支；而"导不出来"是受理<em>之后</em>才发现的，与上游子进程失败同形 ——
+     * 答复已经交出去了，只能进日志。
+     * </p>
+     */
+    @Test
+    void bgrewriteaofStartsTheRewriteAndTheLogStaysAppendable() throws Exception {
+        java.nio.file.Path dir = java.nio.file.Files.createTempDirectory("zcache-bgrewriteaof");
+        java.nio.file.Path aof = dir.resolve("appendonly.aof");
+        int p1 = freePort();
+        RedisServer gen1 = new RedisServer("127.0.0.1", p1, 0);
+        gen1.setDataDir(dir.toString());
+        Thread t1 = startAndWait(gen1, p1);
+        Map<String, String> seen = new LinkedHashMap<>();
+        Map<String, String> wrong = new LinkedHashMap<>();
+        try (Socket socket = connect(p1)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+            // 流水账：同一个键写三笔，只有最新那一笔才是"当前状态"。重写之后的日志里只该留那一笔，
+            // 而它必须还带着时刻（SETEX 在落盘之前就换成 SET + PEXPIREAT，见 13d 那一格）。
+            send(socket, "SET", "k", "v1");
+            assertEquals("+OK", readReply(in));
+            send(socket, "SET", "k", "v2");
+            assertEquals("+OK", readReply(in));
+            send(socket, "SETEX", "k", "3600", "v3");
+            assertEquals("+OK", readReply(in), "前置条件: 最后一笔要带着时刻");
+            send(socket, "SELECT", "3");
+            assertEquals("+OK", readReply(in));
+            send(socket, "SET", "k3", "v3db");
+            assertEquals("+OK", readReply(in));
+            send(socket, "SELECT", "0");
+            assertEquals("+OK", readReply(in));
+
+            int junkBefore = countRecordsFor(readAof(aof), "k");
+            assertTrue(junkBefore >= 3, "前置条件: 重写之前日志里得有三笔流水，实际 " + junkBefore);
+
+            send(socket, "BGREWRITEAOF");
+            String started = readReply(in);
+            seen.put("BGREWRITEAOF 的答复", started);
+            if (!"+Background append only file rewriting started".equals(started)) {
+                wrong.put("BGREWRITEAOF 的答复", "要的是上游 aof.c:1636 那句原文，实际 " + started);
+            }
+            // 等的是"日志整个换过一份"这一因（三笔收成一笔），不是睡一秒赌它跑完了。
+            // 换文件那一瞬间可能读到半截，所以 IOException 只记账、下一轮再读；期限内没收成
+            // 就是这一格红，不许静默往下走。
+            long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
+            java.util.List<String[]> rewritten = null;
+            int junkAfter = junkBefore;
+            String readError = "";
+            for (; ; ) {
+                try {
+                    rewritten = readAof(aof);
+                    junkAfter = countRecordsFor(rewritten, "k");
+                    readError = "";
+                    if (junkAfter <= 1) {
+                        break;
+                    }
+                } catch (IOException e) {
+                    readError = String.valueOf(e);
+                }
+                if (System.nanoTime() >= deadline) {
+                    break;
+                }
+                Thread.sleep(5);
+            }
+            expectTextCell(seen, wrong, "结构层 k 只剩一笔", String.valueOf(junkAfter), "1",
+                    "重写之后同一键只该留下当前状态那一笔（三笔都在 = 根本没重写；0 笔 = 把键导丢了）；"
+                            + "读日志最后一次失败: " + readError);
+            java.util.List<String> selectDbs = new java.util.ArrayList<>();
+            for (String[] record : rewritten == null ? java.util.Collections.<String[]>emptyList() : rewritten) {
+                if ("SELECT".equals(record[0]) && record.length > 1) {
+                    selectDbs.add(record[1]);
+                }
+            }
+            expectTextCell(seen, wrong, "结构层 逐库 SELECT", selectDbs.toString(), "[0, 3]",
+                    "导出的是一份带库号的最小命令集，DB 3 那一族要排在它自己的 SELECT 之后");
+
+            // 换完文件必须重开追加句柄：留着 writer == null，之后每条写命令都会在判空里静默丢掉。
+            send(socket, "SET", "k2", "after-rewrite");
+            String appended = readReply(in);
+            seen.put("重写之后仍然接得上追加", appended);
+            if (!"+OK".equals(appended)) {
+                wrong.put("重写之后仍然接得上追加", "换文件之后写侧被堵住或句柄没接回来，实际 " + appended);
+            }
+
+            // "已经有人在重写"那一支（上游 aof.c:1630-1631 的 -ERR）。这一格不能靠睡：重写排在
+            // 追加用的那把锁上，把锁攥在手里，排队的那一份就走不完，标志就一直是 true —— 上面
+            // 那句 +...started 正是"标志已经抢到"的因证。锁一放开它就跑完，不影响后面的格子。
+            AofPersistence aofHandle = gen1.getAofPersistence();
+            assertNotNull(aofHandle, "前置条件: 这一台得真的起了 AOF，才谈得上\"正在重写\"");
+            // 锁内只许发 BGREWRITEAOF：它不碰这把锁。发写命令的话，命令线程会来抢我们手里这把，
+            // 我们又在等它的答复 —— 两边都动不了。
+            java.util.List<String> busyReplies = new java.util.ArrayList<>();
+            String notBusy = "";
+            synchronized (aofHandle) {
+                for (int i = 0; i < 3 && busyReplies.size() < 2; i++) {
+                    send(socket, "PING");
+                    String ping = readReply(in);
+                    if (!"+PONG".equals(ping)) {
+                        notBusy = "第 " + (i + 1) + " 次 PING 没走通: " + ping;
+                        break;
+                    }
+                    send(socket, "BGREWRITEAOF");
+                    busyReplies.add(readReply(in));
+                }
+            }
+            seen.put("正在重写时连着两问", busyReplies.toString());
+            String first = busyReplies.isEmpty() ? "(一问都没答)" : busyReplies.get(0);
+            String second = busyReplies.size() < 2 ? "(只答了一问)" : busyReplies.get(1);
+            if (!"+Background append only file rewriting started".equals(first)) {
+                wrong.put("正在重写时连着两问", "锁攥着不放时，第一问还该受理（上一问的标志已经抢到了）："
+                        + notBusy + "实际 " + busyReplies);
+            } else if (!"-ERR Background append only file rewriting already in progress".equals(second)) {
+                wrong.put("正在重写时连着两问", "第二问要的是上游 aof.c:1631 那句原文（受理了第二问 = "
+                        + "标志没在入队之前抢，两份重写会排进同一个线程池）；" + notBusy + "实际 " + second);
+            }
+        } finally {
+            gen1.stop();
+            t1.join(DEADLINE_MS);
+        }
+        // 快照那份不留下：这一族只认重写之后的 AOF。
+        java.nio.file.Files.deleteIfExists(dir.resolve("dump.rdb"));
+        int p2 = freePort();
+        RedisServer gen2 = new RedisServer("127.0.0.1", p2, 0);
+        gen2.setDataDir(dir.toString());
+        Thread t2 = startAndWait(gen2, p2);
+        try (Socket socket = connect(p2)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+            expectCell(seen, wrong, socket, in, "GET k", "v3", "GET", "k");
+            expectTtlCell(seen, wrong, socket, in, "k", 3_600);
+            expectCell(seen, wrong, socket, in, "GET k2", "after-rewrite", "GET", "k2");
+            expectCell(seen, wrong, socket, in, "DBSIZE", ":2", "DBSIZE");
+            expectCell(seen, wrong, socket, in, "SELECT 3", "+OK", "SELECT", "3");
+            expectCell(seen, wrong, socket, in, "GET k3 在 3 库", "v3db", "GET", "k3");
+            expectCell(seen, wrong, socket, in, "SELECT 0", "+OK", "SELECT", "0");
+            expectCell(seen, wrong, socket, in, "EXISTS k3 回到 0 库", ":0", "EXISTS", "k3");
+        } finally {
+            gen2.stop();
+            t2.join(DEADLINE_MS);
+        }
+        // 没配 dataDir 的那一台：AOF 根本没起，不能谎报"已经开始了"。
+        int p3 = freePort();
+        RedisServer bare = new RedisServer("127.0.0.1", p3, 0);
+        Thread t3 = startAndWait(bare, p3);
+        try (Socket socket = connect(p3)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+            send(socket, "BGREWRITEAOF");
+            String refused = readReply(in);
+            seen.put("没配 dataDir 时如实拒绝", refused);
+            if (!refused.startsWith("-ERR") || !refused.contains("no data directory")) {
+                wrong.put("没配 dataDir 时如实拒绝", "要的是点名缺什么的 -ERR，实际 " + refused);
+            }
+        } finally {
+            bare.stop();
+            t3.join(DEADLINE_MS);
+        }
+        assertTrue(wrong.isEmpty(), "BGREWRITEAOF 受理之后日志要真的换过一份，且换完还接得上追加、"
+                + "只留这一份 AOF 重启要读得回来，逐格: " + seen
+                + "；不合格: " + wrong + " [RED_CELLS=" + String.join("|", wrong.keySet()) + "]");
+    }
+
+    /** 只读磁盘上的日志，逐条交回命令数组。用一份新实例读，不碰在跑的那一台的句柄。 */
+    private static java.util.List<String[]> readAof(java.nio.file.Path aof) throws IOException {
+        java.util.List<String[]> records = new java.util.ArrayList<>();
+        new AofPersistence().loadAof(aof.toString(), records::add);
+        return records;
+    }
+
+    /** 日志里挂在某个键名上的写记录有几笔（SET / SETEX / SETNX 族，重写之前是三笔流水）。 */
+    private static int countRecordsFor(java.util.List<String[]> records, String key) {
+        int n = 0;
+        for (String[] record : records) {
+            if (record.length >= 2 && key.equals(record[1]) && record[0].startsWith("SET")) {
+                n++;
+            }
+        }
+        return n;
+    }
+
     @Test
     void rewriteWithoutStoreAccessorRefusesInsteadOfWipingTheLog() throws Exception {
         java.nio.file.Path dir = java.nio.file.Files.createTempDirectory("zcache-aof-bare");
@@ -2184,6 +2370,15 @@ class RedisServerLifecycleTest {
         seen.put(label, actual);
         if (!expected.equals(actual)) {
             wrong.put(label, "期望 " + expected + "，实际 " + actual);
+        }
+    }
+
+    /** 不是"发一条命令问一次"的那一格：读数已经由调用方量好了，这里只管记账与判红。 */
+    private static void expectTextCell(Map<String, String> seen, Map<String, String> wrong, String label,
+                                       String actual, String expected, String why) {
+        seen.put(label, actual);
+        if (!expected.equals(actual)) {
+            wrong.put(label, "期望 " + expected + "，实际 " + actual + "。" + why);
         }
     }
 
