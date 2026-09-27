@@ -1869,6 +1869,83 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   测试条数不动是分母正常的表现，不是没测。
 - 250 那一侧仍然没有实测：本轮全部读数单机。
 
+#### 只留快照重启，Stream 一族又是第一个没的：六型里最后一族进不了 RDB（13h）
+
+- **来账**：13g 让流键活过了 AOF 重写，而 README 与 `_doc/001_arch/01-module-structure.md` 里那句
+  "Stream 也仍然进不了 RDB 快照（见 CHANGELOG 13e ③、13g）"是**当时的事实**：`RdbPersistence`
+  从来没问过 `getAllStreamEntries`，SAVE 之前 `DEL` 掉 AOF 之后，六种类型里只有五种回得来。
+  配了 `save` 策略的那一侧只写得下五型，等于"持久化"这项宣传对一整族键是空的。
+- **改动前的形状**（生产侧就是 `a215561` 那份字节，只往测试里加判据；日志
+  `~/.cache/zcache_gauges/logs/rdb_prefix_125207.log`，`Tests run: 1, Failures: 1`）：红 **13 格** ——
+  `DBSIZE`、`XRANGE s_live`、`TYPE s_live`、`XLEN s_live`、`TTL s_live`、`表顶活过快照`、
+  `组重建之后还喂得动`、`EXISTS s_empty`、`TYPE s_empty`、`空流的表顶`、`高位的表顶活过快照`、
+  `XRANGE s_wide（上面那一问的阳性对照）`、`XRANGE s_in3 在 3 库`。
+  那一跑的测试字节还没有 `s_dead` 与那 2.1 秒的显式空档（下一节"牙"之前才补的），所以是 13 格；
+  收口那一跑里同形的那一支（R1）是 **14 格**，多出来的正是加固后的 `组的读数位置`。
+- **上游权威**：`RDB_TYPE_STREAM_LISTPACKS = 15`（`rdb.h:93`），写点 `rdbSaveObjectType`
+  （`rdb.c:625`）里的 `:656`，读点 `rdbLoadObject` 的 `:1698`。顺序照 `rewriteStreamObject`
+  那一族在 AOF 侧的形状（条目 → 表顶 → 组，`aof.c:1172-1266`），13g 已经按这个顺序导出过一次。
+- **改动**：
+    - 类型字节是 `5` 而不是上游的 `15`：我们的魔数是 `ZCHRDB`、`RDB_VERSION = 1`、逐库段头、
+      尾部 XOR 校验，**格式本来就不是 Redis 的**，往自己的序数里连续排（`0..4` 五型之后）比
+      引进一个"看着像上游但其实谁都读不了"的 15 更诚实。这一点写在 `TYPE_STREAM` 的注释里。
+    - 负载三段：表顶两段 `long` + 逐条（ID 文本 + 字段名值）+ 逐组（组名 + 读数位置两段）。
+      表顶那两段存的是**位模式**而不是十进制文本 —— 正是 13g-2 那一支（`>=2^63` 写成负号）
+      教的那一课，二进制格式天然免疫，`s_wide` 那一格就是为这一维留的。
+    - `readStream` 装配完条目之后**再压一次表顶**（`stream.setLastId(topMs, topSeq)`）：
+      `addEntry` 里那道只向前走的 `updateCounters` 会把表顶顶到最大那条条目上，而
+      "表顶停在被 XDEL 掉的那一条"正是这一族唯一不能从条目表推演出的信息。
+    - 组数取自先落一摊非空的 `LinkedHashMap`，不是先写 `groupNames().size()` 再跳空迭代 ——
+      `ConsumerGroup` 那张表是 `ConcurrentHashMap`，`XGROUP DESTROY` 可以在计数与写出的中间
+      抽走一只；那种"计数 3、实际写 2"会让读侧整个错位，而校验和看着还是对的。
+    - `StoreAccessor.restoreStream(db, key, stream, expireAt)` 与另外五家的 `restoreX` 对称；
+      那一腿整只 `put`（`StreamStore.put`，新增），不逐条 `addEntry`，并共用同两道闸
+      （`diedWhileOffline` 判死、`armAfterRestore` 挂时刻）。
+- **判据**：新增 `RedisServerLifecycleTest#saveSnapshotsStreamKeys` —— 一张表 **22 格**、
+  一次合并断言（JUnit 见第一条红就抛，分三批断言会把"三样一起坏"归给先红的那一批，13g 那条
+  踩过一次）。三种形状各问一遍表顶：`s_live`（有组、`XACK` 过、4-1 已 `XDEL` ⇒ 表顶与
+  "活着的最小 ID"是两件事）、`s_empty`（空流也要把表顶留在 5-1）、`s_wide`（整段跨过 2^63）；
+  两枚根本不该回来的（`s_gone` 快照前就 `DEL`、`s_dead` 在**显式睡掉的 2.1 秒空档**里到点，
+  且 SAVE 之前它必须还活着 —— 那才是"进了文件、加载那一判再抹掉"）；分库一枚 `s_in3` 加一格
+  回到 0 库的反证。每问"该被拒"的都压一格猎物（4-2 / 5-2 / `-8`），否则"拒掉了"和"根本没有"
+  分不开。
+- **牙**（新量具 `~/.cache/zcache_gauges/rdb_stream_mut/teeth.py`，七支 + 控制组）：
+  run1（`logs/teeth_run1.txt`）先量出两处，run2（`logs/teeth_run2.txt`，13:09:11—13:10:00）是收口跑：
+  `CONTROL → OK`，`SUMMARY mutants=8 bad=0`，七支全部「漏 无；多 无」，红集大小
+  **R1 14 / R2 4 / R3 2 / R4 1 / R6 14 / R7 4 / R8 3**。
+    - R1 枚举口交回空表、R2 读侧不回写表顶、R3 读侧不重建组、R4 加载腿丢掉 `armAfterRestore`、
+      R6 `DbSection.totalEntries()` 不算流（于是只含流键的库整段不写）、
+      R7 写侧表顶按最后一条条目渲染、R8 写侧不给流键写时刻。
+    - **R5 这一支没有**：摘掉加载腿那道 `diedWhileOffline` 闸不构成一次成功的判红，读码即可断定，
+      不必注入 —— 时刻走 `armAfterRestore` → `MemoryStore.armExpiry`（`MemoryStore.java:692-702`）
+      在 `relativeMillis <= 0` 那一支直接 `removeAnyType`（`:826-836` 六型通删，`:833` 含流表），
+      键当场就没了。两道闸在流这一族上是**冗余**的，因此 `MemoryStoreAccessor:222-225` 那段
+      "没有这道闸会被当成永久键写回去"的说法对**这一族不成立**（它成立的条件是加载后没人再问时刻）；
+      真正有牙的是 R8（文件里根本没有那一行）。
+- **三处覆盖面缺口，照实记不记分**：
+    - R1 与 R6 的红集**逐字相同**（14 格）：枚举口交回空表时段头计数跟着是 0、整段照样不写，
+      落盘形状完全一样。
+    - R2 与 R7 的红集同样**逐字相同**（4 格，`diff` 过）：坏在写侧的表顶还是坏在读侧的表顶，
+      从"重启后 4-0 塞得进"这一问看不出差别。
+    - 把这两对分开要的是同一层东西 —— 直接读 `dump.rdb` 字节的**结构守卫**（像 13g 那一族的
+      `结构层 …` 格子）。本格没有这一层。
+    - 22 格里有 **7 格没有任何一支变异点得红**：`XLEN s_empty`（键根本不在时 XLEN 也回 `:0`，
+      这一格结构上分不开"空流"与"没有流"，那层由 `EXISTS s_empty`/`TYPE s_empty` 扛）、
+      `XADD s_live 4-2（阳性对照）` 与 `XADD s_empty 5-2（阳性对照）`（猎物格，职责是让上面
+      那一问不是空话，一族消失时它们照样"成功"）、`EXISTS s_gone`（要点红它得凭空多一枚键）、
+      `SELECT 3`/`SELECT 0`/`EXISTS s_in3 回到 0 库`（这三格只在负载写歪、字节错位时才红，
+      而七支变异交回的都是形状完好的文件 —— 半损坏文件那一注入得连校验和一起说，未做）。
+- **顺带（同一格在 AOF 那一族里也是空过的）**：`组的读数位置` 原先只问"领没领到条目"，
+  组压根不存在时报的是 `-NOGROUP`，里面没有 `\d+-\d+` ⇒ **那一问把"没有组"读成"位置卡住了"**。
+  两处（AOF 与 RDB 两支测试同形）一起改成"报 `-ERR` 也算红"。13g 那份量具据此重跑
+  （`stream_rw_mut/logs/teeth_run6.txt`，13:11:42）：`M1` 19 → **20 格**、`M3` 2 → **3 格**，
+  八支仍全部「漏 无；多 无」，`SUMMARY mutants=9 bad=0`。**上一格正文里 M1/M3 的格数按本段作废**，
+  那是加固之前的读数。
+- **基线 906 → `907`**（`358 + 412 + 135 + 2`，core 411 → 412 是本格新增的那 1 个 `@Test`；
+  `mvn -o -B clean test` rc=0 / BUILD SUCCESS，日志
+  `~/.cache/zcache_gauges/logs/full_13h_131221.log`）。
+- 250 那一侧仍然 ssh 不通（sshd banner 不发）：本轮全部读数**只有单机**。
+
 ### Added
 - `RedisServer.serverScope()`：只读拿到本台那一份，测试与嵌入式据此判断作用域边界。
 - `StreamIdFormat`（z-cache-common）：stream ID 的唯一文法（uint64 两段、`-` / `+` 两种位置、
