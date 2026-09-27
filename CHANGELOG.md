@@ -1699,9 +1699,81 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   `BGSAVE` 3 命中、`FLUSHALL` 在 `CommandHandler` 里接线），所以本轮修好的一版重写至今只在测试里跑；
   `rewriteExecutor`（`:114 / :157 / :172`）除了 shutdown 没有任何调度方；`syncFile()` 的注释自陈
   "这里通过 flush 保证数据写入操作系统缓冲区" —— 也就是 `FSYNC_ALWAYS` 与每秒 fsync 都**没有真的 fsync**，
-  宣传的持久化强度还没兑现（新格）。
+  宣传的持久化强度还没兑现（新格）。**这一格由下一格（13f）关闭。**
 - 基线 `903`（`358 + 408 + 135 + 2`，全量 `mvn -o -B clean test` rc=0 / BUILD SUCCESS / Total time 34.2s，
   日志 `logs/rw_full2.log`）：core 405 → 408，本格新增 3 个 `@Test`。
+- 250 那一侧仍然没有实测：本轮全部读数单机（判据、牙、基线都在这一台机器上）。
+
+#### `appendfsync` 三档第一次真的有差别：那一支从前只 flush，把"交给内核"宣传成了"交给介质"（13f）
+
+- **来账**：上一格末尾登记的那条"新格" —— `syncFile()` 里只有一句 `writer.flush()`，注释自陈
+  "实际的 fsync 需要使用 FileChannel 或 FileDescriptor"。**这一格由本格关闭**。后果是三档等价：
+  `always` 那条广告（"每个命令同步写入，最安全"）从来没兑现过，`always` 与 `no` 掉电之后丢的一样多。
+- **改动前的形状**（在 `git archive HEAD`（`950342e`）解出来的独立树 `~/.cache/zcache_gauges/fsync_head`
+  上跑本轮的结构判据，不碰工作区，日志 `logs/fsync_headshape.log`）：`Tests run: 1, Failures: 1`，
+  表里点名 `真的 fsync=syncFile() 里没有 getFD().sync()`、`记账的顺序=… 实际 sync@-1 计数@-1`。
+  同一张表里另有四格（`openAppending 这一支还在` / `closeLiveWriter 这一支还在` / `两只手成对打开` /
+  `两只手成对抹掉`）**不算改前的缺陷** —— 那两个方法是本格才引入的形状，HEAD 里没有它们。
+- **改动**（`AofPersistence`）：日志自己记下"写了多少、已经要到盘上的是多少"，`syncFile()`（`:866`）
+  从"只 flush"变成 flush → `stream.getFD().sync()` → 自增 `fsyncCount`（`:129`）→
+  `fsyncedBytes = appendedBytes`（`:874`，上游 `aof.c:506` 同形：先 fsync、成功回来才记账）。三档各自的路径：
+  ① `always` 在每条记录落地后当场刷（`:409`，上游 `aof.c:499-503` 就在 append 之后直接 `redis_fsync`）；
+  ② `everysec` 写侧一笔都不刷，攒着由每秒那一拍刷，而那一拍的判据是 `appendedBytes != fsyncedBytes`
+  （`:834`）—— 上游那一对偏移量是 `aof_fsync_offset != aof_current_size`（`aof.c:349`），而 `:343-347`
+  那段注释专门写的是"缓冲区已经空了、但还欠着一截，这一拍仍要刷"，所以"没人写了"那一拍不许白刷、
+  "还欠着"那一拍不许跳过；③ `no` 一次都不刷，但字节照样已经交出去了。另外两处是这一支的边角：
+  运行中换档要跟着挂/撤那个定时器（`setFsyncPolicy :218` → `applyFsyncScheduler :892`，幂等；上游
+  `config.c:493` 只改一个整数就够，因为它每轮事件循环重读那个整数，我们有线程就得自己跟上）；
+  收摊时 flush → fsync → close（`stop() :286` → `closeLiveWriter(true) :305`，上游 `stopAppendOnly`
+  `aof.c:236-238`，**连 `no` 档也要在放手前刷最后一次**）；换过一次日志之后给新 inode 刷一次并对齐偏移
+  （`:515-519`，上游 `aof.c:1767-1774`）；启动接手现成日志时按文件长度起算、不欠盘（`:274`，
+  上游重放完是对齐这两个量（`aof.c:865-867`，空日志同样 `:718`），起步则把 `aof_last_fsync` 对齐
+  （`aof.c:285`））。`openAppending`（`:672`）同时接上 `writer` 与底下那支持有 fd 的
+  `liveStream`（`:105`），`closeLiveWriter`（`:650`）在同一个 `finally` 里把两只手一起松开。
+- 判据两把（`RedisServerLifecycleTest`，都走真实进程边界 + 真实文件）：
+  `fsyncPolicyDrivesTheRealFsyncCadence`（`:1243`）十格收进一张表 —— `always 每条记录一次`（3 笔 SET +
+  首条写补的 `SELECT` = 4 条记录，实测 delta 4）/ `always 换日志后给新日志刷一次` /
+  `everysec 攒着的由那一拍刷` / `everysec 空转那一拍` / `everysec 写侧不刷盘` /
+  `everysec 换日志后给新日志刷一次` / `no 档的字节确实出了手`（这一格是"0 次"那两格的阳性对照，
+  否则 0 是量具坏了而不是档位对了）/ `换档把每秒那一拍挂上` / `no 档不刷盘` / `收摊前那一刷`。
+  `syncFileAsksTheOperatingSystemAndNotJustTheHeap`（`:1434`）是行为尺结构上量不到的那一层：
+  直接读 `src/main` 的字节，钉"真的 fsync"（`getFD().sync()` 在不在）、"记账的顺序"（自增必须在 sync
+  之后）、"两只手成对打开"、"两只手成对抹掉"。
+- 牙（第九份量具 `~/.cache/zcache_gauges/fsync_mut/fsync_teeth.py`；被量字节
+  `AofPersistence.java cde27cdbf5bb262caa57f8cbf0200bc9` + 判据文件 `3e0ac79b0b928fe5ea2b51329e050c6d`，
+  两份都由本次运行自己存 `.good`、每支还原后按 md5 对账 `match=True`；日志 `logs/fsync_*.log`）：
+  M1 摘掉 sync 只留自增 → 结构红（`真的 fsync` + `记账的顺序`）而**行为尺保持绿**；M2 自增挪到 sync 之前
+  → 结构红（`记账的顺序`），行为绿；M3 `openAppending` 只接 writer → 两把尺各自红（`always 每条记录一次`
+  + `两只手成对打开`）；M4 `closeLiveWriter` 只抹 writer → 结构红，行为绿；M5 那一拍不看"欠着多少" →
+  `everysec 空转那一拍`；M6 换档不重挂定时器 → `换档把每秒那一拍挂上`；M7 EVERYSEC 也逐笔刷 →
+  `everysec 写侧不刷盘`；M8 收摊不 fsync → `收摊前那一刷`；M9 换日志那一支的档位判据反过来 →
+  两档各自的"换日志后给新日志刷一次"；M10 `no` 档也逐笔刷 → `no 档不刷盘`。`SUMMARY mutants=10 bad=0`。
+  M1/M2/M4 与 M5–M10 是**互补**的两层，这一点是跑出来的不是说出来的：前三支正是"计数照走、介质没被问过"
+  那种形状，行为尺全绿；后七支结构上看不出错，只有节奏尺量得出。
+- 过程中量具自己的一处毛病，记下来免得重犯：结构守卫第一版让 `methodBody()` 在找不到签名时当场
+  `assertTrue` 抛掉，于是 `logs/fsync_headshape.log` 第一跑只剩一句"源码里找不到 openAppending"，
+  把前两条**真有牙**的红吞得干干净净 —— JUnit 的 fail-fast 吞的是同一个方法里第 2..N 条判据。
+  改成"四格连同'被钉的那几支方法还在不在'一起收进同一张表、一次断言"之后，改前那一跑才同时报出
+  `真的 fsync` 与 `记账的顺序`。
+- 与上游的差别（记账）：① **不 fork**。上游 EVERYSEC 那一刷走 `aof_background_fsync`（调用点 `aof.c:511`，
+  函数本体 `aof.c:208` 把它交给 BIO 线程），我们的每秒一拍与 always 的逐笔刷都在调用线程上、且和 append 共用同一把锁 ——
+  盘慢时会堵住写侧，这是换来"不需要 `aofRewriteBuffer` 那一整摊"的代价；② **JDK 没有 `fdatasync`**。
+  `FileDescriptor.sync()`（Corretto 8 `java/io/FileDescriptor.java:131`）的 javadoc 明说返回时"data
+  **and attributes**"都已落介质，而 `config.h:92-97` 在 Linux 上特意把 `redis_fsync` 定义成 `fdatasync`
+  就是为了避开元数据 —— 我们这一侧比上游多刷一点元数据，方向是更安全，不是更弱；同一份源码里
+  `fdatasync` 0 命中（同尺阳性对照：`sync` 在该文件 10 命中），也就是这一侧没有更省的那个选项；
+  ③ 上游 5.0.14 不做目录 fsync（`fsyncFileDir` 在 `src/*.c` 里 0 命中，阳性对照 `redis_fsync` 在
+  `aof.c` 里 4 命中），所以两侧都不防"新建的那个文件本身还没落盘"；④ 档位常量的**数值**与上游不同
+  （我们 `:70/:75/:80` 是 always=0 / everysec=1 / no=2，上游 `server.h:355-357` 是 NO=0 / ALWAYS=1 /
+  EVERYSEC=2），只活在进程内部，不上任何线格式。
+- 未覆盖面（记账，不当分）：**掉电真值本机量不了** —— 判据读的是"有没有向操作系统要过 fsync"这句话
+  和它的节奏，介质层要 fs 崩溃才看得出；`SyncFailedException` 之后不自增那一支没有猎物（本机没有可移植
+  的办法让 `fsync` 失败）；上游 EVERYSEC 还有一道 `unixtime > aof_last_fsync` 的"同一秒内不重复发起"闸
+  （`aof.c:508-509`，`aofFsyncInProgress` 在 `aof.c:202`），我们靠"每秒一拍"的时间语义兜住，没有对等的那个整数。
+- 宣传口径同步：README 特性表那一行与 `_doc/001_arch/01-module-structure.md` §2.3.1 那条 ⚠（"只做到
+  `BufferedWriter.flush()`"）按本轮实测改写 —— 那两处是 `950342e` 才推上去的，本格把它们说的话作废了。
+- 基线 `905`（`358 + 410 + 135 + 2`，全量 `mvn -o -B clean test` rc=0 / BUILD SUCCESS，日志
+  `logs/fsync_fullreactor.log`）：core 408 → 410，本格新增 2 个 `@Test`。
 - 250 那一侧仍然没有实测：本轮全部读数单机（判据、牙、基线都在这一台机器上）。
 
 ### Added

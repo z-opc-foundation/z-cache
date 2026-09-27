@@ -19,6 +19,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -94,6 +95,40 @@ public class AofPersistence {
     private volatile BufferedWriter writer;
 
     /**
+     * {@link #writer} 底下那一支持有文件描述符的流 —— fsync 只能从这里要。
+     * <p>
+     * 之所以要单独留一份：{@code BufferedWriter}/{@code OutputStreamWriter} 都没有同步语义，
+     * 而 {@code Writer.close()} 会把底层这同一个人关掉，所以它的生命周期必须和 {@link #writer}
+     * 严格绑在一起（{@link #openAppending} 成对赋值、{@link #closeLiveWriter} 成对抹掉）。
+     * </p>
+     */
+    private volatile FileOutputStream liveStream;
+
+    /**
+     * 累计写进日志的字节数 —— 对应上游的 {@code server.aof_current_size}。
+     */
+    private volatile long appendedBytes;
+
+    /**
+     * 最后一次真 fsync 时的字节数 —— 对应上游的 {@code server.aof_fsync_offset}
+     * （{@code aof.c:349} 判的就是这两个数不相等，{@code aof.c:506/:1774} 赋的就是这两个数）。
+     * <p>
+     * 换过一次日志（{@link #rewriteAof}）之后这两个数一起对齐到新文件长度：新 inode 的
+     * 那一份已经整体同步过，不该被算成"还欠着"。
+     * </p>
+     */
+    private volatile long fsyncedBytes;
+
+    /**
+     * 真的调用过 fsync 的次数，含 {@link #rewriteAof} 对新日志那一次。
+     * <p>
+     * 只在 {@code sync()} 返回之后自增：抛 {@code SyncFailedException}（系统保证不了落盘）时
+     * 计数不动，所以这个数就是"操作系统确认过的同步次数"，不是"我们打算同步的次数"。
+     * </p>
+     */
+    private final AtomicLong fsyncCount = new AtomicLong();
+
+    /**
      * 标记是否已启动
      */
     private final AtomicBoolean started = new AtomicBoolean(false);
@@ -104,7 +139,9 @@ public class AofPersistence {
     private final ScheduledExecutorService scheduler;
 
     /**
-     * 定时 fsync 任务句柄
+     * 定时 fsync 任务句柄。是否挂着由 {@link #applyFsyncScheduler()} 按<b>当前</b>档位决定 ——
+     * 上游没有这个开关（它没有定时器：{@code CONFIG SET appendfsync} 只是改一个整数，
+     * {@code config.c:493}，因为每轮事件循环都会重新读那个整数），我们的定时器必须自己跟上。
      */
     private volatile ScheduledFuture<?> fsyncFuture;
 
@@ -173,7 +210,8 @@ public class AofPersistence {
     }
 
     /**
-     * 设置 fsync 策略。
+     * 设置 fsync 策略。启动之后也可以换档 —— 换档必须把"每秒那一次"跟着档位一起改，
+     * 否则 {@code NO → EVERYSEC} 这一趟换上去的档位只有追加路径那半边是活的。
      *
      * @param policy fsync 策略（FSYNC_ALWAYS / FSYNC_EVERYSEC / FSYNC_NO）
      */
@@ -182,6 +220,9 @@ public class AofPersistence {
             throw new IllegalArgumentException("Invalid fsync policy: " + policy);
         }
         this.fsyncPolicy = policy;
+        if (started.get()) {
+            applyFsyncScheduler();
+        }
     }
 
     /**
@@ -228,13 +269,12 @@ public class AofPersistence {
             }
 
             // 以追加模式打开文件
-            writer = new BufferedWriter(
-                    new OutputStreamWriter(new FileOutputStream(file, true), StandardCharsets.UTF_8));
+            openAppending(file);
+            appendedBytes = file.length();
+            fsyncedBytes = appendedBytes;   // 刚接手的这份不欠盘（上游同形：aof.c:285 / :718）
 
             // 如果是 EVERYSEC 策略，启动定时 fsync
-            if (fsyncPolicy == FSYNC_EVERYSEC) {
-                startFsyncScheduler();
-            }
+            applyFsyncScheduler();
         }
     }
 
@@ -255,11 +295,14 @@ public class AofPersistence {
                 fsyncFuture = null;
             }
 
-            // 关闭文件
-            if (writer != null) {
-                writer.flush();
-                writer.close();
-                writer = null;
+            // 关闭文件。上游 stopAppendOnly 的顺序是 flush → fsync → close，而且<em>不看档位</em>
+            // （{@code aof.c:236-238}：{@code flushAppendOnlyFile(1); redis_fsync(aof_fd); close(aof_fd);}），
+            // 连 NO 档也要在收手前把那一段要回介质上 —— 只 flush 就 close，最后那一段停在操作系统里，
+            // 干净停服看不出问题，整机掉电才丢。
+            // 这一支要在锁里：cancel(false) 打断不了已经在跑的那一拍，让它对着正在关闭的 fd 要
+            // fsync 只会换回一条 SyncFailedException 日志。
+            synchronized (this) {
+                closeLiveWriter(true);
             }
         }
     }
@@ -359,7 +402,7 @@ arg2\r
         }
 
         if (writer != null) {
-            writeRespCommand(writer, command);
+            appendedBytes += writeRespCommand(writer, command);
             writer.flush();
 
             // 根据策略执行 fsync
@@ -376,18 +419,23 @@ arg2\r
      * 长度取的是字节数而不是 {@code String.length()} —— 值里可以有 {@code \r\n}，也可以有中文，
      * 读侧按声明长度取字节（见 {@link #loadAof}）。
      */
-    private static void writeRespCommand(java.io.Writer writer, String[] command) throws IOException {
+    private static long writeRespCommand(java.io.Writer writer, String[] command) throws IOException {
+        String count = String.valueOf(command.length);
         writer.write("*");
-        writer.write(String.valueOf(command.length));
+        writer.write(count);
         writer.write("\r\n");
+        long bytes = 1 + count.length() + 2;
         for (String arg : command) {
-            byte[] argBytes = arg.getBytes(StandardCharsets.UTF_8);
+            int argLen = arg.getBytes(StandardCharsets.UTF_8).length;
+            String len = String.valueOf(argLen);
             writer.write("$");
-            writer.write(String.valueOf(argBytes.length));
+            writer.write(len);
             writer.write("\r\n");
             writer.write(arg);
             writer.write("\r\n");
+            bytes += 1 + len.length() + 2 + argLen + 2;
         }
+        return bytes;
     }
 
     /**
@@ -459,6 +507,16 @@ arg2\r
                 // 注释原文 "Make sure SELECT is re-issued"）。不抹的话，重写后第一条落在 DB 0
                 // 的写补不出 SELECT，重放时会被演进上一段落进 DB 3 的那个位置。
                 lastJournaledDb = -1;
+                // 换进来的是一份新日志，它自己也得算"到过盘"。上游同处按档位刷一次新 fd
+                // （{@code aof.c:1767-1770}：ALWAYS 用 {@code redis_fsync(newfd)}，EVERYSEC 用
+                // {@code aof_background_fsync(newfd)}，NO 两支都不进），随后无条件把
+                // {@code aof_fsync_offset} 对齐到新大小（{@code aof.c:1774}）。
+                // 我们不 fork，"后台那一次"就在调用 rewriteAof 的线程里同步做（差别记在 CHANGELOG）。
+                appendedBytes = new File(aofFilePath).length();
+                if (fsyncPolicy != FSYNC_NO) {
+                    syncFile();
+                }
+                fsyncedBytes = appendedBytes;
             }
             LOGGER.info("AOF rewrite completed successfully: " + commands.size() + " commands");
         } finally {
@@ -581,17 +639,46 @@ arg2\r
     }
 
     private void closeLiveWriter() throws IOException {
-        if (writer != null) {
-            writer.flush();
-            writer.close();
+        closeLiveWriter(false);
+    }
+
+    /**
+     * @param finalSync 收摊那一次要先 fsync 再关（上游 {@code stopAppendOnly} 的顺序就是
+     *                  flush → fsync → close，{@code aof.c:236-238}）；换日志那一次不 fsync ——
+     *                  这批字节接下来就被整份换掉了，要刷的是换进来那份（在 {@link #rewriteAof} 里）。
+     */
+    private void closeLiveWriter(boolean finalSync) throws IOException {
+        try {
+            if (writer != null) {
+                if (finalSync) {
+                    syncFile();  // syncFile 自己会先 flush，顺序不能倒（见它的文档）
+                } else {
+                    writer.flush();
+                }
+                writer.close();  // 同一只手关掉的：OutputStreamWriter.close() 会关掉底下的流
+            }
+        } finally {
+            // 两只手一起松开：留着 liveStream 指向那个已经关掉的 fd，下一拍要 fsync 就是对着
+            // 关掉的描述符要（SyncFailedException），而判空的写侧只看得到 writer。
             writer = null;
+            liveStream = null;
         }
+    }
+
+    /**
+     * 成对打开追加用的两只手：{@link #writer} 管编码，{@link #liveStream} 管文件描述符
+     * （fsync 只能从后者要）。调用方必须已持有本对象锁，或在启动尚未对外的阶段。
+     */
+    private void openAppending(File file) throws IOException {
+        FileOutputStream stream = new FileOutputStream(file, true);
+        liveStream = stream;
+        writer = new BufferedWriter(
+                new OutputStreamWriter(stream, StandardCharsets.UTF_8));
     }
 
     /** 换文件之后必须<em>追加</em>重开：截断会把刚换进来的那份最小命令集抹掉。 */
     private void reopenAppending(String path) throws IOException {
-        writer = new BufferedWriter(
-                new OutputStreamWriter(new FileOutputStream(new File(path), true), StandardCharsets.UTF_8));
+        openAppending(new File(path));
     }
 
     /**
@@ -732,13 +819,19 @@ arg2\r
 
     /**
      * 启动 fsync 调度器（EVERYSEC 策略）。
+     * <p>
+     * 每一拍先问"这一段有没有新字节"（{@code appendedBytes != fsyncedBytes}，上游同判据是
+     * {@code aof_fsync_offset != aof_current_size}，{@code aof.c:349}）—— 没有就不动，
+     * 免得空转的日志每秒白刷一次盘。反过来，写侧停了也必须让这一拍还能补上最后那一截：
+     * 上游在 {@code aof.c:341-345} 专门写了这条注释（"用户在一秒内不再写了，页缓存里那段就得
+     * 由这一拍刷下去"），所以判据是"欠着多少"而不是"这一拍里有没有写过来"。
+     * </p>
      */
     private void startFsyncScheduler() {
         fsyncFuture = scheduler.scheduleAtFixedRate(() -> {
             try {
                 synchronized (this) {
-                    if (writer != null) {
-                        writer.flush();
+                    if (writer != null && fsyncPolicy == FSYNC_EVERYSEC && appendedBytes != fsyncedBytes) {
                         syncFile();
                     }
                 }
@@ -749,16 +842,61 @@ arg2\r
     }
 
     /**
-     * 执行文件同步。
-     *
-     * @throws IOException 如果同步失败
+     * 执行文件同步 —— 这一支必须真的把日志要到介质上，不是"交给操作系统"。
+     * <p>
+     * {@code Writer.flush()} 只把字节交给内核，进程被杀不丢、整机掉电会丢那一段。上游在同一处
+     * 调的是 {@code redis_fsync(server.aof_fd)}（{@code aof.c:503}，紧邻的注释写着 "redis_fsync is
+     * defined as fdatasync() for Linux in order to avoid flushing metadata"，{@code aof.c:500-501}；
+     * 宏定义 {@code config.h:92-96}：Linux 下 {@code fdatasync}，其余平台 {@code fsync}）。
+     * </p>
+     * <p>
+     * JDK 没有 fdatasync 的对应物，只有 {@code FileDescriptor.sync()}：它的文档
+     * （Corretto 8 的 {@code java/io/FileDescriptor.java:104-107}）写明 "This method returns after
+     * all modified data <em>and attributes</em> of this FileDescriptor have been written to the
+     * relevant device(s)"，声明在 {@code :131}（Corretto 25 的实现处注释直接写着
+     * {@code fsync/equivalent}，{@code java.base/java/io/FileDescriptor.java:218}）。
+     * 也就是说我们连元数据一起刷 —— 只比上游更保守，不会更松。
+     * </p>
+     * <p>
+     * 同一份文档（{@code :119-123}）还钉住顺序："sync only affects buffers downstream of this
+     * FileDescriptor"，应用侧缓冲区不先 flush 就管不到那一段 —— 所以这里 flush 在前、sync 在后，
+     * 两句都不是可省的。
+     * </p>
      */
     private void syncFile() throws IOException {
-        // 注意：Java 的 BufferedWriter 不直接支持 fsync
-        // 这里通过 flush 保证数据写入操作系统缓冲区
-        // 实际的 fsync 需要使用 FileChannel 或 FileDescriptor
         if (writer != null) {
             writer.flush();
+        }
+        FileOutputStream stream = liveStream;
+        if (stream != null) {
+            stream.getFD().sync();
+            fsyncCount.incrementAndGet();
+            fsyncedBytes = appendedBytes;   // 上游：server.aof_fsync_offset = server.aof_current_size
+        }
+    }
+
+    /** 真的对这份日志的 fd 调过几次 fsync（含 {@link #rewriteAof} 对新日志那一次）。 */
+    public long getFsyncCount() {
+        return fsyncCount.get();
+    }
+
+    /**
+     * 按<em>当前</em>档位决定"每秒那一次"挂不挂：EVERYSEC 才挂，ALWAYS / NO 都撤。
+     * <p>
+     * 判据不能只在 {@link #start} 里做一次：那样运行中换档就只剩追加路径半边生效，
+     * 而 {@code NO → EVERYSEC} 换上去的档位永远不会有定时器。上游不需要这一支 —— 它没有定时器，
+     * 每轮事件循环都重新读 {@code server.aof_fsync} 这一个整数（{@code config.c:493} 只是赋值）。
+     * 幂等：已经挂着就不重复挂。
+     * </p>
+     */
+    private void applyFsyncScheduler() {
+        if (fsyncPolicy == FSYNC_EVERYSEC) {
+            if (fsyncFuture == null) {
+                startFsyncScheduler();
+            }
+        } else if (fsyncFuture != null) {
+            fsyncFuture.cancel(false);
+            fsyncFuture = null;
         }
     }
 

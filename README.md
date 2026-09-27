@@ -65,7 +65,7 @@ z-cache 是一个**生产就绪**的 Redis 协议兼容内存数据库，使用 
 | **🔒 分布式锁** | 基于 SET NX PX 的 tryLock / unlock / renew / Watchdog 自动续约 / fencing token；**没有 Lua**，解锁走"先 GET 校验再 DEL"，非原子 | [_doc/001_arch/分布式锁设计.md](_doc/001_arch/分布式锁设计.md) |
 | **📡 Pub/Sub 模式匹配** | 支持 PSUBSCRIBE `news.*` 通配符模式订阅，兼容 Redis PSUBSCRIBE/PUNSUBSCRIBE 规范 | （1.3.0 文档规划中） |
 | **📋 Stream 消费组** | XADD/XREAD/XREADGROUP/XACK/XPENDING/XGROUP/XINFO，支持消费者组与 pending list（XCLAIM/XAUTOCLAIM 未实现） | （1.3.0 文档规划中） |
-| **💾 RDB + AOF 持久化** | RDB 快照（逐库、带 TTL）+ AOF 增量日志（启动时重放）。fsync 三档 `always/everysec/no` 可选，但**这一档目前只刷到操作系统缓冲区、没有真的 fsync**（`syncFile()` 只做 flush）—— 进程被杀不丢，整机掉电会丢。AOF 重写 1.3.6 起导出的是当前状态（逐库 `SELECT` + 每键绝对时刻 `PEXPIREAT` + 变参命令 64 一片），但**没有任何命令能触发它**，只能在程序里显式调 `rewriteAof`，因此仍然不要指望 BGREWRITEAOF；且含 Stream 键的库过一遍重写会丢掉那一族键（Stream 既进不了快照也导不出，见 CHANGELOG 13e ③） | （1.3.0 文档规划中） |
+| **💾 RDB + AOF 持久化** | RDB 快照（逐库、带 TTL）+ AOF 增量日志（启动时重放）。fsync 三档 `always/everysec/no` 从 1.3.6 起**三档是三种节奏**：`always` 每条记录问一次介质、`everysec` 写侧不刷而由每秒那一拍刷（"没欠盘"那一拍空转，"没人写了但还欠一截"那一拍仍要刷）、`no` 一次都不刷；停机前无论哪一档都补一次 flush → fsync → close（同上游 `stopAppendOnly`）。**此前那一支只有 `writer.flush()`，三档等价，`always` 是空头广告**（见 CHANGELOG 13f）。差别仍然存在的方向是：只有 `no` 明确把落盘时机交给操作系统，另外两档掉电不丢这一段。AOF 重写 1.3.6 起导出的是当前状态（逐库 `SELECT` + 每键绝对时刻 `PEXPIREAT` + 变参命令 64 一片），但**没有任何命令能触发它**，只能在程序里显式调 `rewriteAof`，因此仍然不要指望 BGREWRITEAOF；且含 Stream 键的库过一遍重写会丢掉那一族键（Stream 既进不了快照也导不出，见 CHANGELOG 13e ③） | （1.3.0 文档规划中） |
 | **📊 运维命令** | INFO/MONITOR/DEBUG/CLIENT/SLOWLOG 5 类运维命令，含集群监控和慢日志追踪 | （1.3.0 文档规划中） |
 
 ### 已有能力（继承自 1.0.x）

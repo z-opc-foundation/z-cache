@@ -94,9 +94,18 @@ z-cache 是一个基于 Java 实现的高性能内存键值存储系统，设计
     - `always`: 每个命令同步写入，最安全但性能最低
     - `everysec`: 每秒同步一次，平衡安全与性能（默认）
     - `no`: 由操作系统决定，性能最高但可能丢失数据
-  ⚠ **本实现现状（1.3.6）**：三档的"同步"目前只做到 `BufferedWriter.flush()`，`AofPersistence.syncFile()`
-  的注释自陈"实际的 fsync 需要使用 FileChannel 或 FileDescriptor" —— 也就是**没有真的 fsync**。
-  进程被杀不丢数据，整机掉电会丢上面这一段。上面那句"最安全"因此只对到操作系统缓冲区这一层。
+  ⚠ **本实现现状（1.3.6，13f）**：三档从这一版起才是三种节奏 —— `syncFile()` 走的是
+  `writer.flush()` → `FileDescriptor.sync()` → 才自增计数并对齐 `fsyncedBytes`（上游 `aof.c:503-506` 同形：
+  fsync 成功回来才记账）。`always` 每条记录刷一次，`everysec` 写侧不刷、由每秒那一拍按
+  `appendedBytes != fsyncedBytes` 决定刷不刷（上游那一对偏移量是 `aof_fsync_offset != aof_current_size`，
+  `aof.c:349`；`:343-347` 那段注释专门防的就是"写侧停了、欠着的那一截永远不刷"），`no` 一次都不刷；
+  运行中 `CONFIG SET appendfsync` 会跟着挂/撤那个定时器；`stopAppendOnly` 那一步（`aof.c:236-238`）
+  对应 flush → fsync → close，**连 `no` 档也在放手前刷最后一次**。13f 之前那一支只有 `flush()`，
+  三档等价，"最安全"只对到操作系统缓冲区这一层。
+  与上游的两处方向性差别：① `aof.c:511` 的 EVERYSEC 走 BIO 线程，我们那一拍在调用线程上、和 append
+  共用同一把锁，盘慢会堵住写侧；② JDK 没有 `fdatasync`（`FileDescriptor.sync()` 的 javadoc 明说"data
+  and attributes"都落介质），而 `config.h:92-97` 在 Linux 上特意把 `redis_fsync` 定义成 `fdatasync`
+  来避开元数据 —— 也就是我们这一侧比上游多刷一点元数据，方向是更安全，不是更弱。
 - **AOF 重写**: 后台进程压缩 AOF 文件，去除冗余命令
   ⚠ **本实现现状（1.3.6）**：不 fork，`AofPersistence.rewriteAof()` 在 `appendCommand` 那把锁里同步完成
   "导出 + 换文件 + 重开追加句柄"（代价是重写期间写侧被堵住）。导出侧 1.3.6 起才是真的当前状态

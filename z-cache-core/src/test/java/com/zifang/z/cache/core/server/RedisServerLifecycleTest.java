@@ -1218,6 +1218,293 @@ class RedisServerLifecycleTest {
     }
 
     /**
+     * 三档 {@code appendfsync} 必须对应三种真实的落盘节奏。上一格只验到"档位这个整数被采纳了"，
+     * 而档位背后那一支 {@code syncFile()} 当时只有一句 {@code writer.flush()} 加一条自陈欠账的注释
+     * （"实际的 fsync 需要使用 FileChannel 或 FileDescriptor"）—— 三档全部等价于"交给操作系统"，
+     * {@code always} 那条广告从来没兑现过，掉电该丢的和 {@code no} 一样多。
+     * <p>
+     * 判据按档位取，因为三档的<em>差别</em>才是被广告出去的东西：
+     * <ul>
+     *   <li>{@code ALWAYS}：每条记录一次（上游 {@code aof.c:499-503} 就在 append 之后直接
+     *       {@code redis_fsync}）；</li>
+     *   <li>{@code EVERYSEC}：写侧一次都不刷，攒着由那一拍刷，且<em>每秒至多一次</em>。判据用上游
+     *       那一对偏移量（{@code aof_fsync_offset != aof_current_size}，{@code aof.c:349}），于是
+     *       "没人写了但还欠着一截"那一拍仍要刷一次（{@code aof.c:341-345} 的注释专门写的是这件事），
+     *       而"没欠"的那一拍必须空转；</li>
+     *   <li>{@code NO}：一次都不刷，但字节必须已经在文件里 —— 这一格是"0 次"那两格的阳性对照，
+     *       否则 0 是量具坏了而不是档位对了。</li>
+     * </ul>
+     * 另外两格不属于"三档"但同属这一支：运行中换档要把那一拍跟着挂上（上游 {@code config.c:493}
+     * 只改整数是因为它每轮事件循环重读那个整数，我们有定时器就得自己跟上）；收摊时上游
+     * {@code stopAppendOnly}（{@code aof.c:236-238}）是 flush → fsync → close，
+     * <em>连 NO 档也要在放手前刷最后一次</em>。
+     */
+    @Test
+    void fsyncPolicyDrivesTheRealFsyncCadence() throws Exception {
+        Map<String, String> seen = new LinkedHashMap<>();
+        Map<String, String> wrong = new LinkedHashMap<>();
+
+        // ==== ① ALWAYS：每条记录都要到盘上 ====
+        System.setProperty("zcache.appendfsync", "always");
+        int portAlways = freePort();
+        RedisServer strict = new RedisServer("127.0.0.1", portAlways, 0);
+        strict.setDataDir(java.nio.file.Files.createTempDirectory("zcache-fs-always").toString());
+        Thread threadAlways = startAndWait(strict, portAlways);
+        long alwaysDelta, rewriteDeltaAlways = -1;
+        try (Socket socket = connect(portAlways)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+            AofPersistence aof = strict.getAofPersistence();
+            assertNotNull(aof, "配了 dataDir 就必须有 AOF");
+            long base = aof.getFsyncCount();
+            for (int i = 0; i < 3; i++) {
+                send(socket, "SET", "a" + i, "v");
+                assertEquals("+OK", readReply(in));
+            }
+            alwaysDelta = aof.getFsyncCount() - base;
+            // 换进来一份新日志 = 一个新 inode，它自己也有一次到盘的义务（aof.c:1767-1770）
+            long beforeRewrite = aof.getFsyncCount();
+            aof.rewriteAof(aof.getAofFilePath());
+            rewriteDeltaAlways = aof.getFsyncCount() - beforeRewrite;
+        } finally {
+            strict.stop();
+            threadAlways.join(DEADLINE_MS);
+            System.clearProperty("zcache.appendfsync");
+        }
+        // 3 笔 SET，加上启动后第一条写补的那一条 SELECT 前缀 = 4 条记录，每条一次 fsync
+        if (alwaysDelta == 4) {
+            seen.put("always 每条记录一次", "4");
+        } else {
+            wrong.put("always 每条记录一次", "3 笔 SET + 首条写补的 SELECT = 4 条记录，实际 fsync "
+                    + alwaysDelta + " 次");
+        }
+        if (rewriteDeltaAlways == 1) {
+            seen.put("always 换日志后给新日志刷一次", "1");
+        } else {
+            wrong.put("always 换日志后给新日志刷一次", "rewriteAof 换进新 inode 之后应当正好刷一次，实际 "
+                    + rewriteDeltaAlways + " 次");
+        }
+
+        // ==== ② EVERYSEC：写侧不刷，那一拍每秒至多刷一次 ====
+        System.setProperty("zcache.appendfsync", "everysec");
+        int portSec = freePort();
+        RedisServer everysec = new RedisServer("127.0.0.1", portSec, 0);
+        everysec.setDataDir(java.nio.file.Files.createTempDirectory("zcache-fs-everysec").toString());
+        Thread threadSec = startAndWait(everysec, portSec);
+        long duringWrites = -1, afterIdle = -1, rewriteDeltaSec = -1;
+        try (Socket socket = connect(portSec)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+            AofPersistence aof = everysec.getAofPersistence();
+            long base = aof.getFsyncCount();
+            for (int i = 0; i < 3; i++) {
+                send(socket, "SET", "b" + i, "v");
+                assertEquals("+OK", readReply(in));
+            }
+            duringWrites = aof.getFsyncCount() - base;
+            boolean ticked = waitUntilFsync(aof, base + 1, 3_000L);
+            long afterTick = aof.getFsyncCount() - base;
+            if (!ticked) {
+                wrong.put("everysec 攒着的由那一拍刷", "等 3 秒也没有一拍把它刷下去（计数仍为 " + afterTick
+                        + "）—— 写侧一停就永远不刷，正是上游 aof.c:341-345 那段注释防的病");
+            } else if (afterTick == 1) {
+                seen.put("everysec 攒着的由那一拍刷", "1");
+            } else {
+                wrong.put("everysec 攒着的由那一拍刷", "3 笔写应当攒成一次 fsync，实际累计 " + afterTick
+                        + " 次（那一拍不该每笔都刷）");
+            }
+            // 已经刷平了：再等一拍必须空转，不许每秒白刷一次盘
+            Thread.sleep(1_100L);
+            afterIdle = aof.getFsyncCount() - base;
+            seen.put("everysec 写侧自己刷了几次", String.valueOf(duringWrites));
+            // 换日志那一次也要刷 —— 这一格与 always 那一格两头钉住档位判据
+            // （上游 aof.c:1767-1770：ALWAYS 同步刷、EVERYSEC 后台刷、NO 两支都不进）
+            long beforeRewrite = aof.getFsyncCount();
+            aof.rewriteAof(aof.getAofFilePath());
+            rewriteDeltaSec = aof.getFsyncCount() - beforeRewrite;
+            if (rewriteDeltaSec == 1) {
+                seen.put("everysec 换日志后给新日志刷一次", "1");
+            } else {
+                wrong.put("everysec 换日志后给新日志刷一次", "EVERYSEC 档换日志时那一份新 inode 也要过一次盘"
+                        + "（上游走 aof_background_fsync），实际 " + rewriteDeltaSec + " 次");
+            }
+        } finally {
+            everysec.stop();
+            threadSec.join(DEADLINE_MS);
+            System.clearProperty("zcache.appendfsync");
+        }
+        if (duringWrites > 1) {
+            wrong.put("everysec 写侧不刷盘", "写命令自己就 fsync 了 " + duringWrites
+                    + " 次，那就不是 everysec 而是 always");
+        }
+        if (afterIdle >= 0 && !wrong.containsKey("everysec 攒着的由那一拍刷") && afterIdle != 1) {
+            wrong.put("everysec 空转那一拍", "没有新字节时第二拍不该再刷，实际累计 " + afterIdle + " 次");
+        } else if (afterIdle == 1) {
+            seen.put("everysec 空转那一拍", "仍是 1");
+        }
+
+        // ==== ③ NO：一次都不刷，但字节得在文件里 ====
+        System.setProperty("zcache.appendfsync", "no");
+        int portNo = freePort();
+        RedisServer lazy = new RedisServer("127.0.0.1", portNo, 0);
+        lazy.setDataDir(java.nio.file.Files.createTempDirectory("zcache-fs-no").toString());
+        Thread threadNo = startAndWait(lazy, portNo);
+        // 攥住引用：RedisServer.stop() 会把 aofPersistence 置空，收摊那一刷得从同一份对象上读
+        AofPersistence lazyAof = lazy.getAofPersistence();
+        assertNotNull(lazyAof, "配了 dataDir 就必须有 AOF");
+        long noDelta = -1, noAfterIdle = -1, switchDelta = -1, afterStopDelta = -1;
+        try (Socket socket = connect(portNo)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+            AofPersistence aof = lazyAof;
+            long base = aof.getFsyncCount();
+            for (int i = 0; i < 3; i++) {
+                send(socket, "SET", "c" + i, "v");
+                assertEquals("+OK", readReply(in));
+            }
+            noDelta = aof.getFsyncCount() - base;
+            Thread.sleep(1_100L);
+            noAfterIdle = aof.getFsyncCount() - base;
+            long logBytes = java.nio.file.Files.size(java.nio.file.Paths.get(aof.getAofFilePath()));
+            if (logBytes == 0) {
+                wrong.put("no 档的字节确实出了手", "日志是空的 —— 这一格的 0 次 fsync 就不是档位对了，"
+                        + "而是根本没写过");
+            } else {
+                seen.put("no 档的字节确实出了手", logBytes + " 字节");
+            }
+
+            // 运行中换档：那一拍必须跟着挂上（挂不上就只剩追加路径半边生效）
+            long beforeSwitch = aof.getFsyncCount();
+            aof.setFsyncPolicy(AofPersistence.FSYNC_EVERYSEC);
+            boolean armed = waitUntilFsync(aof, beforeSwitch + 1, 3_000L);
+            switchDelta = aof.getFsyncCount() - beforeSwitch;
+            if (!armed || switchDelta != 1) {
+                wrong.put("换档把每秒那一拍挂上", "NO → EVERYSEC 之后欠着的那一截应由新挂上的一拍刷下去，实际累计 "
+                        + switchDelta + " 次（等 3 秒" + (armed ? "后有" : "内没有") + "）");
+            } else {
+                seen.put("换档把每秒那一拍挂上", "1");
+            }
+        } finally {
+            long beforeStop = lazyAof.getFsyncCount();
+            lazy.stop();
+            afterStopDelta = lazyAof.getFsyncCount() - beforeStop;
+            threadNo.join(DEADLINE_MS);
+            System.clearProperty("zcache.appendfsync");
+        }
+        if (noDelta != 0 || noAfterIdle != 0) {
+            wrong.put("no 档不刷盘", "当场 " + noDelta + " 次、等一拍后 " + noAfterIdle
+                    + " 次，NO 档两次都应当是 0");
+        } else {
+            seen.put("no 档不刷盘", "0 / 0");
+        }
+        if (afterStopDelta != 1) {
+            wrong.put("收摊前那一刷", "上游 stopAppendOnly 不看档位，flush → fsync → close"
+                    + "（aof.c:236-238）；实际停服时 fsync " + afterStopDelta + " 次");
+        } else {
+            seen.put("收摊前那一刷", "1");
+        }
+        assertTrue(wrong.isEmpty(), "三档 appendfsync 的真实落盘节奏（健康格: " + seen
+                + "）不合格: " + wrong);
+    }
+
+    /** 等到 fsync 计数追上期望值；追上为 true，超时为 false。 */
+    private static boolean waitUntilFsync(AofPersistence aof, long expected, long timeoutMs)
+            throws InterruptedException {
+        long stop = System.currentTimeMillis() + timeoutMs;
+        while (System.currentTimeMillis() < stop) {
+            if (aof.getFsyncCount() >= expected) {
+                return true;
+            }
+            Thread.sleep(20L);
+        }
+        return aof.getFsyncCount() >= expected;
+    }
+
+    /**
+     * 上面那把尺读的是我们自己记的账，所以有一格它结构上量不到：把 {@code syncFile()} 里的
+     * {@code getFD().sync()} 摘掉、只留着后面的自增，计数照旧走，界面照旧全绿，而日志再没问过介质。
+     * 这一层直接读主代码的那一支，钉的就是"到底有没有向操作系统要过 fsync"这句话本身。
+     * <p>
+     * 每一格各有独立的猎物，且都是行为尺看不见的：摘 sync 留计数、把计数挪到 sync 之前、
+     * {@code openAppending} 只接 writer 不接底下那支流（fsync 永远要不上）、{@code closeLiveWriter}
+     * 不把流抹掉（换过日志之后对着已关闭的 fd 要 fsync）。
+     * <p>
+     * 四格连同"被钉的那几支方法还在不在"一起收进同一张表：这一支第一版让 {@code methodBody}
+     * 在找不到签名时当场抛，于是改动前那一跑只报出"找不到 openAppending"，把前两条<em>真有牙</em>的
+     * 红（HEAD 的 {@code syncFile()} 里根本没有 {@code getFD().sync()}）吞得干干净净。
+     */
+    @Test
+    void syncFileAsksTheOperatingSystemAndNotJustTheHeap() throws Exception {
+        String source = mainSourceOf("AofPersistence.java");
+        Map<String, String> wrong = new LinkedHashMap<>();
+        String body = methodBody(source, "private void syncFile() throws IOException", wrong, "syncFile");
+        String openBody = methodBody(source, "private void openAppending(File file)", wrong, "openAppending");
+        String closeBody = methodBody(source, "private void closeLiveWriter(boolean finalSync)", wrong,
+                "closeLiveWriter");
+
+        if (!body.contains("getFD().sync()")) {
+            wrong.put("真的 fsync", "syncFile() 里没有 getFD().sync() —— 只 flush 是把字节交给内核，"
+                    + "不是交给介质（改动前那一句自陈写着\"实际的 fsync 需要使用 FileChannel 或 FileDescriptor\"）");
+        }
+        int syncAt = body.indexOf("getFD().sync()");
+        int countAt = body.indexOf("fsyncCount.incrementAndGet()");
+        if (syncAt < 0 || countAt < 0 || countAt < syncAt) {
+            wrong.put("记账的顺序", "fsyncCount 必须在 sync() 返回之后才自增（系统保证不了落盘就不许记账），实际 sync@"
+                    + syncAt + " 计数@" + countAt);
+        }
+        if (!openBody.contains("liveStream = stream") || !openBody.contains("writer = new BufferedWriter")) {
+            wrong.put("两只手成对打开", "openAppending 必须同时接上 writer 与底下那支持有 fd 的流，实际: " + openBody);
+        }
+        int writerOff = closeBody.indexOf("writer = null;");
+        int streamOff = closeBody.indexOf("liveStream = null;");
+        if (writerOff < 0 || streamOff < 0
+                || !closeBody.substring(writerOff + "writer = null;".length()).trim().startsWith("liveStream = null;")) {
+            wrong.put("两只手成对抹掉", "closeLiveWriter 里 writer 与 liveStream 必须一起松开（紧挨着的两句），"
+                    + "只抹 writer 就是留着一个人对着已关闭的 fd 要 fsync；实际 writer@" + writerOff
+                    + " 流@" + streamOff);
+        }
+        assertTrue(wrong.isEmpty(), "syncFile 这一支的结构（读的是 src/main 的字节）不合格: " + wrong);
+    }
+
+    /** 主代码的字节 —— surefire 的 cwd 是模块目录，从仓根起算的那一种写法留作兜底。 */
+    private static String mainSourceOf(String fileName) throws IOException {
+        String tail = "src/main/java/com/zifang/z/cache/core/persistence/" + fileName;
+        java.nio.file.Path p = java.nio.file.Paths.get(tail);
+        if (!java.nio.file.Files.exists(p)) {
+            p = java.nio.file.Paths.get("z-cache-core/" + tail);
+        }
+        assertTrue(java.nio.file.Files.exists(p), "找不到被结构守卫读的那份源码: " + tail
+                + "（cwd=" + java.nio.file.Paths.get("").toAbsolutePath() + "）");
+        return new String(java.nio.file.Files.readAllBytes(p), StandardCharsets.UTF_8);
+    }
+
+    /** 取一个方法的花括号体；找不到就往表里记一笔并交回空串，好让同一张表里的其它几格照旧跑完。 */
+    private static String methodBody(String source, String signature, Map<String, String> wrong, String cell) {
+        int at = source.indexOf(signature);
+        if (at < 0) {
+            wrong.put(cell + " 这一支还在", "源码里找不到 " + signature + " —— 这一支被改名或删掉了，"
+                    + "靠它的那一格随之失去猎物");
+            return "";
+        }
+        int open = source.indexOf('{', at);
+        int depth = 0, end = -1;
+        for (int i = open; i < source.length(); i++) {
+            char c = source.charAt(i);
+            if (c == '{') {
+                depth++;
+            } else if (c == '}') {
+                depth--;
+                if (depth == 0) {
+                    end = i;
+                    break;
+                }
+            }
+        }
+        if (end <= open) {
+            wrong.put(cell + " 的花括号", signature + " 的花括号配不上对 —— 结构守卫读不出这一支");
+            return "";
+        }
+        return source.substring(open, end);
+    }
+
+    /**
      * SETBIT 与 BITOP 必须进 AOF —— 它们写的是真数据，重启之后得还在。
      * <p>
      * 这两个命令一度都不在 {@code WRITE_COMMANDS} 里，而那不是一个会红的缺陷：值进了内存、
