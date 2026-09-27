@@ -65,7 +65,7 @@ z-cache 是一个**生产就绪**的 Redis 协议兼容内存数据库，使用 
 | **🔒 分布式锁** | 基于 SET NX PX 的 tryLock / unlock / renew / Watchdog 自动续约 / fencing token；**没有 Lua**，解锁走"先 GET 校验再 DEL"，非原子 | [_doc/001_arch/分布式锁设计.md](_doc/001_arch/分布式锁设计.md) |
 | **📡 Pub/Sub 模式匹配** | 支持 PSUBSCRIBE `news.*` 通配符模式订阅，兼容 Redis PSUBSCRIBE/PUNSUBSCRIBE 规范 | （1.3.0 文档规划中） |
 | **📋 Stream 消费组** | XADD/XREAD/XREADGROUP/XACK/XPENDING/XGROUP/XINFO，支持消费者组与 pending list（XCLAIM/XAUTOCLAIM 未实现） | （1.3.0 文档规划中） |
-| **💾 RDB + AOF 持久化** | RDB 快照（逐库、带 TTL）+ AOF 增量日志（启动时重放），fsync 三档 `always/everysec/no`。AOF 重写未实现（`rewriteAof` 是个只写空文件的壳，且没有任何命令能触发它，因此不要指望 BGREWRITEAOF） | （1.3.0 文档规划中） |
+| **💾 RDB + AOF 持久化** | RDB 快照（逐库、带 TTL）+ AOF 增量日志（启动时重放）。fsync 三档 `always/everysec/no` 可选，但**这一档目前只刷到操作系统缓冲区、没有真的 fsync**（`syncFile()` 只做 flush）—— 进程被杀不丢，整机掉电会丢。AOF 重写 1.3.6 起导出的是当前状态（逐库 `SELECT` + 每键绝对时刻 `PEXPIREAT` + 变参命令 64 一片），但**没有任何命令能触发它**，只能在程序里显式调 `rewriteAof`，因此仍然不要指望 BGREWRITEAOF；且含 Stream 键的库过一遍重写会丢掉那一族键（Stream 既进不了快照也导不出，见 CHANGELOG 13e ③） | （1.3.0 文档规划中） |
 | **📊 运维命令** | INFO/MONITOR/DEBUG/CLIENT/SLOWLOG 5 类运维命令，含集群监控和慢日志追踪 | （1.3.0 文档规划中） |
 
 ### 已有能力（继承自 1.0.x）
@@ -209,7 +209,7 @@ redis-cli -h localhost -p 16379 SLOWLOG GET 10
 | **🔒 分布式锁** | SET NX PX ✅ / EVAL·EVALSHA 🚧 未实现 | 服务端没有 Lua 解释器；客户端 `DistributedLock` 会降级成"先 GET 校验再 DEL"，**不是原子的**（跨进程竞争下可能误删别人的锁） |
 | **📡 Pub/Sub** | PUBLISH / SUBSCRIBE / UNSUBSCRIBE / PSUBSCRIBE / PUNSUBSCRIBE / PUBSUB | ✅ 确认包的第 3 个数从 1.3.5 起是"这条连接的频道数+模式数"（此前每条命令各自从 1 数，客户端据此记账会错位） |
 | **📋 Stream** | XADD / XREAD / XREADGROUP / XACK / XPENDING / XGROUP / XINFO | ✅ `XINFO CONSUMERS` 1.3.5 起才有实现（此前只有注释里没有 case）；XCLAIM 🚧 未实现；`XPENDING` 只有汇总形态，明细形式（`IDLE`/`start end count`）明确报错 |
-| **💾 持久化** | SAVE / BGSAVE / LASTSAVE | ✅ 1.3.4 起才真正落盘（此前三条命令只回一个写死的成功回复）；1.3.6 起这三板的作用域是"本台服务器"，同 JVM 里再起一台不带 `--data-dir` 的不会把这台关掉；BGREWRITEAOF 🚧 未实现 |
+| **💾 持久化** | SAVE / BGSAVE / LASTSAVE | ✅ 1.3.4 起才真正落盘（此前三条命令只回一个写死的成功回复）；1.3.6 起这三板的作用域是"本台服务器"，同 JVM 里再起一台不带 `--data-dir` 的不会把这台关掉；1.3.6 起 `rewriteAof()` 导出的是当前状态（不再是空日志），但**触发它的命令一个都没有** —— BGREWRITEAOF 🚧 未实现，体积自动重写也没有，所以这一份只能在程序里显式调 |
 | **📊 运维** | INFO / MONITOR / DEBUG / CLIENT / SLOWLOG | ✅ `CLIENT LIST` 从 1.3.5 起列出本机全部连接且 `sub=`/`psub=` 是真值（此前只有发起者一行、两个数写死 0）、`CLIENT KILL` 真关连接、新增 `CLIENT INFO`；SLOWLOG 1.3.5 才接上真实服务器（此前恒回 not configured） |
 | **事务** | MULTI / EXEC / DISCARD / WATCH / UNWATCH | ✅ 1.3.5 修掉 WATCH 的两处失效：复查用的版本尺恒返回 0（该中止的中止不了），且 EXEC/DISCARD 不清 WATCH（上一条事务的观察键会永久挂着，把后来的事务无端打掉） |
 | **Pipeline** | 客户端 SDK 自动支持 | ✅ |
