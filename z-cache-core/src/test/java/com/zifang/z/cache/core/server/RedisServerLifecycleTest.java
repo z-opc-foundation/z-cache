@@ -1143,9 +1143,12 @@ class RedisServerLifecycleTest {
             send(socket, "XREADGROUP", "GROUP", "g1", "c3", "COUNT", "10", "STREAMS", "s_orders", ">");
             String afterGroup = readReplyDeep(in);
             seen.put("XREADGROUP c3 >", afterGroup);
-            if (java.util.regex.Pattern.compile("\\d+-\\d+").matcher(afterGroup).find()) {
-                wrong.put("组的读数位置", "组该重建在 4-1（1-1/2-5/3-9 早已投过、4-1 已删），"
-                        + "新消费者 c3 一条都不该领到，实际 " + afterGroup);
+            // 两问一起判：报 -ERR = 组压根没重建（只问"领没领到条目"会把"组不在"读成"位置卡住了"，
+            // 那是一格空过的判据），领到条目 = 位置真的没卡。
+            if (afterGroup.startsWith("-")
+                    || java.util.regex.Pattern.compile("\\d+-\\d+").matcher(afterGroup).find()) {
+                wrong.put("组的读数位置", "组该重建在 4-1（1-1/2-5/3-9 早已投过、4-1 已删）：报 -ERR 是组没重建，"
+                        + "领到条目是位置没卡住；新消费者 c3 两条都不该有，实际 " + afterGroup);
             }
             expectCell(seen, wrong, socket, in, "XADD s_orders 4-2（上面那一问的阳性对照）", "4-2",
                     "XADD", "s_orders", "4-2", "item", "e", "qty", "6");
@@ -1221,6 +1224,227 @@ class RedisServerLifecycleTest {
      * 而不是写一份<em>空</em>日志再把真的有内容的那份换掉（这一格改动前的实际形状：
      * 注释自陈"实际实现需要依赖 StoreAccessor"，然后把 {@code appendonly.aof} 删了）。
      */
+    /**
+     * Stream 一族进得了 RDB 快照。
+     * <p>
+     * 上游 5.0.14 给这一族留了专门的一种类型字节（{@code rdb.h:93} 的
+     * {@code RDB_TYPE_STREAM_LISTPACKS = 15}，写侧在 {@code rdbSaveObjectType} 的 {@code rdb.c:656}，
+     * 读侧在 {@code rdb.c:1698}），负载按 listpack 分三摊：条目、组、每组里每个消费者手上未确认的条目。
+     * 我们的快照从来不是 Redis 能 load 的那份字节（魔数是 {@code ZCHRDB}，见 {@link RdbPersistence}），
+     * 所以这里钉的是"这一族进不进得进快照、进来之后带着什么"，不是 listpack 的排布。
+     * <p>
+     * 与 {@code aofRewriteCarriesStreamKeysAcrossTheSwap}（13g）是两条独立的腿：那一条走
+     * "重写 → 只留 AOF 重启"，这一条走 "SAVE → 只留快照重启"。两条各配一份量具，
+     * 因为<b>任一条单独成立都不蕴含另一条</b>（导出侧 13g 之前只有 AOF 有流键，快照那侧一直没有人）。
+     */
+    @Test
+    void saveSnapshotsStreamKeys() throws Exception {
+        java.nio.file.Path dir = java.nio.file.Files.createTempDirectory("zcache-rdb-stream");
+        int p1 = freePort();
+        RedisServer gen1 = new RedisServer("127.0.0.1", p1, 0);
+        gen1.setDataDir(dir.toString());
+        Thread t1 = startAndWait(gen1, p1);
+        Map<String, String> seen = new LinkedHashMap<>();
+        Map<String, String> wrong = new LinkedHashMap<>();
+        String liveBefore;
+        String wideBefore;
+        String in3Before;
+        try (Socket socket = connect(p1)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+
+            // 带组的流：读数位置推到 3-9，4-1 投给 c2 之后又被 XDEL —— 于是"表顶"与
+            // "活着的最大学 ID"从这一刻起是两件事，快照必须把前者单独带过去。
+            send(socket, "XADD", "s_live", "1-1", "item", "a");
+            assertEquals("1-1", readReply(in), "前置条件: 显式 ID 写得进");
+            send(socket, "XADD", "s_live", "2-5", "item", "b");
+            assertEquals("2-5", readReply(in));
+            send(socket, "XADD", "s_live", "3-9", "item", "c");
+            assertEquals("3-9", readReply(in));
+            send(socket, "XGROUP", "CREATE", "s_live", "g1", "0-0");
+            assertEquals("+OK", readReply(in), "前置条件: 组建得起来");
+            send(socket, "XREADGROUP", "GROUP", "g1", "c1", "COUNT", "10", "STREAMS", "s_live", ">");
+            String c1 = readReplyDeep(in);
+            assertTrue(c1.contains("3-9"), "前置条件: c1 要把三条都领走，实际 " + c1);
+            send(socket, "XADD", "s_live", "4-1", "item", "d");
+            assertEquals("4-1", readReply(in));
+            send(socket, "XREADGROUP", "GROUP", "g1", "c2", "COUNT", "10", "STREAMS", "s_live", ">");
+            String c2 = readReplyDeep(in);
+            assertTrue(c2.contains("4-1") && !c2.contains("3-9"),
+                    "前置条件: c2 只领得到 4-1，实际 " + c2);
+            send(socket, "XDEL", "s_live", "4-1");
+            assertEquals(":1", readReply(in));
+            send(socket, "EXPIRE", "s_live", "3600");
+            assertEquals(":1", readReply(in), "前置条件: 流键挂得上时刻");
+            send(socket, "XRANGE", "s_live", "-", "+");
+            liveBefore = readReplyDeep(in);
+            assertTrue(liveBefore.contains("3-9") && !liveBefore.contains("4-1"),
+                    "前置条件: 活着的是 1-1/2-5/3-9，实际 " + liveBefore);
+
+            // 空流：键在、表顶在、记录一条都不在
+            send(socket, "XADD", "s_empty", "5-1", "k", "v");
+            assertEquals("5-1", readReply(in));
+            send(socket, "XDEL", "s_empty", "5-1");
+            assertEquals(":1", readReply(in));
+            send(socket, "XLEN", "s_empty");
+            assertEquals(":0", readReply(in), "前置条件: s_empty 现在是一条空流");
+            send(socket, "EXISTS", "s_empty");
+            assertEquals(":1", readReply(in), "前置条件: 空流仍然是键");
+
+            // 表顶跨过 2^63：快照里存的应当是两段位模式，而不是某个进制下的文本
+            send(socket, "XADD", "s_wide", "9223372036854775808-7", "f", "w7");
+            assertEquals("9223372036854775808-7", readReply(in), "前置条件: uint64 高位的 ID 写得进");
+            send(socket, "XADD", "s_wide", "9223372036854775808-9", "f", "w9");
+            assertEquals("9223372036854775808-9", readReply(in));
+            send(socket, "XDEL", "s_wide", "9223372036854775808-9");
+            assertEquals(":1", readReply(in));
+            send(socket, "XRANGE", "s_wide", "-", "+");
+            wideBefore = readReplyDeep(in);
+            assertTrue(wideBefore.contains("w7") && !wideBefore.contains("w9"),
+                    "前置条件: s_wide 只剩 -7 而表顶停在 -9，实际 " + wideBefore);
+
+            // 快照根本不该带上的两枚：整键被删、停机期间到点
+            send(socket, "XADD", "s_gone", "1-1", "f", "v");
+            assertEquals("1-1", readReply(in));
+            send(socket, "DEL", "s_gone");
+            assertEquals(":1", readReply(in));
+            send(socket, "XADD", "s_dead", "1-1", "f", "v");
+            assertEquals("1-1", readReply(in));
+            // 这一枚要的是"进了文件、加载那一判再把它抹掉"，所以 SAVE 时它必须<em>还活着</em>；
+            // 而停机那一段必须跨过它的时刻。上一格（saveSnapshotsEveryDatabaseAndTheirTtls）
+            // 那枚 dead7 靠的是"重启本来就慢于一秒"，那是没量过的巧合；这里把睡着那一段
+            // 显式压在两次运行之间，判据由 2 秒的时刻与 2.1 秒的空档共同钉住。
+            send(socket, "EXPIRE", "s_dead", "2");
+            assertEquals(":1", readReply(in), "前置条件: s_dead 挂得上时刻");
+            send(socket, "EXISTS", "s_dead");
+            assertEquals(":1", readReply(in), "前置条件: SAVE 之前 s_dead 还活着，它必须真的进得了文件");
+
+            send(socket, "SELECT", "3");
+            assertEquals("+OK", readReply(in));
+            send(socket, "XADD", "s_in3", "1-1", "f", "v3");
+            assertEquals("1-1", readReply(in));
+            send(socket, "XRANGE", "s_in3", "-", "+");
+            in3Before = readReplyDeep(in);
+            send(socket, "SELECT", "0");
+            assertEquals("+OK", readReply(in));
+
+            send(socket, "SAVE");
+            assertEquals("+OK", readReply(in), "前置条件: 配了 dataDir，SAVE 要如实回 +OK");
+            send(socket, "LASTSAVE");
+            String lastSave = readReply(in);
+            assertTrue(lastSave.startsWith(":") && Long.parseLong(lastSave.substring(1)) > 0,
+                    "LASTSAVE 要报出真实的快照时刻，实际: " + lastSave);
+        } finally {
+            gen1.stop();
+            t1.join(DEADLINE_MS);
+        }
+        // 停机那一段要跨过 s_dead 的时刻：显式睡过去，而不是赌"重启够慢"
+        Thread.sleep(2_100);
+        // 只留快照：别拿 AOF 那一侧的功劳当这一族的证据
+        java.nio.file.Files.deleteIfExists(dir.resolve("appendonly.aof"));
+        assertTrue(java.nio.file.Files.size(dir.resolve("dump.rdb")) > 0,
+                "SAVE 报了 +OK，磁盘上就必须有文件");
+
+        int p2 = freePort();
+        RedisServer gen2 = new RedisServer("127.0.0.1", p2, 0);
+        gen2.setDataDir(dir.toString());
+        Thread t2 = startAndWait(gen2, p2);
+        try (Socket socket = connect(p2)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+            expectCell(seen, wrong, socket, in, "DBSIZE", ":3", "DBSIZE");
+            send(socket, "XRANGE", "s_live", "-", "+");
+            String liveAfter = readReplyDeep(in);
+            seen.put("XRANGE s_live", liveAfter);
+            if (!liveBefore.equals(liveAfter)) {
+                wrong.put("XRANGE s_live", "快照前 " + liveBefore + " → 重启后 " + liveAfter);
+            }
+            expectCell(seen, wrong, socket, in, "TYPE s_live", "+stream", "TYPE", "s_live");
+            expectCell(seen, wrong, socket, in, "XLEN s_live", ":3", "XLEN", "s_live");
+            expectTtlCell(seen, wrong, socket, in, "s_live", 3_600);
+            // 表顶与"活着的最大学 ID"是两件事：4-1 已被 XDEL，只有快照把表顶单独带过来，4-0 才被挡下
+            send(socket, "XADD", "s_live", "4-0", "item", "x");
+            String liveRejected = readReply(in);
+            seen.put("XADD s_live 4-0", liveRejected);
+            if (!liveRejected.startsWith("-ERR")) {
+                wrong.put("表顶活过快照", "4-1 已被 XDEL 而表顶该停在 4-1，比它小的 4-0 该被单调性闸挡下；"
+                        + "实际 " + liveRejected);
+            }
+            // 组的读数位置：新消费者 c3 只该领到 4-1 之后的条目，而 4-1 已删 ⇒ 空。
+            // 这一问必须排在下面那条 XADD 4-2 之前，且下面还压着一问猎物。
+            send(socket, "XREADGROUP", "GROUP", "g1", "c3", "COUNT", "10", "STREAMS", "s_live", ">");
+            String afterGroup = readReplyDeep(in);
+            seen.put("XREADGROUP c3 >", afterGroup);
+            // 两问一起判：报 -ERR = 组压根没重建（只问"领没领到条目"会把"组不在"读成"位置卡住了"，
+            // 那是一格空过的判据），领到条目 = 位置真的没卡。
+            if (afterGroup.startsWith("-")
+                    || java.util.regex.Pattern.compile("\\d+-\\d+").matcher(afterGroup).find()) {
+                wrong.put("组的读数位置", "组该重建在 4-1（1-1/2-5/3-9 早已投过、4-1 已删）：报 -ERR 是组没重建，"
+                        + "领到条目是位置没卡住；新消费者 c3 两条都不该有，实际 " + afterGroup);
+            }
+            expectCell(seen, wrong, socket, in, "XADD s_live 4-2（上面那一问的阳性对照）", "4-2",
+                    "XADD", "s_live", "4-2", "item", "e");
+            send(socket, "XREADGROUP", "GROUP", "g1", "c3", "COUNT", "10", "STREAMS", "s_live", ">");
+            String groupFeeds = readReplyDeep(in);
+            seen.put("XREADGROUP c3 >（再问）", groupFeeds);
+            if (!groupFeeds.contains("4-2")) {
+                wrong.put("组重建之后还喂得动", "上一问的『一条都不领到』需要一个猎物：4-2 一进流，同一个 c3 再问一次 > "
+                        + "就该领到它，否则『领不到』是组压根没重建，而不是位置卡在 4-1，实际 " + groupFeeds);
+            }
+            expectCell(seen, wrong, socket, in, "EXISTS s_empty", ":1", "EXISTS", "s_empty");
+            expectCell(seen, wrong, socket, in, "TYPE s_empty", "+stream", "TYPE", "s_empty");
+            expectCell(seen, wrong, socket, in, "XLEN s_empty", ":0", "XLEN", "s_empty");
+            send(socket, "XADD", "s_empty", "5-0", "k", "v");
+            String emptyRejected = readReply(in);
+            seen.put("XADD s_empty 5-0", emptyRejected);
+            if (!emptyRejected.startsWith("-ERR")) {
+                wrong.put("空流的表顶", "空流也要把表顶留在 5-1，否则 5-0 还能塞进去，实际 " + emptyRejected);
+            }
+            expectCell(seen, wrong, socket, in, "XADD s_empty 5-2（阳性对照）", "5-2",
+                    "XADD", "s_empty", "5-2", "k", "v2");
+            // 与 s_live 同形，但这一问要的是位模式：表顶跨过 2^63 时那两段不能按十进制文本存
+            send(socket, "XADD", "s_wide", "9223372036854775808-8", "f", "w8");
+            String wideRejected = readReply(in);
+            seen.put("XADD s_wide 高位-8", wideRejected);
+            if (!wideRejected.startsWith("-ERR")) {
+                wrong.put("高位的表顶活过快照", "活着的是 9223372036854775808-7 而表顶该停在 ...08-9，"
+                        + "比它小的 ...08-8 该被挡下；实际 " + wideRejected);
+            }
+            send(socket, "XRANGE", "s_wide", "-", "+");
+            String wideStill = readReplyDeep(in);
+            seen.put("XRANGE s_wide（上面那一问的阳性对照）", wideStill);
+            if (!wideBefore.equals(wideStill)) {
+                wrong.put("XRANGE s_wide（上面那一问的阳性对照）", "被拒的那一问不能顺手改掉内容：快照前 "
+                        + wideBefore + " → 重启后 " + wideStill);
+            }
+            expectCell(seen, wrong, socket, in, "EXISTS s_gone", ":0", "EXISTS", "s_gone");
+            expectCell(seen, wrong, socket, in, "EXISTS s_dead", ":0", "EXISTS", "s_dead");
+            send(socket, "SELECT", "3");
+            String select3 = readReply(in);
+            seen.put("SELECT 3", select3);
+            if (!"+OK".equals(select3)) {
+                wrong.put("SELECT 3", "切库要答 +OK（读不到它就说明上面的字节没吃干净），实际 " + select3);
+            }
+            send(socket, "XRANGE", "s_in3", "-", "+");
+            String in3After = readReplyDeep(in);
+            seen.put("XRANGE s_in3 在 3 库", in3After);
+            if (!in3Before.equals(in3After)) {
+                wrong.put("XRANGE s_in3 在 3 库", "快照前 " + in3Before + " → 重启后 " + in3After);
+            }
+            send(socket, "SELECT", "0");
+            String backTo0 = readReply(in);
+            seen.put("SELECT 0", backTo0);
+            if (!"+OK".equals(backTo0)) {
+                wrong.put("SELECT 0", "切回 0 库要答 +OK，实际 " + backTo0);
+            }
+            expectCell(seen, wrong, socket, in, "EXISTS s_in3 回到 0 库", ":0", "EXISTS", "s_in3");
+        } finally {
+            gen2.stop();
+            t2.join(DEADLINE_MS);
+        }
+        assertTrue(wrong.isEmpty(), "流键过一遍快照：只留 dump.rdb 重启之后要逐格读回（一格都不在 = 这一族"
+                + "根本没进快照；值在而表顶/组/时刻不在 = 负载只写了一半）。读回的格子 " + seen
+                + "；不合格: " + wrong + " [RED_CELLS=" + String.join("|", wrong.keySet()) + "]");
+    }
+
     @Test
     void rewriteWithoutStoreAccessorRefusesInsteadOfWipingTheLog() throws Exception {
         java.nio.file.Path dir = java.nio.file.Files.createTempDirectory("zcache-aof-bare");

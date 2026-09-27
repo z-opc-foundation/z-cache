@@ -42,6 +42,16 @@ public class StreamStore {
     }
 
     /**
+     * 整只装回：把一个已经装配好的流放到键名下（快照加载那一条腿用）。
+     * <p>
+     * 不并进 {@link #getOrCreate}：表顶与组的读数位置是"这一只流自己的历史"，
+     * 逐条 {@code addEntry} 拼不出"表顶停在被 XDEL 掉的那一条"那种排布。
+     */
+    public void put(int db, String key, Stream stream) {
+        stores[db].put(key, stream);
+    }
+
+    /**
      * 检查 key 是否存在。
      */
     public boolean exists(int db, String key) {

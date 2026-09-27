@@ -155,4 +155,18 @@ public interface StoreAccessor {
      * @param expireAt      过期时间戳（毫秒），-1 表示无过期时间
      */
     void restoreSortedSet(int db, String key, Map<byte[], Double> memberScores, long expireAt);
+
+    /**
+     * 向指定库恢复一条 Stream 键。
+     * <p>
+     * 交回来的是<em>装配好的那一只</em>，而不是条目列表：与 {@link #getAllStreamEntries} 对称，
+     * 这一族的"表顶在哪"和"每组读到哪儿"都是键自身的一部分，摊成容器就只剩成员表。
+     * 停机期间已经到点的那一枚整键不装（{@code rdb.c:2097} 同一判）。
+     *
+     * @param db       数据库编号
+     * @param key      键名
+     * @param stream   已经带上条目、表顶与消费组的那一只流
+     * @param expireAt 过期时间戳（毫秒），-1 表示无过期时间
+     */
+    void restoreStream(int db, String key, Stream stream, long expireAt);
 }

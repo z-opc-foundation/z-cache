@@ -205,6 +205,21 @@ public class MemoryStoreAccessor implements StoreAccessor {
     }
 
     /**
+     * 第六家的加载那一腿。与另外五家共用同两道闸（{@link #diedWhileOffline} 判死、
+     * {@link #armAfterRestore} 挂时刻），差别只在装值这一步：这里整只放进去，
+     * 不逐条 {@code addEntry} —— 表顶与组的读数位置拼不出来，见
+     * {@link com.zifang.z.cache.core.stream.StreamStore#put}。
+     */
+    @Override
+    public void restoreStream(int db, String key, Stream stream, long expireAt) {
+        if (diedWhileOffline(expireAt) || stream == null) {
+            return;
+        }
+        store.streamStore().put(db, key, stream);
+        armAfterRestore(db, key, expireAt);
+    }
+
+    /**
      * 停机期间那一个时刻已经过去：这一枚在真实 Redis 里不存在了，整键不许复活。
      * 没有这一道闸时"剩余毫秒 &lt;= 0"会被当成永久键写回去，等于凭空复活一份再也删不掉的数据。
      */

@@ -26,6 +26,11 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
+import com.zifang.z.cache.core.stream.ConsumerGroup;
+import com.zifang.z.cache.core.stream.Stream;
+import com.zifang.z.cache.core.stream.StreamEntry;
+import com.zifang.z.cache.common.protocol.StreamIdFormat;
+
 /**
  * RDB 快照持久化调度器。
  * <p>
@@ -43,10 +48,17 @@ import java.util.logging.Logger;
  *   DB 编号: int
  *   键值对数量: int
  *   对每个键值对:
- *     数据类型标记: byte (0=string, 1=hash, 2=list, 3=set, 4=sorted_set)
+ *     数据类型标记: byte (0=string, 1=hash, 2=list, 3=set, 4=sorted_set, 5=stream)
  *     key: length-prefixed bytes (int length + byte[])
  *     过期时间: long (-1 表示无过期)
  *     值: 根据类型序列化
+ *       stream 一族的负载（其余四型各是"成员数 + 成员"那一式）：
+ *         表顶 ms(long) + 表顶 seq(long)
+ *         + 条目数(int)，每条 = id(length-prefixed UTF) + 字段数(int) + 字段名/值(各 length-prefixed UTF)
+ *         + 组数(int)，每组 = 组名(length-prefixed UTF) + 读数位置 ms(long) + seq(long)
+ *         那两段表顶存的是<em>位模式</em>而不是十进制文本：一个 uint64 的 ID 一旦跨过 2^63，
+ *         按文本存就得再约定进制，而 {@code long} 本身就装得下它（见 13g-2 那条有符号渲染的教训）。
+ *         组里每个消费者手上未确认的那一摊（PEL）<b>不写</b>：见 CHANGELOG 13g 的"与上游的差别"。
  * 结束标记: byte (0xFF)
  * 校验和: long (所有字节的 XOR)
  * </pre>
@@ -93,6 +105,15 @@ public class RdbPersistence {
      * 数据类型标记：Sorted Set
      */
     private static final byte TYPE_SORTED_SET = 4;
+
+    /**
+     * 数据类型标记：Stream。
+     * <p>
+     * 编号沿着我们自己那份格式往下排（0..4 已被前五家占满），<b>不是</b>上游的
+     * {@code RDB_TYPE_STREAM_LISTPACKS = 15}（{@code rdb.h:93}）—— 我们的魔数是 {@code ZCHRDB}，
+     * 这份文件 Redis 从来 load 不动，对齐那个编号只会让人以为能对齐。
+     */
+    private static final byte TYPE_STREAM = 5;
 
     /**
      * 结束标记
@@ -432,6 +453,7 @@ public class RdbPersistence {
                         storeAccessor.getAllListEntries(db),
                         storeAccessor.getAllSetEntries(db),
                         storeAccessor.getAllSortedSetEntries(db),
+                        storeAccessor.getAllStreamEntries(db),
                         storeAccessor.getAllExpirationEntries(db));
                 if (section.totalEntries() > 0) {
                     sections.add(section);
@@ -452,11 +474,12 @@ public class RdbPersistence {
             Map<String, Object> listEntries = section.listEntries;
             Map<String, Object> setEntries = section.setEntries;
             Map<String, Object> sortedSetEntries = section.sortedSetEntries;
+            Map<String, Stream> streamEntries = section.streamEntries;
             Map<String, Long> expirationEntries = section.expirationEntries;
 
             // 计算总键值对数量
             int totalEntries = stringEntries.size() + hashEntries.size() + listEntries.size()
-                    + setEntries.size() + sortedSetEntries.size();
+                    + setEntries.size() + sortedSetEntries.size() + streamEntries.size();
             dos.writeInt(totalEntries);
             checksum = updateChecksum(checksum, totalEntries);
 
@@ -532,6 +555,21 @@ public class RdbPersistence {
                 checksum = writeString(dos, key, checksum);
                 checksum = writeLong(dos, expireAt, checksum);
                 checksum = writeSortedSet(dos, sortedSetValue, checksum);
+            }
+
+            // 写入 Stream 类型。前五家交回的是扁平容器，这一家交回的是那一只流本身：
+            // 一条流要带出去的不只成员，还有"表顶停在哪儿"和"每组读到哪儿"。
+            for (Map.Entry<String, Stream> entry : streamEntries.entrySet()) {
+                String key = entry.getKey();
+                Stream stream = entry.getValue();
+                Long expireAt = expirationEntries.getOrDefault(key, -1L);
+
+                dos.writeByte(TYPE_STREAM);
+                checksum = updateChecksum(checksum, TYPE_STREAM);
+
+                checksum = writeString(dos, key, checksum);
+                checksum = writeLong(dos, expireAt, checksum);
+                checksum = writeStream(dos, stream, checksum);
             }
             }
 
@@ -637,6 +675,15 @@ public class RdbPersistence {
                         }
                         break;
 
+                    case TYPE_STREAM:
+                        LoadedStream loaded = readStream(dis, checksum);
+                        Stream stream = loaded.stream;
+                        checksum = loaded.checksum;
+                        if (restorable) {
+                            storeAccessor.restoreStream(dbIndex, key, stream, expireAt);
+                        }
+                        break;
+
                     default:
                         throw new IOException("Unknown data type: " + type);
                 }
@@ -667,23 +714,26 @@ public class RdbPersistence {
         final Map<String, Object> listEntries;
         final Map<String, Object> setEntries;
         final Map<String, Object> sortedSetEntries;
+        final Map<String, Stream> streamEntries;
         final Map<String, Long> expirationEntries;
 
         DbSection(int dbIndex, Map<String, Object> stringEntries, Map<String, Object> hashEntries,
                   Map<String, Object> listEntries, Map<String, Object> setEntries,
-                  Map<String, Object> sortedSetEntries, Map<String, Long> expirationEntries) {
+                  Map<String, Object> sortedSetEntries, Map<String, Stream> streamEntries,
+                  Map<String, Long> expirationEntries) {
             this.dbIndex = dbIndex;
             this.stringEntries = stringEntries;
             this.hashEntries = hashEntries;
             this.listEntries = listEntries;
             this.setEntries = setEntries;
             this.sortedSetEntries = sortedSetEntries;
+            this.streamEntries = streamEntries;
             this.expirationEntries = expirationEntries;
         }
 
         int totalEntries() {
             return stringEntries.size() + hashEntries.size() + listEntries.size()
-                    + setEntries.size() + sortedSetEntries.size();
+                    + setEntries.size() + sortedSetEntries.size() + streamEntries.size();
         }
     }
 
@@ -895,6 +945,105 @@ public class RdbPersistence {
     private long updateChecksum(long checksum, long value) {
         checksum ^= value;
         return checksum;
+    }
+
+    /**
+     * 写一条流：表顶两段、条目、组。顺序与读侧一致，也与 13g 那条 AOF 导出的顺序一致
+     * （先条目、后表顶、再组 —— 上游 {@code rewriteStreamObject} 是 XADD / XSETID / XGROUP）。
+     */
+    private long writeStream(DataOutputStream dos, Stream stream, long checksum) throws IOException {
+        long[] top = stream.lastId();
+        checksum = writeLong(dos, top[0], checksum);
+        checksum = writeLong(dos, top[1], checksum);
+
+        List<StreamEntry> entries = stream.getEntries();
+        checksum = updateChecksum(checksum, entries.size());
+        dos.writeInt(entries.size());
+        for (StreamEntry entry : entries) {
+            checksum = writeString(dos, entry.getId(), checksum);
+            Map<String, String> fields = entry.getFields();
+            checksum = updateChecksum(checksum, fields.size());
+            dos.writeInt(fields.size());
+            for (Map.Entry<String, String> field : fields.entrySet()) {
+                checksum = writeString(dos, field.getKey(), checksum);
+                checksum = writeString(dos, field.getValue(), checksum);
+            }
+        }
+
+        // 组表是 ConcurrentHashMap，"数出来的"与"取到的"之间可以少掉一只（XGROUP DESTROY 就在改它）。
+        // 计数与写出的条数必须同源，所以先落一摊非空的，再按这一摊的规模写 —— 反过来的那份
+        // "计数 3、实际写 2"会让读侧整个错位，而后半段的校验和看着还是对的。
+        Map<String, ConsumerGroup> groups = new LinkedHashMap<>();
+        for (String groupName : stream.groupNames()) {
+            ConsumerGroup group = stream.getGroup(groupName);
+            if (group != null) {
+                groups.put(groupName, group);
+            }
+        }
+        checksum = updateChecksum(checksum, groups.size());
+        dos.writeInt(groups.size());
+        for (Map.Entry<String, ConsumerGroup> groupEntry : groups.entrySet()) {
+            checksum = writeString(dos, groupEntry.getKey(), checksum);
+            checksum = writeLong(dos, groupEntry.getValue().getLastDeliveredId(), checksum);
+            checksum = writeLong(dos, groupEntry.getValue().getLastDeliveredSeq(), checksum);
+        }
+        return checksum;
+    }
+
+    /**
+     * 读回一条流。装配的顺序与 {@link #writeStream} 逐字对应；表顶要<em>在条目之后</em>再压一次，
+     * 因为 {@code addEntry} 里那道只向前走的 {@code updateCounters} 会把表顶顶到最大那条条目上 ——
+     * 而"表顶停在被 XDEL 掉的那一条"正是这一族唯一不能被条目表推演出的信息。
+     */
+    private LoadedStream readStream(DataInputStream dis, long checksum) throws IOException {
+        Stream stream = new Stream();
+        long topMs = dis.readLong();
+        long topSeq = dis.readLong();
+        checksum = updateChecksum(checksum, topMs);
+        checksum = updateChecksum(checksum, topSeq);
+
+        int entryCount = dis.readInt();
+        checksum = updateChecksum(checksum, entryCount);
+        for (int i = 0; i < entryCount; i++) {
+            String id = readString(dis);
+            checksum = updateChecksum(checksum, id.getBytes(StandardCharsets.UTF_8));
+            int fieldCount = dis.readInt();
+            checksum = updateChecksum(checksum, fieldCount);
+            Map<String, String> fields = new LinkedHashMap<>();
+            for (int f = 0; f < fieldCount; f++) {
+                String name = readString(dis);
+                checksum = updateChecksum(checksum, name.getBytes(StandardCharsets.UTF_8));
+                String value = readString(dis);
+                checksum = updateChecksum(checksum, value.getBytes(StandardCharsets.UTF_8));
+                fields.put(name, value);
+            }
+            stream.addEntry(fields, id);
+        }
+        stream.setLastId(topMs, topSeq);
+
+        int groupCount = dis.readInt();
+        checksum = updateChecksum(checksum, groupCount);
+        for (int g = 0; g < groupCount; g++) {
+            String groupName = readString(dis);
+            checksum = updateChecksum(checksum, groupName.getBytes(StandardCharsets.UTF_8));
+            long positionMs = dis.readLong();
+            long positionSeq = dis.readLong();
+            checksum = updateChecksum(checksum, positionMs);
+            checksum = updateChecksum(checksum, positionSeq);
+            stream.createGroup(groupName, StreamIdFormat.format(positionMs, positionSeq));
+        }
+        return new LoadedStream(stream, checksum);
+    }
+
+    /** 读一条流要同时交回"装配好的那一只"和"这一段吃掉的校验和"，所以要有这么一个小盒子。 */
+    private static final class LoadedStream {
+        final Stream stream;
+        final long checksum;
+
+        LoadedStream(Stream stream, long checksum) {
+            this.stream = stream;
+            this.checksum = checksum;
+        }
     }
 
     /**
