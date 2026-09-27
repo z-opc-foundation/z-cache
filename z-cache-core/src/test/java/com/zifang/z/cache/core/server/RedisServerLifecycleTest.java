@@ -908,6 +908,7 @@ class RedisServerLifecycleTest {
         Map<String, String> wrong = new LinkedHashMap<>();
         String rangeBefore;
         String in3Before;
+        String wideBefore;
         try (Socket socket = connect(p1)) {
             DataInputStream in = new DataInputStream(socket.getInputStream());
             send(socket, "XADD", "s_orders", "1-1", "item", "a", "qty", "2");
@@ -955,6 +956,20 @@ class RedisServerLifecycleTest {
             send(socket, "DEL", "s_gone");
             assertEquals(":1", readReply(in));
 
+            // 表顶那两段是 uint64 的位模式。最高位一置起来，"有符号地渲染"就会写出负号，
+            // 那条 XSETID 到重放时要么被 ID 文法拒掉、要么挪去别处 —— 所以这一族除了"补不补"，
+            // 还要钉"怎么写法"。删掉最大那条，逼着表顶只能由 XSETID 带过去（与 s_orders 同形）。
+            send(socket, "XADD", "s_wide", "9223372036854775808-7", "f", "w7");
+            assertEquals("9223372036854775808-7", readReply(in), "前置条件: uint64 高位的 ID 写得进");
+            send(socket, "XADD", "s_wide", "9223372036854775808-9", "f", "w9");
+            assertEquals("9223372036854775808-9", readReply(in));
+            send(socket, "XDEL", "s_wide", "9223372036854775808-9");
+            assertEquals(":1", readReply(in));
+            send(socket, "XRANGE", "s_wide", "-", "+");
+            wideBefore = readReplyDeep(in);
+            assertTrue(wideBefore.contains("w7") && !wideBefore.contains("w9"),
+                    "前置条件: s_wide 现在只剩 -7 那一条而表顶停在 -9，实际 " + wideBefore);
+
             send(socket, "SELECT", "3");
             assertEquals("+OK", readReply(in));
             send(socket, "XADD", "s_in3", "1-1", "f", "v3");
@@ -981,7 +996,8 @@ class RedisServerLifecycleTest {
             java.util.List<String> selectDbs = new java.util.ArrayList<>();
             int xsetidOrders = 0, pexpireatOrders = 0, groupCreates = 0, emptyTrick = 0, mentionsGone = 0;
             int xsetIdAt = -1, lastOrderXaddAt = -1, lastOrdersRecordAt = -1, pexpireatAt = -1;
-            int firstIn3At = -1, select3At = -1;
+            int firstIn3At = -1, select3At = -1, wideXsetIdAt = -1;
+            String wideXsetIdArg = null;
             for (int i = 0; i < records.size(); i++) {
                 String[] record = records.get(i);
                 String verb = record[0];
@@ -1018,6 +1034,9 @@ class RedisServerLifecycleTest {
                     xsetidOrders++;
                     xsetIdAt = i;
                     lastOrdersRecordAt = i;
+                } else if ("XSETID".equals(verb) && "s_wide".equals(key)) {
+                    wideXsetIdAt = i;
+                    wideXsetIdArg = record.length > 2 ? record[2] : null;
                 } else if ("XGROUP".equals(verb) && record.length == 5 && "CREATE".equals(record[1])
                         && "s_orders".equals(record[2]) && "g1".equals(record[3])) {
                     groupCreates++;
@@ -1032,6 +1051,7 @@ class RedisServerLifecycleTest {
             shape.put("s_events 的空流那一手", String.valueOf(emptyTrick));
             shape.put("XSETID s_orders", xsetidOrders + " 条（位置 " + xsetIdAt + "，最后一条 XADD 在 "
                     + lastOrderXaddAt + "）");
+            shape.put("XSETID s_wide", String.valueOf(wideXsetIdArg) + "（位置 " + wideXsetIdAt + "）");
             shape.put("XGROUP CREATE s_orders g1", String.valueOf(groupCreates));
             shape.put("PEXPIREAT s_orders", pexpireatOrders + " 条（位置 " + pexpireatAt
                     + "，本键最后一条 stream 记录在 " + lastOrdersRecordAt + "）");
@@ -1055,6 +1075,11 @@ class RedisServerLifecycleTest {
                 shapeWrong.put("表顶要补 XSETID", "s_orders 的表顶停在 4-1 而活着的最大学 ID 是 3-9，"
                         + "最后一条 XADD 之后必须无条件补一条 XSETID（aof.c:1212-1217），实际 "
                         + shape.get("XSETID s_orders"));
+            }
+            if (!"9223372036854775808-9".equals(wideXsetIdArg)) {
+                shapeWrong.put("表顶的无符号写法", "s_wide 的表顶是 9223372036854775808-9，那两段按 uint64 的"
+                        + "位模式渲染（上游 streamReplyID 用的就是 %PRIu64）；写成有符号就是负号开头的一串，"
+                        + "重放时 ID 文法不认，实际 " + shape.get("XSETID s_wide"));
             }
             if (groupCreates != 1) {
                 shapeWrong.put("组要重建", "每组一条 XGROUP CREATE key g <读数位置>（aof.c:1227-1233），实际 "
@@ -1143,6 +1168,23 @@ class RedisServerLifecycleTest {
             }
             expectCell(seen, wrong, socket, in, "XADD s_events 6-0（阳性对照）", "6-0",
                     "XADD", "s_events", "6-0", "k", "v2");
+            // 与"表顶活过重写"同形，但这一问要的是<em>写法</em>：结构层那条 XSETID 只要带负号，
+            // 重放就没把表顶推到 -9，于是 -8 塞得进来。
+            send(socket, "XADD", "s_wide", "9223372036854775808-8", "f", "w8");
+            String wideRejected = readReply(in);
+            seen.put("XADD s_wide 高位-8", wideRejected);
+            if (!wideRejected.startsWith("-ERR")) {
+                wrong.put("高位的表顶活过重写", "活着的是 9223372036854775808-7 而表顶该停在 ...08-9，"
+                        + "比它小的 ...08-8 该被单调性闸挡下；实际 " + wideRejected);
+            }
+            send(socket, "XRANGE", "s_wide", "-", "+");
+            String wideStill = readReplyDeep(in);
+            seen.put("XRANGE s_wide（上面那一问的阳性对照）", wideStill);
+            if (!wideBefore.equals(wideStill)) {
+                wrong.put("XRANGE s_wide（上面那一问的阳性对照）", "被拒的那一问不能顺手改掉内容：重写前 "
+                        + wideBefore + " → 重启后 " + wideStill + "（两者不等就说明 s_wide 整个没活过重写，"
+                        + "上面那句『-8 被挡下』就成了空跑）");
+            }
             expectCell(seen, wrong, socket, in, "EXISTS s_gone", ":0", "EXISTS", "s_gone");
             expectCell(seen, wrong, socket, in, "GET s_tail", "t", "GET", "s_tail");
             expectCell(seen, wrong, socket, in, "GET s_after", "v", "GET", "s_after");

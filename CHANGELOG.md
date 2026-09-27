@@ -1833,6 +1833,42 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   `~/.cache/zcache_gauges/logs/full_13g_123455.log`）：core 410 → 411，本格新增 1 个 `@Test`。
 - 250 那一侧仍然没有实测：本轮全部读数单机（判据、牙、基线都在这一台机器上）。
 
+#### 上一格自己的第一号缺陷：表顶是按有符号写的，2^63 以上那一串重放时没人认（13g-2）
+
+- **来账**：`91569e2`（上一格）里那条 `streamId(long ms, long seq)` 写的是 `ms + "-" + seq`。
+  表顶那两段是 **uint64 的位模式**，Java 的 `long` 只是它的容器 —— 最高位置起来时拼接会写出
+  负号开头的一串。上一格的判据全在个位数 ID 上排布（`1-1`…`4-2`），所以这一维整个没量到。
+- **改动前的形状**（工作区只改测试、生产侧就是 `91569e2` 那份字节；日志
+  `logs/wide_prefix_124325.log`）：`Tests run: 1, Failures: 1`，红 3 格 ——
+  `结构层 表顶的无符号写法`（导出的实录是 `XSETID s_wide -9223372036854775808-9`）、
+  `高位的表顶活过重写`（`XADD s_wide 9223372036854775808-8` 竟然**写进去了**）、
+  `XRANGE s_wide（上面那一问的阳性对照）`（那条 -8 真的留在流里）。
+  链路上每一环都成立：那种写法过不了 ID 文法 ⇒ 重放整条拒掉 ⇒ 表顶退回到还活着的 `…-7`
+  ⇒ 单调性闸失去参照。**这一支不会被"少一条记录"型的变异发现，只能被"写法"发现。**
+- **上游权威**：`rioWriteBulkStreamID`（`aof.c:1136-1140`）里那一行
+  `sdscatfmt(sdsempty(),"%U-%U",id->ms,id->seq)`（`:1139`），`%U` 就是无符号那一款；
+  `XADD` 的条目 ID、`XSETID` 的表顶、`XGROUP CREATE` 的位置三只都走这一支函数。
+- **改动**：`streamId(long, long)` 改为委托仓库里已有的唯一文法出口
+  `StreamIdFormat.format`（`z-cache-common`，`:75-77` 用的正是 `Long.toUnsignedString`；
+  命令层 6 处早就走它：`CommandHandler:2499 / :2583 / :2584 / :2818 / :2895 / :3241`）。**修的是写法，没有新增格式**：
+  日志的形状、命令的条数与顺序都不变，所以线格式与 13g 那份一致。
+- **判据**：上一格那条 `aofRewriteCarriesStreamKeysAcrossTheSwap` 加一种形状
+  （`s_wide`：`XADD …-7` → `XADD …-9` → `XDEL …-9`，于是表顶只能由 `XSETID` 带过去，
+  与 `s_orders` 同形但整段跨过 2^63），另加 1 格结构层 + 1 格行为层 + 1 格阳性对照
+  （被拒的那一问不许顺手改掉内容 —— 它同时是"s_wide 真的活过了重写"的证据）。
+- **牙**（同一份量具，`logs/teeth_run3.txt` 是加格子之后的第一跑，`logs/teeth_run4.txt` 是收口跑）：
+  新增 M8（把 `streamId` 换回有符号拼接）→ 恰好红上面那 3 格。三格的预期集是**跑出来的**：
+  run3 报出 M1/M2/M5 各"多"了新的格子，逐个想过因果之后按实测放宽 ——
+  M1（整族消失）16 → 19 格、M2（摘掉 XSETID）2 → 5 格（摘的正是 `s_wide` 也要的那一条）、
+  M5（改用自动 ID）6 → 7 格（只漂"内容逐字对得上"那一格，`s_wide` 的 XSETID 写法没动，
+  所以表顶那两格**保持绿**，这是三格里唯一一支不能顺带放宽预期集的）。
+  `CONTROL → OK`，`SUMMARY mutants=9 bad=0`，八支全部「漏 无；多 无」。
+  **上一格正文里"改前 16 格"与"mutants=8"两句按本段作废**，那是加形状之前的读数。
+- **基线不变 `906`**（`358 + 411 + 135 + 2`，`mvn -o -B clean test` rc=0 / BUILD SUCCESS，日志
+  `~/.cache/zcache_gauges/logs/full_wide_124645.log`）：本格加的是**格子不是 `@Test`**，
+  测试条数不动是分母正常的表现，不是没测。
+- 250 那一侧仍然没有实测：本轮全部读数单机。
+
 ### Added
 - `RedisServer.serverScope()`：只读拿到本台那一份，测试与嵌入式据此判断作用域边界。
 - `StreamIdFormat`（z-cache-common）：stream ID 的唯一文法（uint64 两段、`-` / `+` 两种位置、

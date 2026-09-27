@@ -684,8 +684,15 @@ arg2\r
         return streamId(id[0], id[1]);
     }
 
+    /**
+     * 两段都是 uint64 的<b>位模式</b>，写法必须无符号：上游那一手是
+     * {@code rioWriteBulkStreamID}（{@code aof.c:1136-1140}）里的
+     * {@code sdscatfmt(sdsempty(),"%U-%U",id->ms,id->seq)}，而 {@code %U} 正是无符号那一款。
+     * 有符号渲染会把 2^63 以上的表顶写成负号开头的一串，那种写法过不了 ID 文法，
+     * 重放时被整条拒掉 —— 表顶就悄悄退回到"还活着的那条"，XSETID 白补了。
+     */
     private static String streamId(long ms, long seq) {
-        return ms + "-" + seq;
+        return com.zifang.z.cache.common.protocol.StreamIdFormat.format(ms, seq);
     }
 
     private static List<String> texts(java.util.Collection<byte[]> values) {
