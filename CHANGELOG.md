@@ -1305,9 +1305,11 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
     `RedisServerProtocolSemanticsTest.streamsAreOrdinaryKeysForKeyspaceCommands:4015 INFO 报的键数必须与 DBSIZE 是同一个数（少的那一枚是流键）... expected: <6> but was: <5>`。
     这一支的判据**必须加在网线层**：单测层那三个裸 `new CommandHandler(store)` 用的是进程级 static
     的 stream store 兜底，`MemoryStore.streamKeys(db)` 根本看不见它 —— 钉不到这一层就等于没钉。
-  - N4（`handleKeys` 退回"再原样并四张集合表"）**整套 core 402 例全绿，这是预期而不是漏网**：
-    那四句加回来的键与 `keysDb` 交的今天逐字相同，因为集合键还拿不到时刻行（`expireDb` 那五支
-    只看 `stringStores`）。它是等价变异；翻完 fence 要把这一支重跑一遍，那时它才该红。
+  - N4（`handleKeys` 退回"再原样并四张集合表"）**那一轮整套 core 402 例全绿，当时我把它记成了"预期而不是漏网"**：
+    理由是"集合键还拿不到时刻行（`expireDb` 那五支只看 `stringStores`），加回来的与 `keysDb` 交的逐字相同"。
+    下一格（13b-ii）翻完 fence 按承诺把这一支重跑了一遍，**它红了** —— 那句"等价变异"作废，
+    原因见下一节 N4 那一条：这一支丢的是 glob，而那一刻盘上已经有了还活着的 `e:*` 集合键能让它现形。
+    教训写在这里：一次绿只说明"**这份字节上现有的判据**看不见它"，不说明它不可观测。
 - 顺手验过两件事，都没靠推断：`CommandHandler.globToRegex` 与 `MemoryStore.globToRegex` 把空白和
   变量名抹掉后**逐字符相同**，所以"模式匹配挪进 `keysDb`"没有偷换 glob 语义；
   `handleRandomkey`（`CommandHandler.java:1299-1305`）本来就只问 `keysDb` 一把尺，这一格之后它抽的
@@ -1318,6 +1320,129 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   ④ 服务器侧没有 active expire cycle ⇒ 到点又没人碰的键既不释放内存也不从时刻表里退，
   `liveKeys` 的顺带回收只覆盖"有人来枚举"的情况；⑤ `INFO keyspace` 这一行仍然只有 `keys=`，
   上游是 `keys=,expires=,avg_ttl=`（`server.c:3686`），补它要先定义得清 `avg_ttl` 在我们这里是什么。
+
+#### 五种集合键第一次挂得上过期：EXPIRE 一族去掉类型分支，而"键空了自己掉"必须先接进时刻表
+
+- **现象**（改动前，按网线原文记）：`EXPIRE` / `PEXPIRE` / `EXPIREAT` / `PEXPIREAT` 对
+  hash / list / set / zset / stream 一律回 `:0`，`TTL` / `PTTL` 对它们回 `:-2`（"键不存在"），
+  `PERSIST` 回 `:0` —— 只有 String 挂得上过期。这就是上一格留下的"还没做的 ①②"两栏。
+- **归因**：时刻表上一格刚立起来，本来就按库、按键名存，五种集合键挂不上**不是忘了接线**，而是
+  `expireDb` / `pexpireDb` / `ttlDb` / `pttlDb` / `persistDb` 每一支各自先去问一张只装 String 的表
+  （`stringStores[db].get(key)`），问不出值对象就当场回"键不在"。五支各问各的，所以"谁能挂过期"
+  这件事在命令层有**五把**尺。上游 `expireGenericCommand`（`expire.c:415-451`）通篇没有类型分支，
+  `:426` 那一问只有 `lookupKeyWrite` —— 判"键在不在"与判"是哪一型"是同一把尺，我们这里就是
+  `typeOfDb`，五支现在全部改从它走（收进一个 `armExpiry`）。
+- **接上之前必须先补的一环**：集合键一旦挂得上过期，"值空了所以键不在了"那 **21 处**
+  （`LPOP` 弹出最后一个元素、`SPOP` 掏空、`ZREM` 清完、`LTRIM` 裁空、`HDEL` 删掉最后一个字段……
+  长在四个 store 各自内部，Hash 2 / List 8 / Set 4 / SortedSet 7）就把时刻行留在原地。
+  后果不是"多一行垃圾"：留在原地的是一个**未来**时刻，同名键被重新写入之后直接继承它 ——
+  上游那里 `TTL` 回 -1，这里会回一个看着完全合理的正数，谁也发现不了。上游删键只有一个口
+  （`dbSyncDelete` 先删 `db->expires` 再删 `db->dict`，`db.c:271-281`），所以这里也做成一个口：
+  四个 store 的整键删除收进各自的 `dropKey`，**真摘掉过**才通告，`MemoryStore` 在构造末尾把通告
+  接到 `clearExpireAtDb`。stream 刻意不在这份名单里：`xdelCommand`（`t_stream.c:2413-2436`）
+  掏空一条流并不删键，它的删除只从 `removeAnyType` 那一个口进来。
+- `removed != null` 那一判是必需的，不是防御性写法：`removeAnyType` 会拿每个键名挨个问六张表，
+  无条件通告等于"A 表什么都没摘掉，却把 B 表那一行的过期取消了"（P6 实测把它判成 27 条红）。
+- 顺带两处同源缺陷：① `PERSIST` 不再把值原样 `putDb` 回去 —— 那里面带着 `clearOtherTypes`，
+  于是"取消一枚 String 的过期"会顺手毁掉同名的另一型；网线层碰不到（命令层不允许一个键名同时挂
+  两型），但 `RedisServer.getStore()` 交出去的就是 `MemoryStore`，嵌入式用户摸的正是两张表。
+  ② `MOVE` 原先只有 String 腿带着时刻走，"集合类型没有 TTL 可搬"这句话在接线之前是真的、接线之后
+  就成了漏；现在六型共用一个收尾，且**取时刻排在搬运之前**（上游 `moveCommand` 同序：`db.c:957`
+  取 `getExpire`、`:965` 挂到目标库、`:969` 才 `dbDelete(src)`；这里两步先后与上游相反，因为
+  `dbDelete` 要 decrRefCount 而我们的时刻表按库分栏，可观测结果一致）。
+- 判据为什么写成"一张表一次断言"：JUnit 见到第一条红就抛，同一方法里第 2—N 条判据全被第一条遮住。
+  六枚键各搬一次如果写六条 `assertEquals`，摘掉"搬到目标库之后重新挂上"那一尾巴只红在 string 那一行，
+  另外五格一起丢了没人说 —— 判据当场退化成"只钉住 String"。收进一张 `Map` 整体比对之后，三支互斥
+  变异各自点名漏了哪几型（见下面 Q1 / Q2 / Q3 的三条 `but was`）。
+- 判据与牙（三支量具：`sixttl_teeth.py` 的 P1—P6 打"六型都能挂过期"这一段，`move_teeth.py` 的 Q1—Q4 打
+  搬库那一条腿，`keyspace_teeth.py` 的 N1—N5 打"到点的键由谁收走"那一条；三支各自先在同一份字节上要求
+  基线绿，每支还原后按 md5 对账 `match=True`。**下面每一条红的行号都出自 08:48—08:57 那一轮链**
+  （`~/.cache/zcache_gauges/logs/chain_13bii_0848.out`，19 份日志 08:48:34—08:56:56 各 320—530KB），
+  被量字节 `MemoryStore.java 8121ae2af90bc9796b5966c092e2a0b7`、`CommandHandler.java 96a31e63ef13b0bec1db3d57bb55716d`、
+  `RedisServerProtocolSemanticsTest.java 9626dafbe63ad501a796fdbd7ac5a6c1`、
+  `MemoryStoreTest.java 33dd9b07262122b7a144c911e4fcc4b8`、`ListStore.java fc8d1550cce974db20e08beda2415d43`、
+  `SortedSetStore.java a14a4e6162f58eab04f6931b818e2c5d`）：
+  - P1 `armExpiry` 摘掉"键在不在"那一问 → 6 红，含
+    `streamsAreOrdinaryKeysForKeyspaceCommands:4207 前提：键不在时 EXPIRE 不许顺手造出一枚键 ==> expected: <:0> but was: <:1>`；
+  - P2 整段不接时刻行通告口 → 1 红，正是
+    `:4241->expiryRowDiesWhenTheKeyEmptiesItself:4305 e:list 复活之后不许继承上一枚键的时刻行 —— 上游那里键没了时刻跟着一起没 ==> expected: <:-1> but was: <:100>`；
+  - P3 `ttlDb` 退回只看 `stringStores` → 2 红：`streamsAreOrdinaryKeysForKeyspaceCommands:4212 hash 键在而没挂过期：-1，不是 -2 ==> expected: <:-1> but was: <:-2>`
+    与 `zstoreAndCrossDbMoveFollowTheMeasuredRows:2858 MOVE 之后集合键的 TTL 也要跟着过去: :-2`（那一格摘掉之后 `TTL` 又去问了 string 表）；
+  - P4 `persistDb` 退回只看 `stringStores` → 1 红
+    `:4216 hash 挂上之后 PERSIST 读得到那一行 ==> expected: <:1> but was: <:0>`；
+  - P5 只让 `ListStore` 不通告 → 1 红且**只**红在 `e:list` 那一行（`:4305`），逐 store 的归属对得上；
+  - P6 `dropKey` 不看"真摘掉过"就通告 → **27 红**，所以它不是等价变异：`removeAnyType` 会拿每个键名挨个问
+    每一张表，无条件通告等于"A 表什么都没摘掉，却把 B 表那一行取消了"，`SETRANGE 之后 TTL 要还在`
+    （`:2351`）、`MOVE 之后 TTL 要跟着过去`（`:2833`）、`源键的 TTL 要跟着搬过来`（`:1897`）三条全被它带红；
+  - Q1 摘掉"搬到目标库之后重新挂上"那一尾巴 → 3 红：整表断言交回
+    `{mv:string=-1, mv:hash=-1, mv:list=-1, mv:set=-1, mv:zset=-1, mv:stream=-1}`，六格全丢，
+    网线层 `zstoreAndCrossDbMoveFollowTheMeasuredRows:2833 MOVE 之后 TTL 要跟着过去: :-1`，
+    老那一条 `MemoryStoreTest.moveAndRenameMoveTheRecordInsteadOfLeavingItBehind:350 搬库要带着原来的时刻`；
+  - Q2 把"取时刻"那一步挪到搬运之后 → 2 红，整表交回
+    `{mv:string=1790470672853, mv:hash=-1, mv:list=-1, mv:set=-1, mv:zset=-1, mv:stream=1790470672853}`：
+    丢的正好是那四种"搬的过程中被自己的删除通告回收过"的类型，String 与 stream 反而对得上 ——
+    注释里"取时刻排在搬运之前"那一句的牙就在这里；网线层配套红在
+    `zstoreAndCrossDbMoveFollowTheMeasuredRows:2858 MOVE 之后集合键的 TTL 也要跟着过去: :-1`；
+  - Q3 摘掉源库那一行的收尾 → 3 红：`MemoryStoreTest.everyTypeCarriesItsExpiryRowAcrossDbs:399
+    六枚键全搬空之后，源库时刻表里不许留无主记录: [mv:stream, mv:string]`、
+    `MemoryStoreTest.moveAndRenameMoveTheRecordInsteadOfLeavingItBehind:349 搬完以后源库不许还留着记录`、
+    网线层 `:2887 搬走的流在源库里留下的时刻行不许被同名新键继承 ==> expected: <:-1> but was: <:200>`；
+    它与 Q2 的红集互补（四种集合由通告兜住，剩下两型由 MOVE 自己兜）；
+  - Q4 把 `PERSIST` 退回它本来的样子（摘完时刻再把值 `putDb` 写回一次）→ 1 红
+    `MemoryStoreTest.persistRewritesTheExpiryRowAndNothingElse:421 PERSIST 不许顺手毁掉同名的 hash`。
+- 枚举那三家（`DBSIZE` / `KEYS` / `INFO keyspace`）本来各自有一把尺，13b-i 之后都从 `liveKeys` 走，
+  于是"到点的键由谁收走"这一维必须单独有牙来量（`keyspace_teeth.py`；N1—N4 是上一格那四支的**同一批**，
+  本轮在同一份新字节上重跑，另加 N5。行号与上一节不同是因为网线层那一段判据变长了，两边各自抄的是自己那一轮的日志）：
+  - N1 摘掉 `liveKeys` 里 `typeOfDb` 那道判活 → 4 红，其中**只有一条**钉住"没人碰过它、第一次问它是 KEYS"
+    这一维：`RedisServerProtocolSemanticsTest.streamsAreOrdinaryKeysForKeyspaceCommands:4271
+    到点之后没有一次读发生过：两枚集合键必须由 KEYS 自己收走 ==> expected: <[]> but was: <[px:hash, px:list]>`。
+    同一跑里前面那条 `KEYS tt:*`（`:4255`）**没有红** —— 那两枚在更早的 `EXISTS`/`TYPE` 那一问就被
+    读路径顺手回收了，所以那一问量的其实是读路径；这一段新判据中间一次读都不做，把"枚举自己负责回收"
+    从"读顺手做了"里分了出来，这是它存在的全部理由；
+  - N2 `dbsizeDb` 退回"六张表各自加总" → 3 红，含 `MemoryStoreTest.theThreeEnumerationsAgreeOnEveryShapeOfKeySet:751
+    一枚键名只数一个，不论它落在几张表里 ==> expected: <2> but was: <3>`；
+  - N3 `INFO` 退回"五张表各自 size() 相加" → 1 红：`:4051 INFO 报的键数必须与 DBSIZE 是同一个数（少的那一枚是流键）`；
+  - N4 `handleKeys` 退回"把四张集合表原样并回来" → **红**（`reds=1`：`:4255 … but was: <[tt:string, tt:list, tt:set, tt:stream, e:hash, e:list, e:set, e:zset]>`）。
+    **上一格在这里写的"今天是等价变异、绿着才是对的"是我编的**：这一支丢的是 glob，于是四枚还活着的
+    `e:*` 被无条件并了回来，判据当场抓住。当时它报绿只因为那一份字节里还没有能红给它看的判据，
+    我把"尺看不见"记成了"变异等价"；
+  - N5 换成历史上真长那样的那一支（四张表各自带 glob 再并回来）→ 也红，但红在另一维：
+    `:4042 expected: <[kt:string, kt:hash, kt:list, kt:set, kt:zset, kt:stream]> but was: <[kt:hash, kt:list, kt:set, kt:zset, kt:string, kt:stream]>`
+    —— string 那几枚被排到了四张集合表之后。N4 红不蕴含 N5 红，反之亦然，所以这两维（并回来的是谁 /
+    以什么顺序）各自都要有判据；这一支的红的不是过期，是**枚举顺序**，也照实记在这里。
+
+- 一次**未归因**的红，照实记不写成"已排除"：Q4 那一跑里
+  `RedisServerReferenceParityTest.debugSubcommandGrammarMatchesTheReference:937` 报了
+  `0.3 秒必须真睡够，实测只等了 199ms`。它跟本支变异没有路径关系（PERSIST 不在 DEBUG 那条路上），
+  单独把这一个类复跑 8 遍 8 绿、八份日志 `grep -c 只等了` 全 0；而"睡短了"朝负载噪声的方向也不该出现
+  （客户端拿墙钟量的是下界，机器越忙只会读得更大），所以更像是墙钟被 slew 或回话错位一格，
+  机制没定下来 ⇒ 已登记待办：那一条判据改用 `nanoTime`，好让下一次出现有意义。
+  08:48—08:57 那一轮整链重跑（19 次 mvn，含同样的 Q4 那一跑 `reds=1`）**没有再出现**这一条，
+  所以它仍是"未归因、本轮未复现"，不写成"已排除"。
+  ⚠ 这 8 遍最初报的是"每遍 13 条失败"，那是**我的量具坏了**：命令漏了 `-am`，core 链接到 `~/.m2` 里
+  旧的 z-cache-common，回话长成 `-ERR com/zifang/z/cache/common/protocol/RedisIntegerFormat`。
+- 基线 `897 → 899`（`358 + 404 + 135 + 2`，全量 `mvn -o -B clean test` rc=0 / BUILD SUCCESS，量的就是上面
+  那六个 md5）。新增两支都在 core：`MemoryStoreTest.everyTypeCarriesItsExpiryRowAcrossDbs`、
+  `MemoryStoreTest.persistRewritesTheExpiryRowAndNothingElse`；网线层另加一段（`EXPIRE` 一族对六型各问一次
+  ＋ 四枚"键空了自己掉"的复活判据 ＆ 集合/stream 搬库带时刻 ＆ 一枚"到点之后只被 `KEYS` 问过"的回收判据），
+  没加 `@Test` 方法数不变。
+- 250 那一侧这一格仍然没有实测：它现在拒绝 ssh（`kex_exchange_identification` 直接 reset），
+  `_doc/battery*.txt` 那批原文真值复跑不了，本格的权威只有 5.0.14 源码行号。
+- 还没做的：① 快照 —— 这一格之后缺口从"只有 String 带得进快照"变成"六型都挂得上过期，而四种集合的
+  restore 腿一个字都不读那个参数"（`MemoryStoreAccessor.java:134 / :144 / :151 / :158` 收了 `expireAt`
+  却没用，`:119-131` 那条才是完整的）。**格式不用动，这一句本轮查实了**：写侧四张集合表各自都取
+  `expirationEntries.getOrDefault(key, -1L)`（`RdbPersistence.java:482 / :497 / :512 / :527`）并 `writeLong`
+  进条目，读侧在 `:596` 无条件 `readLong` 再传给五个 `restore*` —— 也就是说**今天 SAVE 已经把集合键的时刻
+  写进了文件，是 RESTORE 把它丢了**；上游同一件事也不分类型（`rdb.c:1188` 每个键 `getExpire` 一次、
+  `:1015-1018` 在类型 opcode 之前写 `RDB_OPCODE_EXPIRETIME_MS`、`:2105` 加载时 `setExpire`、
+  `:2097` 停机期间已过的键直接不 `dbAdd`），所以这是四行代码 + 一轮 SAVE→重启→读回的判据，不是破坏性抬版。
+  ② 服务器侧没有 active expire cycle（不变，本轮 N1 那条红恰好说明"没人问就一直不回收"是真的）；
+  ③ `INFO keyspace` 的行形状（不变）；④ 端口抢占：本轮见到的是**第三种形态**——前两格记的是"探针只 bind
+  IPv4，看不见别人占在 IPv6 `*:25170` 上的 HTTP 应答"，而这次发现的危险是**方向相反**的：那种红如果落在
+  变异那一跑上，会被量具读成"判据抓住了它"（`keyspace_teeth.py` 的 N1 与 `sixttl_teeth.py` 的 P6 只看
+  `rc!=0`/有没有红）。本轮给两支量具加了 `run_guarded`：整跑红全是 RESP 签名→重跑，**混着抢占→直接
+  SystemExit(7) 中止**，宁可停也不把抢占记成正向证据；四条分支（抢占→重跑→绿 / 混着→7 / 连三跑→7 /
+  真红原样交回）都用假 `run_core` 实测过才上岗。`freePort()` 本身仍是待修（已登记）。
 
 ### Added
 - `RedisServer.serverScope()`：只读拿到本台那一份，测试与嵌入式据此判断作用域边界。

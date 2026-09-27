@@ -145,6 +145,32 @@ public class MemoryStore {
             keyTypeMaps[i] = new ConcurrentHashMap<>();
             expirations[i] = new ConcurrentHashMap<>();
         }
+        wireExpiryRecycling();
+    }
+
+    /**
+     * 把四个集合 store 的「整键没了」接到本库的时刻表上：键消失的那一刻，它在时刻表里的那一行
+     * 一起回收。
+     * <p>
+     * 这一接是为「集合键也能挂过期」准备的：上游删键只有一个口（{@code dbSyncDelete} 先删
+     * {@code db->expires} 再删 {@code db->dict}，{@code db.c:271-281}），而我们"键空了所以不在了"
+     * 这个决定长在各自的 store 里（{@code LPOP} 弹出最后一个元素、{@code SPOP} 掏空、
+     * {@code ZREM} 清完、{@code LTRIM} 裁空……共 21 处），它们在构造上就看不见时刻表。
+     * 不接的后果不是"多留一行垃圾"：那行是一个<b>未来</b>的时刻，同名键被重新写入之后会
+     * 直接继承它 —— 上游那里 {@code TTL} 回 -1，这里会回一个看着合理的正数，谁也发现不了。
+     * <p>
+     * stream 不在这份名单里是有意的：上游 {@code xdelCommand}（{@code t_stream.c:2413-2436}）
+     * 掏空一条流并不删键，所以 {@code StreamStore} 没有"自己把键摘掉"的路径，
+     * 它的删除只从 {@link #removeAnyType} 那一个口进来。
+     */
+    private void wireExpiryRecycling() {
+        for (int i = 0; i < dbCount; i++) {
+            final int db = i;
+            hashStores[db].onKeyVanished(key -> clearExpireAtDb(db, key));
+            listStores[db].onKeyVanished(key -> clearExpireAtDb(db, key));
+            setStores[db].onKeyVanished(key -> clearExpireAtDb(db, key));
+            sortedSetStores[db].onKeyVanished(key -> clearExpireAtDb(db, key));
+        }
     }
 
     // ==================== 多 DB 访问 ====================
@@ -281,8 +307,8 @@ public class MemoryStore {
         // 惰性删除：时刻表是"按库、按键名"的一张表，六种类型共用这一把尺去问它 —— 与上游
         // expireIfNeeded 的口径一致（它也不看类型，时刻就挂在 db->expire 里，见 expire.c:415-451
         // 那一问只有 lookupKeyWrite 一道闸、没有类型分支）。
-        // 今天只有 String 键的行进得来这一支（集合键的 TTL 还没接线），所以对五种集合类型仍是
-        // 一次 containsKey 的空问；接线之后不需要再改这里。
+        // 六种类型的 TTL 现在都从 {@link #armExpiry} 那一条腿挂上来（上游 expireGenericCommand
+        // 也没有类型分支），所以这一支对六种类型都是真问、不是 containsKey 的空问。
         if (hasExpirationDb(db, key) && isExpiredDb(db, key)) {
             removeAnyType(db, key);   // 连键连带时刻那一行一起没，不留"只抹时刻、键留着"
             return DataType.NONE;
@@ -626,29 +652,15 @@ public class MemoryStore {
     }
 
     /**
-     * 与 {@link #pexpireDb} 同一条尺，只是量纲是秒：{@code seconds <= 0} 是"立刻过期"，
-     * 实测（battery37 第 28 行）{@code EXPIRE k 0} 回 {@code :1} 而键当场不见 —— 不是回 0，
-     * 也不是把过期时间写成一个非正的时刻（时刻表里 {@code expireAt <= 0} 的口径是"没有过期"，
-     * 写进去等于反过来把它救活）。键不在时回 0 由 {@code delDb} 自己给。
+     * 与 {@link #pexpireDb} 走同一条腿（{@link #armExpiry}），只是量纲是秒：{@code seconds <= 0}
+     * 是"立刻过期"，实测（battery37 第 28 行）{@code EXPIRE k 0} 回 {@code :1} 而键当场不见 ——
+     * 不是回 0，也不是把过期时间写成一个非正的时刻（时刻表里 {@code expireAt <= 0} 的口径是
+     * "没有过期"，写进去等于反过来把它救活）。秒乘一千会不会溢出由命令层挡
+     * （{@code CommandHandler#expireMillisOrOverflow}），"乘得出来但加不上现在"由
+     * {@link #saturatingExpireAt} 贴顶。
      */
     public boolean expireDb(int db, String key, long seconds) {
-        if (seconds <= 0) {
-            return delDb(db, key);
-        }
-        synchronized (stringStores[db]) {
-            ValueWrapper wrapper = stringStores[db].get(key);
-            if (wrapper == null || isExpiredDb(db, key)) {
-                if (wrapper != null) {
-                    stringStores[db].remove(key, wrapper);
-                    keyTypeMaps[db].remove(key);
-                    clearExpireAtDb(db, key);
-                }
-                return false;
-            }
-            setExpireAtDb(db, key, saturatingExpireAt(TimeUnit.SECONDS.toMillis(seconds)));
-            putDb(db, key, new ValueWrapper(wrapper.data));
-            return true;
-        }
+        return armExpiry(db, key, seconds <= 0 ? 0L : TimeUnit.SECONDS.toMillis(seconds));
     }
 
     public boolean pexpire(String key, long milliseconds) {
@@ -656,47 +668,54 @@ public class MemoryStore {
     }
 
     public boolean pexpireDb(int db, String key, long milliseconds) {
-        if (milliseconds <= 0) {
-            return delDb(db, key);
+        return armExpiry(db, key, milliseconds);
+    }
+
+    /**
+     * EXPIRE / PEXPIRE（以及从它们走过去 {@code EXPIREAT} / {@code PEXPIREAT}）的唯一一条腿。
+     * <p>
+     * 判存只问 {@link #typeOfDb} 那一把尺，不再先看 {@code stringStores} 里有没有一枚值对象 ——
+     * 上游 {@code expireGenericCommand}（{@code expire.c:415-451}）没有类型分支，:426 那一问
+     * 只有 {@code lookupKeyWrite}，所以六种类型都能挂上过期。时刻表本来就是按库、按键名的，
+     * 五种集合键挂不上不是"忘了接线"，是那五支各自都先去问了一张只装 String 的表。
+     * <p>
+     * {@code relativeMillis <= 0} 那一支对应上游的 {@code checkAlreadyExpired}：当场删整个键并回
+     * 成功（{@code dbSyncDelete}），而判活那一句先问 {@code typeOfDb} 是因为
+     * {@code lookupKeyWrite} 里的 {@code expireIfNeeded} 已经把到点的键摘走了 —— 那一问回的是
+     * "键不在"，于是回 0。
+     */
+    private boolean armExpiry(int db, String key, long relativeMillis) {
+        if (typeOfDb(db, key) == DataType.NONE) {
+            return false;
         }
-        synchronized (stringStores[db]) {
-            ValueWrapper wrapper = stringStores[db].get(key);
-            if (wrapper == null || isExpiredDb(db, key)) {
-                if (wrapper != null) {
-                    stringStores[db].remove(key, wrapper);
-                    keyTypeMaps[db].remove(key);
-                    clearExpireAtDb(db, key);
-                }
-                return false;
-            }
-            setExpireAtDb(db, key, saturatingExpireAt(milliseconds));
-            putDb(db, key, new ValueWrapper(wrapper.data));
+        if (relativeMillis <= 0) {
+            removeAnyType(db, key);
             return true;
         }
+        setExpireAtDb(db, key, saturatingExpireAt(relativeMillis));
+        return true;
     }
 
     public boolean persist(String key) {
         return persistDb(0, key);
     }
 
+    /**
+     * 取消过期：只动时刻表那一行。
+     * <p>
+     * 以前这里为了清 {@code ValueWrapper} 上的一栏，把值原样 {@code putDb} 回去了一次，
+     * 而 {@code putDb} 里带着 {@code clearOtherTypes} —— 也就是说"取消一枚 String 的过期"
+     * 会顺手毁掉同名的那枚 hash。时刻搬进表之后这一次写值既没必要、也是有害的。
+     */
     public boolean persistDb(int db, String key) {
-        synchronized (stringStores[db]) {
-            ValueWrapper wrapper = stringStores[db].get(key);
-            if (wrapper == null || isExpiredDb(db, key)) {
-                if (wrapper != null) {
-                    stringStores[db].remove(key, wrapper);
-                    keyTypeMaps[db].remove(key);
-                    clearExpireAtDb(db, key);
-                }
-                return false;
-            }
-            if (!hasExpirationDb(db, key)) {
-                return false;
-            }
-            putDb(db, key, new ValueWrapper(wrapper.data));
-            clearExpireAtDb(db, key);
-            return true;
+        if (typeOfDb(db, key) == DataType.NONE) {
+            return false;
         }
+        if (!hasExpirationDb(db, key)) {
+            return false;
+        }
+        clearExpireAtDb(db, key);
+        return true;
     }
 
     public long ttl(String key) {
@@ -704,13 +723,9 @@ public class MemoryStore {
     }
 
     public long ttlDb(int db, String key) {
-        ValueWrapper wrapper = stringStores[db].get(key);
-        if (wrapper == null || isExpiredDb(db, key)) {
-            if (wrapper != null && isExpiredDb(db, key)) {
-                stringStores[db].remove(key);
-                keyTypeMaps[db].remove(key);
-                clearExpireAtDb(db, key);
-            }
+        // -2 与 -1 分别是"键不在"和"键在但没挂过期"：把这一问只交给 typeOfDb 一把尺，
+        // 五种集合键才第一次能回出 -1（改之前它们连 -2 那一步都过不了 stringStores 那道闸）。
+        if (typeOfDb(db, key) == DataType.NONE) {
             return -2;
         }
         if (!hasExpirationDb(db, key)) {
@@ -726,13 +741,7 @@ public class MemoryStore {
     }
 
     public long pttlDb(int db, String key) {
-        ValueWrapper wrapper = stringStores[db].get(key);
-        if (wrapper == null || isExpiredDb(db, key)) {
-            if (wrapper != null) {
-                stringStores[db].remove(key, wrapper);
-                keyTypeMaps[db].remove(key);
-                clearExpireAtDb(db, key);
-            }
+        if (typeOfDb(db, key) == DataType.NONE) {
             return -2;
         }
         if (!hasExpirationDb(db, key)) {
@@ -1046,7 +1055,11 @@ public class MemoryStore {
      *   <li>目标库已经有同名键就整个不做：回 0，两边都保持原值（不是覆盖，也不是报错）；</li>
      *   <li>五种类型都能搬，搬完源库里干干净净（DBSIZE 两侧对账 1 / 7）。</li>
      * </ol>
-     * 集合类型没有 TTL 可搬，沿本实现的同一把尺（见 {@code CommandHandler} 里 EXPIRE 一族的注释）。
+     * 过期时刻对六种类型一起搬：上游 {@code moveCommand}（{@code db.c:919}）按的是键而不是类型 ——
+     * {@code getExpire} 在 :957 取一次，:965 挂到目标库，:969 才 {@code dbDelete} 源库，全程没有
+     * 一个类型分支。判据 1 那一句以前只在 String 上成立，因为集合键根本挂不上过期；五种集合键的
+     * TTL 接进 {@link #armExpiry} 之后，搬库必须带着那一行，否则"搬完就没过期"是一种谁也发现不
+     * 了的静默行为变化。
      *
      * @return 是否真的搬走了
      */
@@ -1058,42 +1071,50 @@ public class MemoryStore {
         if (type == DataType.NONE || typeOfDb(toDb, key) != DataType.NONE) {
             return false;
         }
+        // 时刻先取下来，值搬完之后再挂到目标库。顺序不能反：三个集合腿在搬的过程中会
+        // `xStores[fromDb].del(key)`，那一步的"键没了"通告（见 {@link #wireExpiryRecycling}）
+        // 顺手就把源库这一行回收了 —— 先搬后读就成了"搬过去发现没挂过期"。
+        // 上游同样是"先取后搬"：{@code db.c:957} 的 {@code expire = getExpire(c->db, key)}
+        // 排在 :964 的 {@code dbAdd(dst, …)} 之前。
+        boolean armed = hasExpirationDb(fromDb, key);
+        long expireAt = armed ? expireAtDb(fromDb, key) : -1L;
+        boolean moved;
         switch (type) {
             case STRING: {
                 ValueWrapper wrapper;
                 synchronized (stringStores[fromDb]) {
-                    long expireAt = expireAtDb(fromDb, key);
                     wrapper = stringStores[fromDb].remove(key);
                     keyTypeMaps[fromDb].remove(key);
-                    clearExpireAtDb(fromDb, key);
                     if (wrapper != null) {
                         // 目标库确认没有任何类型挂着这个键名（上面那一道判据），所以直接放，
                         // 不走 putDb —— 那会在两把库锁之间来回，跨库的锁序说不清。
                         stringStores[toDb].put(key, wrapper);
                         keyTypeMaps[toDb].put(key, DataType.STRING);
-                        // 过期时刻跟着键一起搬库（判据见本方法注释第 1 条）。
-                        setExpireAtDb(toDb, key, expireAt);
                     }
                 }
-                return wrapper != null;
+                moved = wrapper != null;
+                break;
             }
             case HASH: {
                 Map<String, byte[]> fields = hashStores[fromDb].hgetall(key);
                 hashStores[fromDb].del(key);
                 hashStores[toDb].hmset(key, fields);
-                return true;
+                moved = true;
+                break;
             }
             case LIST: {
                 List<byte[]> elements = listStores[fromDb].lrange(key, 0, -1);
                 listStores[fromDb].del(key);
                 listStores[toDb].rpush(key, elements.toArray(new byte[0][]));
-                return true;
+                moved = true;
+                break;
             }
             case SET: {
                 List<byte[]> members = setStores[fromDb].smembers(key);
                 setStores[fromDb].del(key);
                 setStores[toDb].sadd(key, members.toArray(new byte[0][]));
-                return true;
+                moved = true;
+                break;
             }
             case ZSET: {
                 // 快照成 member → score，再按分数原样落进目标库。不走 "zrange WITHSCORES 再 parse
@@ -1104,17 +1125,35 @@ public class MemoryStore {
                     sortedSetStores[toDb].zadd(key, entry.getValue(),
                             entry.getKey().getBytes(StandardCharsets.UTF_8));
                 }
-                return true;
+                moved = true;
+                break;
             }
             case STREAM: {
                 // 挪的是 Stream 对象本身（表顶、消费组、PEL 一起走），不是条目快照 ——
-                // 上游 moveKey 换的是 dict 里的 value 指针，没有"照条目重建一遍"这一说。
+                // 上游 moveCommand 换的是 dict 里的 value 指针（{@code db.c:964} 直接把同一个
+                // robj 挂进 dst），没有"照条目重建一遍"这一说。
                 com.zifang.z.cache.core.stream.StreamStore s = streams;
-                return s != null && s.moveTo(fromDb, toDb, key);
+                moved = s != null && s.moveTo(fromDb, toDb, key);
+                break;
             }
             default:
-                return false;
+                moved = false;
         }
+        if (moved) {
+            // 过期时刻跟着键一起搬库，六种类型共用这一个尾巴（判据见本方法注释第 1 条）：
+            // 上游 {@code moveCommand} 是 :965 {@code setExpire(c, dst, …)} 再 :969
+            // {@code dbDelete(src, …)}（源库那一行由 {@code dbDelete → dbSyncDelete} 顺带收走，
+            // 它先删 {@code db->expires} 再删 {@code db->dict}，{@code db.c:271-281}）。
+            // 这里两步的先后正好相反 —— 先从源库摘、再挂到目标库：上游要按那个顺序是因为
+            // {@code dbDelete} 会 decrRefCount，值必须先被目标 dict 持有；我们的时刻表按库分栏，
+            // {@code expirations[fromDb]} 与 {@code expirations[toDb]} 是两张互不相干的表，
+            // 谁先谁后都不会串台，可观测结果一致。
+            clearExpireAtDb(fromDb, key);
+            if (armed) {
+                setExpireAtDb(toDb, key, expireAt);
+            }
+        }
+        return moved;
     }
 
     // ==================== 事务版本号 ====================

@@ -29,6 +29,33 @@ public class ListStore {
     private final ConcurrentHashMap<String, CopyOnWriteArrayList<byte[]>> store = new ConcurrentHashMap<>();
 
     /**
+     * 「这一枚键名下的整个键没了」的通告口，由 {@link MemoryStore} 建库时接上，用来回收它在
+     * 时刻表里的那一行。上游的对应动作是 {@code dbSyncDelete} —— 先删 {@code db->expires}
+     * 再删 {@code db->dict}（{@code db.c:271-281}），因为删键只有一个口，时刻必然跟着键走。
+     * 这里之所以要一个回调而不是直接清表：本类看不见时刻表，那张表按库长在 MemoryStore 里。
+     * 没接上时是一次空操作（独立 {@code new} 出来的 store 仍然能用）。
+     */
+    private java.util.function.Consumer<String> keyVanished;
+
+    /** 接上「键没了」的通告；只由持有方（{@link MemoryStore}）在建库时调用一次。 */
+    public void onKeyVanished(java.util.function.Consumer<String> listener) {
+        this.keyVanished = listener;
+    }
+
+    /**
+     * 整键删除的唯一落点：先摘本表，<b>真摘掉过</b>才通告 —— 所以重复调用不会误报，
+     * 而 {@code del} 一族「摘掉了什么」的返回值一个都没变。
+     */
+    private CopyOnWriteArrayList<byte[]> dropKey(String key) {
+        CopyOnWriteArrayList<byte[]> removed = store.remove(key);
+        if (removed != null && keyVanished != null) {
+            keyVanished.accept(key);
+        }
+        return removed;
+    }
+
+
+    /**
      * 用于 bpop 阻塞通知的等待队列。
      * key: list key, value: 等待通知的 latch 列表
      */
@@ -136,7 +163,7 @@ public class ListStore {
             }
             byte[] value = list.remove(0);
             if (list.isEmpty()) {
-                store.remove(key);
+                dropKey(key);
             }
             return value;
         }
@@ -159,7 +186,7 @@ public class ListStore {
             }
             byte[] value = list.remove(list.size() - 1);
             if (list.isEmpty()) {
-                store.remove(key);
+                dropKey(key);
             }
             return value;
         }
@@ -184,7 +211,7 @@ public class ListStore {
             }
             byte[] value = srcList.remove(srcList.size() - 1);
             if (srcList.isEmpty()) {
-                store.remove(source);
+                dropKey(source);
             }
             CopyOnWriteArrayList<byte[]> destList = store.computeIfAbsent(dest, k -> new CopyOnWriteArrayList<>());
             destList.add(0, value == null ? null : value.clone());
@@ -214,7 +241,7 @@ public class ListStore {
             boolean srcFromLeft = "LEFT".equalsIgnoreCase(srcDir);
             byte[] value = srcFromLeft ? srcList.remove(0) : srcList.remove(srcList.size() - 1);
             if (srcList.isEmpty()) {
-                store.remove(source);
+                dropKey(source);
             }
             CopyOnWriteArrayList<byte[]> destList = store.computeIfAbsent(dest, k -> new CopyOnWriteArrayList<>());
             boolean destToLeft = "LEFT".equalsIgnoreCase(destDir);
@@ -335,7 +362,7 @@ public class ListStore {
                 }
             }
             if (list.isEmpty()) {
-                store.remove(key);
+                dropKey(key);
             }
             return removed[0];
         }
@@ -363,7 +390,7 @@ public class ListStore {
             if (resolvedStart < 0) resolvedStart = 0;
             if (resolvedStop >= size) resolvedStop = size - 1;
             if (resolvedStart > resolvedStop || resolvedStart >= size) {
-                store.remove(key);
+                dropKey(key);
                 return;
             }
             List<byte[]> trimmed = new ArrayList<>();
@@ -516,7 +543,7 @@ public class ListStore {
                 if (list != null && !list.isEmpty()) {
                     byte[] value = fromLeft ? list.remove(0) : list.remove(list.size() - 1);
                     if (list.isEmpty()) {
-                        store.remove(key);
+                        dropKey(key);
                     }
                     List<byte[]> result = new ArrayList<>(2);
                     result.add(key.getBytes(StandardCharsets.UTF_8));
@@ -582,7 +609,7 @@ public class ListStore {
         if (key == null) {
             return false;
         }
-        CopyOnWriteArrayList<byte[]> removed = store.remove(key);
+        CopyOnWriteArrayList<byte[]> removed = dropKey(key);
         if (removed != null) {
             // 唤醒所有在此 key 上等待的线程
             notifyWaiters(key);

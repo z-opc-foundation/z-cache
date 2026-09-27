@@ -360,6 +360,70 @@ class MemoryStoreTest {
     }
 
     /**
+     * 六种类型各带一枚过期搬一次库，<b>六格收进一张表、一次断言报全</b>。
+     * <p>
+     * 为什么不写成六条 {@code assertEquals}：断言见到第一条就抛，"只有 String 带着时刻走"这种
+     * 缺陷在六连发里只露得出第一张脸 —— 实测把"搬到目标库之后重新挂上"那一尾巴摘掉，红的确实
+     * 只有 string 那一行，另外五格一起丢了也没人说（整段搬库的判据当场退化成"钉住 String"）。
+     * 整表比对能把"丢了哪几格"直接写进消息里。
+     */
+    @Test
+    void everyTypeCarriesItsExpiryRowAcrossDbs() {
+        com.zifang.z.cache.core.stream.StreamStore streams =
+                new com.zifang.z.cache.core.stream.StreamStore(16);
+        store.bindStreams(streams);
+        byte[] v = "v".getBytes(StandardCharsets.UTF_8);
+        java.util.Map<String, String> oneField = new java.util.HashMap<>();
+        oneField.put("f", "v");
+
+        store.set("mv:string", v);
+        store.getHashStore(0).hset("mv:hash", "f", v);
+        store.getListStore(0).rpush("mv:list", v);
+        store.getSetStore(0).sadd("mv:set", v);
+        store.getSortedSetStore(0).zadd("mv:zset", 1.0, v);
+        assertEquals("1-1", streams.xadd(0, "mv:stream", oneField, "1-1", -1));
+
+        String[] keys = {"mv:string", "mv:hash", "mv:list", "mv:set", "mv:zset", "mv:stream"};
+        java.util.Map<String, Long> before = new java.util.LinkedHashMap<>();
+        for (String key : keys) {
+            assertTrue(store.expireDb(0, key, 100), key + " 要先挂得上过期");
+            before.put(key, store.expireAtDb(0, key));
+            assertTrue(store.moveKeyToDb(0, 7, key), key + " 要能整键搬走");
+        }
+        java.util.Map<String, Long> after = new java.util.LinkedHashMap<>();
+        for (String key : keys) {
+            assertEquals(MemoryStore.DataType.NONE, store.typeOfDb(0, key), key + " 在源库里不再留壳");
+            after.put(key, store.expireAtDb(7, key));
+        }
+        assertEquals(before, after, "搬库前后逐格相同（-1 = 那一格到了目标库就没过期了）");
+        assertTrue(store.expirationSnapshot(0).isEmpty(),
+                "六枚键全搬空之后，源库时刻表里不许留无主记录: " + store.expirationSnapshot(0).keySet());
+        assertRecordsHaveHost(store, 7, "六型搬进 db7");
+    }
+
+    /**
+     * PERSIST 只许动时刻表那一行，不许顺手写回值。
+     * <p>
+     * 它以前为了清 {@code ValueWrapper} 上的一栏，会把值原样 {@code putDb} 回去一次，而
+     * {@code putDb} 里带着 {@code clearOtherTypes}（见本类 {@code putDb} 那一段）—— 于是
+     * "取消一枚 String 的过期"会连带毁掉同名那枚 hash。网线层碰不到这一格（命令层不允许一个
+     * 键名同时挂两型），但 {@code RedisServer.getStore()} 交出去的就是本类，嵌入式用户摸的
+     * 正是两张表，所以判据落在这一层，而不是"因为网线到不了就当它不存在"。
+     */
+    @Test
+    void persistRewritesTheExpiryRowAndNothingElse() {
+        byte[] v = "v".getBytes(StandardCharsets.UTF_8);
+        store.getHashStore(0).hset("ps:both", "f", v);
+        store.getStringStore(0).put("ps:both", new MemoryStore.ValueWrapper(v));
+        assertTrue(store.expire("ps:both", 100), "前置: String 那一半挂得上过期");
+        assertTrue(store.persist("ps:both"));
+        assertEquals(-1, store.expireAtDb(0, "ps:both"), "PERSIST 回 true 就得真的摘掉");
+        assertTrue(store.getHashStore(0).exists("ps:both"),
+                "PERSIST 不许顺手毁掉同名的 hash —— 它改的只是时刻表那一行");
+        assertArrayEquals(v, store.getHashStore(0).hget("ps:both", "f"), "字段也得原样还在");
+    }
+
+    /**
      * 淘汰掉一个带过期的键时，那行记录必须跟着走。
      * <p>
      * 挑谁当受害者是随机的（{@code evictOne} 抽样比 LRU），所以这一支不指望某一枚特定的键

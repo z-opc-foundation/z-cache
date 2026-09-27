@@ -37,6 +37,33 @@ public class SortedSetStore {
      */
     private final ConcurrentHashMap<String, SortedSetData> store = new ConcurrentHashMap<>();
 
+    /**
+     * 「这一枚键名下的整个键没了」的通告口，由 {@link MemoryStore} 建库时接上，用来回收它在
+     * 时刻表里的那一行。上游的对应动作是 {@code dbSyncDelete} —— 先删 {@code db->expires}
+     * 再删 {@code db->dict}（{@code db.c:271-281}），因为删键只有一个口，时刻必然跟着键走。
+     * 这里之所以要一个回调而不是直接清表：本类看不见时刻表，那张表按库长在 MemoryStore 里。
+     * 没接上时是一次空操作（独立 {@code new} 出来的 store 仍然能用）。
+     */
+    private java.util.function.Consumer<String> keyVanished;
+
+    /** 接上「键没了」的通告；只由持有方（{@link MemoryStore}）在建库时调用一次。 */
+    public void onKeyVanished(java.util.function.Consumer<String> listener) {
+        this.keyVanished = listener;
+    }
+
+    /**
+     * 整键删除的唯一落点：先摘本表，<b>真摘掉过</b>才通告 —— 所以重复调用不会误报，
+     * 而 {@code del} 一族「摘掉了什么」的返回值一个都没变。
+     */
+    private SortedSetData dropKey(String key) {
+        SortedSetData removed = store.remove(key);
+        if (removed != null && keyVanished != null) {
+            keyVanished.accept(key);
+        }
+        return removed;
+    }
+
+
     // ==================== Internal Data Structure ====================
 
     /**
@@ -267,7 +294,7 @@ public class SortedSetStore {
                 }
             }
             if (data.memberScores.isEmpty()) {
-                store.remove(key);
+                dropKey(key);
             }
             return count;
         }
@@ -771,7 +798,7 @@ public class SortedSetStore {
                 }
             }
             if (data.memberScores.isEmpty()) {
-                store.remove(key);
+                dropKey(key);
             }
             return count;
         }
@@ -805,7 +832,7 @@ public class SortedSetStore {
                 }
             }
             if (data.memberScores.isEmpty()) {
-                store.remove(key);
+                dropKey(key);
             }
             return count;
         }
@@ -837,7 +864,7 @@ public class SortedSetStore {
                 }
             }
             if (data.memberScores.isEmpty()) {
-                store.remove(key);
+                dropKey(key);
             }
             return count;
         }
@@ -965,7 +992,7 @@ public class SortedSetStore {
                 if (data == null) {
                     if (isIntersect) {
                         // 交集中如果有一个 key 不存在，结果为空
-                        store.remove(dest);
+                        dropKey(dest);
                         return 0;
                     }
                     continue;
@@ -1014,7 +1041,7 @@ public class SortedSetStore {
             }
 
             if (destData.memberScores.isEmpty()) {
-                store.remove(dest);
+                dropKey(dest);
                 return 0;
             }
             store.put(dest, destData);
@@ -1066,7 +1093,7 @@ public class SortedSetStore {
         if (key == null) {
             return false;
         }
-        return store.remove(key) != null;
+        return dropKey(key) != null;
     }
 
     /**

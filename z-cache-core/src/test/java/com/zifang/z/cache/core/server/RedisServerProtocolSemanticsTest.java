@@ -2836,19 +2836,55 @@ class RedisServerProtocolSemanticsTest {
             assertEquals("+string", readReply(in));
             send(socket, "SELECT", "0");
             assertEquals("+OK", readReply(in));
-            // 集合类型也能整键搬走（实测 hash/list/zset 三种都回 1）
+            // 集合类型也能整键搬走（实测 hash/list/zset 三种都回 1），而且<b>时刻行跟着键走</b>：
+            // 上游 moveCommand（db.c:919）没有类型分支 —— :957 取 expire、:965 挂到目标库、
+            // :969 才从源库 dbDelete（那一手顺带收走源库的时刻行）。
             send(socket, "HSET", "mv:h", "f", "v");
             assertEquals(":1", readReply(in));
+            send(socket, "EXPIRE", "mv:h", "200");
+            assertEquals(":1", readReply(in), "前置: hash 键上得了时刻行");
             send(socket, "MOVE", "mv:h", "5");
             assertEquals(":1", readReply(in));
             send(socket, "EXISTS", "mv:h");
             assertEquals(":0", readReply(in), "搬走的键在源库里不再留壳");
+            send(socket, "TTL", "mv:h");
+            assertEquals(":-2", readReply(in), "源库里键都走了，不许留一行没人认领的过期时刻");
             send(socket, "SELECT", "5");
             assertEquals("+OK", readReply(in));
             send(socket, "HGET", "mv:h", "f");
             assertEquals("v", readReply(in));
+            send(socket, "TTL", "mv:h");
+            String movedHashTtl = readReply(in);
+            assertTrue(movedHashTtl.startsWith(":") && Long.parseLong(movedHashTtl.substring(1)) > 150,
+                    "MOVE 之后集合键的 TTL 也要跟着过去: " + movedHashTtl);
             send(socket, "DBSIZE");
             assertEquals(":1", readReply(in), "库 5 里只有搬来的这一枚");
+
+            // 第六种类型单独走一趟，顺带钉住"源库那一行不许留在原地没人认领"：stream 刻意不在
+            // {@code wireExpiryRecycling} 的名单里（上游 xdelCommand 不删空流），所以搬走一枚流键时，
+            // 源库的时刻行只能由 MOVE 自己收尾 —— 上一段那次 SELECT 0 之后同名重写，读回的必须是 -1。
+            send(socket, "SELECT", "0");
+            assertEquals("+OK", readReply(in));
+            send(socket, "XADD", "mv:s", "1-1", "f", "v");
+            assertEquals("1-1", readReply(in));
+            send(socket, "EXPIRE", "mv:s", "200");
+            assertEquals(":1", readReply(in), "前置: 流键上得了时刻行");
+            send(socket, "MOVE", "mv:s", "4");
+            assertEquals(":1", readReply(in), "流键整键搬走，表顶跟着走");
+            send(socket, "SELECT", "4");
+            assertEquals("+OK", readReply(in));
+            send(socket, "XRANGE", "mv:s", "-", "+");
+            assertEquals("[[1-1, [f, v]]]", readReplyDeep(in), "搬过去的还是原来那一条条目");
+            send(socket, "TTL", "mv:s");
+            String movedStreamTtl = readReply(in);
+            assertTrue(movedStreamTtl.startsWith(":") && Long.parseLong(movedStreamTtl.substring(1)) > 150,
+                    "MOVE 之后流键的 TTL 也要跟着过去: " + movedStreamTtl);
+            send(socket, "SELECT", "0");
+            assertEquals("+OK", readReply(in));
+            send(socket, "XADD", "mv:s", "1-1", "f", "again");
+            assertEquals("1-1", readReply(in));
+            send(socket, "TTL", "mv:s");
+            assertEquals(":-1", readReply(in), "搬走的流在源库里留下的时刻行不许被同名新键继承");
         } finally {
             server.stop();
             thread.join(DEADLINE_MS);
@@ -4146,26 +4182,128 @@ class RedisServerProtocolSemanticsTest {
             send(socket, "XADD", "ks:mv", "1-1", "a", "1");
             assertEquals("1-1", readReply(in), "battery68 第 56 行：改之前这里吃 ID 太小，9-9 那个表顶没人清");
 
-            // ---- 已知边界，钉现状而不是钉成合格：TTL 一族还不会问第六张表 ----
-            // expire.c:426 那一问只有 lookupKeyWrite、没有类型分支，所以上游 EXPIRE 在流键上
-            // 回 1 并真的挂上过期；我们回 0。同一句在 list 键上也回 0（下面两行是对照），
-            // 所以这是五种集合键共同的 TTL 缺口，不是这一格新开的洞，也不在这一格里修。
-            send(socket, "TTL", "ks:mv");
-            assertEquals(":-2", readReply(in), "这一问上游也是 -2：没有过期时间");
-            send(socket, "EXPIRE", "ks:mv", "100");
-            assertEquals(":0", readReply(in), "已知不一致：上游回 :1");
-            send(socket, "PERSIST", "ks:mv");
-            assertEquals(":0", readReply(in));
-            send(socket, "RPUSH", "ks:list", "x");
+            // ---- 六种类型都能挂上过期，而且挂上之后真的会到点 ----
+            // 这一串以前是**钉现状的 fence**：EXPIRE 在流键和 list 键上都回 :0，注释写着
+            // "五种集合键共同的 TTL 缺口，不在这一格里修"。上游 expireGenericCommand
+            // （expire.c:415-451）没有类型分支、:426 只问 lookupKeyWrite，回的是 :1 ——
+            // 五支 TTL 方法改成只问 typeOfDb 一把尺之后，这里翻成钉合格，六种类型各钉一问。
+            send(socket, "SET", "tt:string", "v");
+            assertEquals("+OK", readReply(in));
+            send(socket, "HSET", "tt:hash", "f", "v");
             assertEquals(":1", readReply(in));
-            send(socket, "EXPIRE", "ks:list", "100");
-            assertEquals(":0", readReply(in), "对照：同一格缺口在 list 键上，与 stream 无关");
+            send(socket, "RPUSH", "tt:list", "x");
+            assertEquals(":1", readReply(in));
+            send(socket, "SADD", "tt:set", "x");
+            assertEquals(":1", readReply(in));
+            send(socket, "ZADD", "tt:zset", "1", "x");
+            assertEquals(":1", readReply(in));
+            send(socket, "XADD", "tt:stream", "1-1", "a", "1");
+            assertEquals("1-1", readReply(in));
+
+            // 两条前提，缺任何一条下面那一串 -1 都是空跑
+            send(socket, "TTL", "tt:nosuch");
+            assertEquals(":-2", readReply(in), "前提：键真的不在才是 -2");
+            send(socket, "EXPIRE", "tt:nosuch", "100");
+            assertEquals(":0", readReply(in), "前提：键不在时 EXPIRE 不许顺手造出一枚键");
+
+            for (String typeName : new String[]{"string", "hash", "list", "set", "zset", "stream"}) {
+                String k = "tt:" + typeName;
+                send(socket, "TTL", k);
+                assertEquals(":-1", readReply(in), typeName + " 键在而没挂过期：-1，不是 -2");
+                send(socket, "EXPIRE", k, "100");
+                assertEquals(":1", readReply(in), typeName + " 键也要挂得上过期");
+                send(socket, "PERSIST", k);
+                assertEquals(":1", readReply(in), typeName + " 挂上之后 PERSIST 读得到那一行");
+                send(socket, "TTL", k);
+                assertEquals(":-1", readReply(in), typeName + " 取消之后回到 -1，而不是 -2（键还在）");
+                send(socket, "PERSIST", k);
+                assertEquals(":0", readReply(in), typeName + " 没有可取消的过期时回 0");
+                send(socket, "EXISTS", k);
+                assertEquals(":1", readReply(in), typeName + " 回 0 的那一句不许顺手把键删了");
+            }
+
+            // 挂上之后真的会到点：上一格修好的"类型无关的惰性删除"到这里才第一次能拿集合键量到
+            send(socket, "PEXPIRE", "tt:zset", "1");
+            assertEquals(":1", readReply(in));
+            send(socket, "EXPIREAT", "tt:hash", "1");
+            assertEquals(":1", readReply(in), "一个过去的绝对时刻：当场删、回 1（上游 checkAlreadyExpired 那一支）");
+            Thread.sleep(30);
+            send(socket, "EXISTS", "tt:zset");
+            assertEquals(":0", readReply(in), "到点的 zset 键不在");
+            send(socket, "TYPE", "tt:hash");
+            assertEquals("+none", readReply(in), "到点的 hash 键也不在");
+
+            // ---- 键是"自己掏空"没的，时刻行也必须跟着没 ----
+            // 上游删键只有一个口（dbSyncDelete 先删 db->expires 再删 db->dict，db.c:271-281），
+            // 而我们"最后一个元素走了所以键不在了"这个决定长在四个 store 里（LPOP / HDEL /
+            // SPOP / ZREM 那 21 处 store.remove），它们看不见时刻表 —— 接上通告口就是这一段在量的。
+            // 留一行的后果不是"多一条垃圾"：那行是个未来的时刻，同名键复活会直接继承它。
+            expiryRowDiesWhenTheKeyEmptiesItself(in, socket,
+                    new String[]{"RPUSH", "e:list", "x"}, new String[]{"LPOP", "e:list"}, "x");
+            expiryRowDiesWhenTheKeyEmptiesItself(in, socket,
+                    new String[]{"HSET", "e:hash", "f", "v"}, new String[]{"HDEL", "e:hash", "f"}, ":1");
+            expiryRowDiesWhenTheKeyEmptiesItself(in, socket,
+                    new String[]{"SADD", "e:set", "x"}, new String[]{"SREM", "e:set", "x"}, ":1");
+            expiryRowDiesWhenTheKeyEmptiesItself(in, socket,
+                    new String[]{"ZADD", "e:zset", "1", "x"}, new String[]{"ZREM", "e:zset", "x"}, ":1");
+
+            // 与 DBSIZE / KEYS 同一把尺对账：ks:mv 一枚 + 六种里活着的四枚（tt:hash、tt:zset 已到点）
+            // + 复活的 e:* 四枚
             send(socket, "DBSIZE");
-            assertEquals(":2", readReply(in), "EXPIRE 回 0 之后两枚键都还在：没有半途挂上过期又答复失败");
+            assertEquals(":9", readReply(in));
+            send(socket, "KEYS", "tt:*");
+            assertEquals("[tt:string, tt:list, tt:set, tt:stream]", readReplyDeep(in),
+                    "到点那两枚（tt:hash、tt:zset 的第一枚）不许还留在 KEYS 里");
+
+            // 上面那几问（EXISTS / TYPE / TTL）都会顺手把到点的键摘掉，所以那两枚"不在"其实是被
+            // 读路径回收的。这一段换一条没人碰过的路：挂上过期后让时钟走完，中间不做任何一次读，
+            // 第一次问它的人就是 KEYS —— 只有枚举自己负责回收，才算量到了 liveKeys。
+            send(socket, "HSET", "px:hash", "f", "1");
+            assertEquals(":1", readReply(in));
+            send(socket, "LPUSH", "px:list", "x");
+            assertEquals(":1", readReply(in));
+            send(socket, "EXPIRE", "px:hash", "1");
+            assertEquals(":1", readReply(in));
+            send(socket, "EXPIRE", "px:list", "1");
+            assertEquals(":1", readReply(in));
+            Thread.sleep(1200);
+            send(socket, "KEYS", "px:*");
+            assertEquals("[]", readReplyDeep(in),
+                    "到点之后没有一次读发生过：两枚集合键必须由 KEYS 自己收走");
         } finally {
             server.stop();
             thread.join(DEADLINE_MS);
         }
+    }
+
+    /**
+     * 一枚集合键"把自己掏空"的那一趟，四种类型共用：写入唯一一个成员 → 挂上过期 → 摘掉那一个成员
+     * （这一步是各 store 内部的 {@code store.remove(key)}，不经过 {@code MemoryStore} 的删键口）
+     * → 确认键已经不算存在 → 同名再写一次 → TTL 必须回到 -1。
+     *
+     * <p>三条前置各自带断言：挂不上过期（回 0）、那一个成员没被真摘掉、空键还 {@code EXISTS} 的话，
+     * 最后那句 -1 就是空跑而不是判据。
+     *
+     * @param add          写入那一个成员的整条命令（含键名）
+     * @param removeLast   摘掉那一个成员的整条命令（含键名）
+     * @param removedReply 摘掉那一句该有的原文：{@code LPOP} 回的是值本身，其余回 {@code :1}
+     */
+    private static void expiryRowDiesWhenTheKeyEmptiesItself(DataInputStream in, Socket socket,
+            String[] add, String[] removeLast, String removedReply) throws IOException {
+        String key = add[1];
+        send(socket, add);
+        assertEquals(":1", readReply(in), key + " 的前置：那一个成员写进去了");
+        send(socket, "EXPIRE", key, "100");
+        assertEquals(":1", readReply(in), key + " 的前置：掏空之前先挂得上过期，否则下面全是空跑");
+        send(socket, removeLast);
+        assertEquals(removedReply, readReply(in), key + " 的前置：那一个成员真的被摘掉了");
+        send(socket, "EXISTS", key);
+        assertEquals(":0", readReply(in), key + " 空值键已经不算存在");
+        send(socket, add);
+        assertEquals(":1", readReply(in), key + " 同名重新写入");
+        send(socket, "TTL", key);
+        assertEquals(":-1", readReply(in),
+                key + " 复活之后不许继承上一枚键的时刻行 —— 上游那里键没了时刻跟着一起没");
     }
 
     /** 只解析测试用到的一层 RESP 形状：+/-/: 单行，$ bulk 按声明长度读满。 */
