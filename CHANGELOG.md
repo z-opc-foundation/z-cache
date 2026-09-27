@@ -2228,6 +2228,88 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   同一条管道的阳性对照 `grep -rn 'case "BGREWRITEAOF"'` 命中一处
   `CommandHandler.java:432`）。
 
+#### 那一拍的第五个条件：后台快照在跑就不许换日志（13l）
+
+- **来账**：13k 结尾"下一格 ①"点名的就是这一条 —— 那一拍五个条件只落了四个，缺的是
+  `server.c:1303` 的 `rdb_child_pid == -1`。当时没补的理由也写在 13k 差别 ③ 里：
+  要先给 `RdbPersistence.bgSaving` 露一个读口，耦合方向得先定。
+- **上游**（本轮在 `~/.cache/zcache_gauges/full5x/redis-5.0.14/src/server.c` 现读 1299—1318 行）：
+  `:1302` `aof_state == AOF_ON`、**`:1303` `server.rdb_child_pid == -1`**、`:1304`
+  `server.aof_child_pid == -1`、`:1305` `aof_rewrite_perc` 非零、`:1306` 严格大于地板。
+  两条 `child_pid` 是**两个**条件，不是一个：13k 落的只是 `:1304`（本版的 `rewriting` 标志）。
+- **做了什么**（四份文件，命令层照旧一个字没动）：
+  ① `RdbPersistence.isBackgroundSaving()` —— `bgSaving` 那一个计数（`:171`）此前只有 BGSAVE
+  自己用来拒并发，**类外零读口**；`saveAsync()`（`:351`）确实把活交给单线程调度器，
+  所以"有后台保存在跑"不是恒假，这一项因此在结构上真能拦住什么；
+  ② `AofPersistence` 多一条 `volatile BooleanSupplier rdbBusy`，默认 `() -> false`，配
+  `setRdbBusy` / `getRdbBusy`；
+  ③ `shouldAutoRewrite` 多一个形参 `rdbSaving`，条件里落 `:1303` 那一项；
+  ④ `checkAutoRewrite()` 真的去问 `rdbBusy.getAsBoolean()`；
+  ⑤ `RedisServer.initPersistence()` 接线 `aofPersistence.setRdbBusy(rdbPersistence::isBackgroundSaving)`，
+  且**必须早于 `aofPersistence.start(...)`** —— 那一拍是在 `start()` 里挂上的。
+  默认那一支恒 `false` 在这里的含义是<em>没人接线</em>，不是"问过了、当前空闲"，
+  而这两种坏法在盘面上长得一模一样 ⇒ 所以下面除了行为尺还有一层结构守卫。
+- **判据：38 格 → 49 格，五张表**（现读每支 @Test 里的 `expectCell` / `wrong.put` 计数：
+  表 19、实例 10、定时器 11、挡住／放开 3、接线守卫 6）：
+  表里新增的是那一对反向邻居 `后台快照在跑 ⇒ 这一拍不许换日志` / `后台快照空了 ⇒ 同一组数照样换`
+  （17 → 19）；新支 `RedisServerLifecycleTest#backgroundSaveBlocksTheRewriteTick` 真起一台、
+  注入恒真，等的是**盘上 `SET` 记录数**（13j 立的那条：等待信号不许是被审的字段），
+  窗口由同一台前一臂实测的毫秒数推出来（下限 6 拍），反证那一格是
+  `放开挡 ⇒ 同一台马上又换得动（上一臂不是量具瞎）`；
+  新支 `#theRewriteTickAsksTheRealBackgroundSaveCounter` 读的是**三份 `src/main` 的字节**，
+  钉五件事（接了、接的是真计数、时机在挂那一拍之前、那一拍真的去问、那一项在 `if` 的括号里），
+  阳性对照用一条本来就在的接线（`setStoreAccessor(accessor)`）加一条没有一支变异会碰的条件项（`minSize`）。
+- **为什么行为尺不够 —— 这一条是量出来的，不是论证出来的**：m3 那一轮里，
+  T14（把那根接线整行删掉）、T15（把读口写成 `return false`）、T16（把接线挪到 `start()` 之后）
+  三支在 `backgroundSaveBlocksTheRewriteTick` 那一臂**一格都不红**（那一臂注入的是假读数，
+  它看不见生产接的是谁），红的只有结构守卫那几格：T14 两格、T15 一格、T16 一格。
+  反过来 T12（摘掉条件里那一项）同时红三格（表、行为、结构各一），T13（那一拍不去问读口）红两格。
+- **有牙量具扩到 16 支**：`~/.cache/zcache_gauges/auto_rewrite_mut/teeth.py` 的 TRACKED 从 3 份文件
+  扩到 5 份（新增 `RedisServer.java`、`RdbPersistence.java` —— 结构守卫读它们的字节，
+  量具在飞时这两份也不许编辑），`METHOD` 扩到三支 lifecycle @Test，控制组分母 3 → 5。
+  `logs/m3_teeth.txt` = `CONTROL 未变异: Tests run 5 Failures 0 Errors 0 -> OK` +
+  `SUMMARY mutants=16 bad=0 control=OK`，逐支判红 T1 3 / T2 1 / T3 3 / T4 12 / T5 1 / T6 1 /
+  T7 6 / T8 1 / T9 2 / T10 4 / T11 2 / T12 3 / T13 2 / T14 2 / T15 1 / T16 1。
+  预期红集全部由 `backfill.py` 从测量轮 `logs/m1_teeth.txt` 机械回填，回填后再机械对账
+  （`RECON mutants=16 对账不一致=0`）。**新判据把旧那 11 支的波及面也加宽了**：
+  T4 从 10 格变 12 格、T7 从 4 格变 6 格，都是实测 —— 所以 13k 那 11 组的旧预期这一轮整体作废重写，
+  不能顺延。量具自己这一轮新增两把小牙：`TEETH_PREFLIGHT=1`（不跑 maven 的秒级预检：锚点在盘上必须
+  恰好一次、预期格名必须出自两份判据源码；它当场逮到我四处只改了一半的锚点），以及 `flaky_probe.py`
+  （专门量"会跳的读数"的红率）。
+- **一条会跳的读数，和它背后那个真缺陷（13m）**：验收轮 m2 里 T1 少红一格 ——
+  `那八笔确实落到了盘上（长度比换完那一刻大）` 在 m1 红、在 m2 绿。**没有去改判据**，
+  先去量率（`TEETH_PASS=probe python3 flaky_probe.py 8`，日志 `logs/probe_flaky.txt`）：
+  未变异的真代码连跑八遍 8/8 全绿（五张表一格都不红），T1 下这一格红 **4/8**、同臂其余三格 8/8 红。
+  所以跳的不是判据，是那一臂的读数；而它红的时候说的是一个具体的坏：**换手之后文件比换手那一刻还小**，
+  也就是窗口里已经返回成功的追加被一份旧快照整份盖掉。机制是<em>待证假设</em>（13m 要用判定性的
+  量具去证或去否，不许照抄本节）：`rewriteInternal` 里 `exportMinimalCommandSet(accessor)` 在
+  `synchronized (this)` **之外**取快照，随后才进锁写临时文件并 `renameTo` 换掉那一份；
+  追加那一路持的是同一把对象锁，于是落在"快照已取、锁还没抢到"里的写会当场成功、随后被盖掉。
+  现读旁证：`appendRawLocked` 里 `if (rewriting.get())` 那一只腿只 `LOGGER.fine("AOF rewrite in
+  progress, buffering command")`，一个字节都没有缓冲（`grep -n 'buffering command' -A 3 <该文件>`），
+  而上游正是靠重写期间的 `aof_rewrite_buf` 补这个洞。
+  T1 的预期集因此只留"每遍都红"的交集，剔除的那一格连同这段来历写在 `teeth.py` 那条注释里，
+  等 13m 的判据落地后按实测改写。
+- **一条必须写下来的盘面事实：origin/main 上那一笔带着一个变异体**。另一会话的 `chore(sync)`
+  在 15:37:30 把当时在途的字节入库成 `4039de0`，而那个时刻 `AofPersistence` 正被 m2 那一轮的
+  **T12 变异**改着（条件里少了 `rdbSaving`）⇒ **已推送的 `4039de0` 里，13l① 那一项条件是不在的**
+  （现读：`git show 4039de0:<AofPersistence 路径> | grep -n 'if (!aofOn'` 出来的那一行没有 `rdbSaving`，
+  而签名那一行有 —— 正是 T12 的形状）。本笔把那一行覆盖回真值。不改历史（共享仓、那是别人的提交），
+  只在这里记账；并且本轮所有"绿"的读数都注明量的是哪一副字节：工作树那五份的 md5 见
+  `logs/m2_teeth.txt` / `logs/m3_teeth.txt` 开头的 `SNAPSHOT` 行，两轮逐文件一致（还原步只从本次的
+  `.good` 走 `cp` 并逐文件对 md5）。
+- **基线与复跑命令**：`mvn -o -B clean test` BUILD SUCCESS（44s），
+  `python3 ~/.cache/zcache_gauges/tally_log.py ~/.cache/zcache_gauges/logs/full_13l_run1.txt` 报
+  `MODULES=4 run=914 failures=0 errors=0 skipped=0`（`358 + 419 + 135 + 2`；core 417 → 419 正是那两支新 @Test）。
+  **这一轮只有本机**，250 一格都没复算。本轮动过 `AofPersistence` / `RedisServer` / `RdbPersistence`
+  与 `RedisServerLifecycleTest` ⇒ 兄弟族里 TRACKED 含这四份之一的，13k 时段的读数对这副字节作废
+  （`auto_rewrite_mut` 本身已按新字节重量，其余四族下一轮要么复跑、要么引用时注明）。
+- **下一格（13m、13n）**：① 13m = 上面那条"重写窗口里成功的追加被旧快照盖掉"，要的是判定性的窗口
+  复现（`StoreAccessor` 本来就是注入点）＋ 一层不许钉死修法写法的结构守卫，判据要问**整份日志重放进
+  一个新实例能不能读回那一笔**，只比文件长度不算；② 13n = `CONFIG GET` / `CONFIG SET` 把那两条旋钮
+  接到命令层（仓库里 `case "CONFIG"` 一个都没有，同一条管道的阳性对照 `case "BGREWRITEAOF"` 命中一处，
+  行号一律现读）。
+
 ### Added
 - `RedisServer.serverScope()`：只读拿到本台那一份，测试与嵌入式据此判断作用域边界。
 - `StreamIdFormat`（z-cache-common）：stream ID 的唯一文法（uint64 两段、`-` / `+` 两种位置、

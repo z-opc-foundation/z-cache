@@ -1192,7 +1192,7 @@ arg2\r
      */
     static boolean shouldAutoRewrite(boolean aofOn, boolean rdbSaving, boolean rewriteInProgress,
                                      long current, long base, int percentage, long minSize) {
-        if (!aofOn || rewriteInProgress || percentage == 0 || current <= minSize) {
+        if (!aofOn || rdbSaving || rewriteInProgress || percentage == 0 || current <= minSize) {
             return false;
         }
         long baseForGrowth = base != 0 ? base : 1;
