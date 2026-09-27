@@ -111,6 +111,28 @@ z-cache 是一个**生产就绪**的 Redis 协议兼容内存数据库，使用 
 
 详细架构：[_doc/001_arch/01-module-structure.md](_doc/001_arch/01-module-structure.md)
 
+### 日志：只有一个家族，而且分工是钉住的
+
+- **库只带 API，且"谁记日志谁声明"。** `z-cache-core` / `z-cache-client` 声明的是 `org.apache.logging.log4j:log4j-api`（compile）
+  加一支 `log4j-core`（**test**，只给自己那两套测试用）。引 z-cache 不会被顺路塞进任何日志实现 ——
+  此前 `logback-classic` 在 core 是 compile 作用域，每个消费者都白背一支实现，而代码里一处 `import ch.qos.logback` 都没有。
+  反过来也不虚报"每个模块都配齐了"：`z-cache-common`（13 个 `src/main` 文件）与 starter（3 个）现读 0 处日志调用，
+  所以不欠它们一支用不上的依赖 —— 判的是**用了就必须直接声明**，这条由 ⑦ 那支 @Test 盯着。
+- **配置文件只有一份，且在发行包。** `z-cache-server/src/main/resources/log4j2.xml` 是全仓唯一的一份日志配置；
+  库模块一份都不许有（`z-cache-core/src/main/resources/logback.xml` 已删 —— 库 jar 里的 root logger 配置会替
+  所有下游决定日志长什么样，还会按进程工作目录往**别人的** `logs/` 里写文件）。properties / yml 里也不许留
+  `logging.config=classpath:…` 把实现再指回去。
+- **代码里只许这一家。** `src/main` 记日志一律 `org.apache.logging.log4j`，`java.util.logging` / `org.slf4j` /
+  `ch.qos.logback` 都不许 —— 包括**全限定名**写法（按 import 找会整个漏掉）。JUL 的事件不进任何已配置的
+  appender：13u 之前那两个持久化类（`AofPersistence` / `RdbPersistence`，合计 29 个记日志调用点）走 JUL，
+  活体冒烟里它们的日志只出现在 stderr，`logs/z-cache.log` 里 grep 到 **0** 条。
+- **钉住它的是 7 支 @Test**：`z-cache-core/src/test/…/core/server/LoggingFamilyGuardTest.java` —— 4 支扫声明与
+  配置的结构（pom / exclusion / 配置文件落点 / `logging.config`），1 支扫 `src/main` 的代码行，1 支逐模块对照
+  "这个模块的代码真在记日志 ⇒ 它的 pom 必须直接写 `log4j-api`"（现读：core 10 个文件、client 8 个在记，两个都声明了；
+  `z-cache-common` 13 个文件 0 处日志，就不欠它一支用不上的依赖），1 支真往 root logger
+  挂 appender 把一条 INFO 送到实现再读回来（否定式那几支各自带<em>猎物</em>与阳性对照）。
+  验牙的尺在 `~/.cache/zcache_gauges/logging_mut/teeth.py`（6 支真变异各红在指定的那一支 + 2 支等价形状必须保持绿）。
+
 ---
 
 ## 🚀 快速开始

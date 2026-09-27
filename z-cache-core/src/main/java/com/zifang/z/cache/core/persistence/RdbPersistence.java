@@ -23,13 +23,13 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.logging.Level;
-import java.util.logging.Logger;
 
 import com.zifang.z.cache.core.stream.ConsumerGroup;
 import com.zifang.z.cache.core.stream.Stream;
 import com.zifang.z.cache.core.stream.StreamEntry;
 import com.zifang.z.cache.common.protocol.StreamIdFormat;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 /**
  * RDB 快照持久化调度器。
@@ -69,7 +69,7 @@ import com.zifang.z.cache.common.protocol.StreamIdFormat;
  */
 public class RdbPersistence {
 
-    private static final Logger LOGGER = Logger.getLogger(RdbPersistence.class.getName());
+    private static final Logger LOGGER = LogManager.getLogger(RdbPersistence.class);
 
     /**
      * RDB 文件魔数标识
@@ -257,7 +257,7 @@ public class RdbPersistence {
                         save();
                     }
                 } catch (Exception e) {
-                    LOGGER.log(Level.WARNING, "Error during RDB scheduled save", e);
+                    LOGGER.warn("Error during RDB scheduled save", e);
                 }
             }, saveSeconds, saveSeconds, TimeUnit.SECONDS);
         }
@@ -335,7 +335,7 @@ public class RdbPersistence {
             if (tempFile.exists()) {
                 tempFile.delete();
             }
-            LOGGER.log(Level.SEVERE, "Failed to save RDB file", e);
+            LOGGER.error("Failed to save RDB file", e);
             throw e;
         }
     }
@@ -356,7 +356,7 @@ public class RdbPersistence {
             try {
                 save();
             } catch (Exception e) {
-                LOGGER.log(Level.WARNING, "Background RDB save failed", e);
+                LOGGER.warn("Background RDB save failed", e);
             } finally {
                 bgSaving.set(0);
             }
@@ -379,7 +379,7 @@ public class RdbPersistence {
      */
     public void load(String dbFilePath) throws IOException {
         if (storeAccessor == null) {
-            LOGGER.warning("StoreAccessor not set, skipping RDB load");
+            LOGGER.warn("StoreAccessor not set, skipping RDB load");
             return;
         }
 

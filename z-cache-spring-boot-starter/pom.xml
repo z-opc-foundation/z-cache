@@ -66,6 +66,23 @@
             <artifactId>spring-boot-starter-test</artifactId>
             <version>2.7.18</version>
             <scope>test</scope>
+            <exclusions>
+                <!-- spring 容器的默认日志那一族整条拔掉：它带的是
+                     `ch.qos.logback:logback-classic` + `org.apache.logging.log4j:log4j-to-slf4j`
+                     （方向正好反过来：log4j2 的事件被灌进 slf4j→logback），
+                     还顺手把 log4j-api 抬成 2.25.4 —— 于是同一个测试类路径上出现过两个 log4j2 版本。
+                     拔掉之后由下面那支 starter-log4j2 供实现，全仓只剩一个方向：log4j2 自己。 -->
+                <exclusion>
+                    <groupId>org.springframework.boot</groupId>
+                    <artifactId>spring-boot-starter-logging</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-log4j2</artifactId>
+            <version>2.7.18</version>
+            <scope>test</scope>
         </dependency>
     </dependencies>
 

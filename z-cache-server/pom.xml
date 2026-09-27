@@ -49,6 +49,18 @@
             <artifactId>z-cache-core</artifactId>
             <version>${project.version}</version>
         </dependency>
+        <!-- 发行包这一层是"实现 + 配置"的<em>唯一</em>落点：库里只带 log4j-api，
+             这一台把 log4j-core 与 `src/main/resources/log4j2.xml` 一起带上（那份配置接替此前
+             住在 z-cache-core jar 里的那份 logback.xml）。shade 打的是 fat jar，所以实现必须在
+             编译期就在这一模块的类路径上，不能指望传递。 -->
+        <dependency>
+            <groupId>org.apache.logging.log4j</groupId>
+            <artifactId>log4j-api</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.logging.log4j</groupId>
+            <artifactId>log4j-core</artifactId>
+        </dependency>
     </dependencies>
 
     <build>
