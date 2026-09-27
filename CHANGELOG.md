@@ -2033,8 +2033,8 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
 #### 自动重写要先有分子与分母：`INFO` 里那两个 AOF 大小此前一个字都没有（13j）
 
 - **来账**：13i 把"下一格"记成自动挡（`auto-aof-rewrite-percentage` / `auto-aof-rewrite-min-size`）。
-  动手前先读上游那一台机器：`server.c:1305-1312` 算的是
-  `base = aof_rewrite_base_size ? : 1`、`growth = aof_current_size*100/base - 100` —— 分子分母两个数
+  动手前先读上游那一台机器：`server.c:1301-1315` 那块算的是
+  `base = aof_rewrite_base_size ? : 1`（`:1308-1309`）、`growth = aof_current_size*100/base - 100`（`:1310`）—— 分子分母两个数
   我们只有分子的一半（`appendedBytes` 有记账，但没有任何出口读得到它），分母**整个概念都不存在**；
   而上游把这两个数交出去看的那张嘴（`INFO` 的 `# Persistence` 段）在本仓**一个字段都没有**：
   `handleInfo` 只有 Server / Clients / Memory / Stats / Keyspace / Replication 六段。
@@ -2091,15 +2091,33 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   （同尺阳性对照 `blocked_clients` 1 命中；`CLUSTER` 也 0 命中），而 Memory 段报的是 `max_memory`
   —— 那是另一格，已单独登记，不混进本节。
 - **仍然没接上的（下一格）**：自动挡本身 —— `auto-aof-rewrite-percentage` / `auto-aof-rewrite-min-size`
-  （默认 100 与 64mb，`server.h:98-99`；解析 `config.c:501` / `:509`；`CONFIG SET` 运行时口
-  `config.c:1161` / `:1263`；`CONFIG GET` `:1362` / `:1364`）—— 本仓根本没有 `CONFIG` 命令
+  （默认 100 与 64mb，`server.h:98-99`；配置文件解析后落到 `config.c:501` / `:509`；`CONFIG SET`
+  运行时口 `config.c:1160-1161`（数值，`0..INT_MAX`）与 `:1262-1263`（内存量，`0..LONG_MAX`）；
+  `CONFIG GET` `config.c:1361-1362` / `:1363-1364`）—— 本仓根本没有 `CONFIG` 命令
   （现读 `CommandHandler` 的 case 表：`CONFIG` / `COMMAND` / `ACL` / `TIME` / `SWAPDB` 各 0 命中，
   阳性对照同一次量具 `INFO` / `SLOWLOG` / `BGREWRITEAOF` 5 命中），也没有后台调度方去算
-  `server.c:1305-1312` 那个增幅。13j 供上的是它的**分子与分母**，也就是那一格的两条腿。
+  `server.c:1302-1313` 那个增幅。13j 供上的是它的**分子与分母**，也就是那一格的两条腿。
 - **基线 908 → `909`**（`358 + 414 + 135 + 2`，core 413 → 414 就是本格新增的那 1 个 `@Test`；
   `mvn -o -B clean test` BUILD SUCCESS，日志 `~/.cache/zcache_gauges/logs/full_13j_run1.txt`，
   分模块读数由 `tally_log.py` 现算：`MODULES=4 run=909 failures=0 errors=0 skipped=0`）。
-- 250 那一侧仍然 ssh 不通：本轮全部读数**只有单机**。
+- **第二台机器补跑（09-27 14:2x）—— 本 entry 上一版写的"本轮全部读数只有单机"到此作废**：
+  250 已恢复 ssh，在 `13b8c6b` 的**干净 clone**（`~/zcache-250t/z-cache-13j`，
+  `git status --porcelain | wc -l` = 0）上跑完整套件：`BUILD SUCCESS`，`tally_log.py` 报
+  `MODULES=4 run=909 failures=0 errors=0 skipped=0`（`358 + 414 + 135 + 2`），与本机的
+  `logs/full_13j_run1.txt` **逐字节相同** —— 两份 tally 文本 `diff` 无差异、`md5` 同为
+  `dbc023d1602e9b6e9f5fc49158ddb1ac`（原始日志分别是 `8538bdeb…` 本机 / `720b5877…` 250，
+  差异只有时刻）。所以本格装的那四个字段、17 格判据与三族牙**两台机器都成立**。
+- **250 上"照着 PATH 跑"是跑不起来的，原因不在代码**：那台机器的默认 `mvn` 是 **3.6.0**
+  （`/usr/bin/mvn`），14:23 那一次 `mvn -B clean test` 61 行就死在 `PluginIncompatibleException`
+  （插件要求 Maven ≥ 3.6.3）。换 `~/maven3914/bin/mvn`（3.9.14；同机另有 3.9.6 也满足）一次跑通。
+  **往后在 250 一律显式写 `~/maven3914/bin/mvn`**，别再拿 `PATH` 上那个。
+- **行号校正（三处，都在本 entry 里，因为两行折行的宏只点了第二行）**：`CONFIG SET` 的
+  `auto-aof-rewrite-percentage` 是 `config.c:1160-1161`（宏名在 1160，字段与区间 `0,INT_MAX` 在 1161），
+  `auto-aof-rewrite-min-size` 是 `config.c:1262-1263`（赋值在 1263）；`CONFIG GET` 两项分别是
+  `config.c:1361-1362` / `:1363-1364`。上一版各写一个行号，读起来像"两个判据各占一行"。
+  同一次现读还纠正了增幅那一段的指代：整块是 `server.c:1301-1315`（五个条件 `:1302-1306`、
+  `base = … ? : 1` 在 `:1308-1309`、`growth` 在 `:1310`、比较在 `:1311`、真的去重写是 `:1313`），
+  上一版写的 `server.c:1305-1312` 两头都切在了句子中间。
 
 ### Added
 - `RedisServer.serverScope()`：只读拿到本台那一份，测试与嵌入式据此判断作用域边界。
