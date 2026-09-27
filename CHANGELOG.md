@@ -2023,7 +2023,8 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   在这一版字节上全绿，没有互相踩坏。
 - **仍然没接上的（下一格）**：按体积触发的那一台 —— `auto-aof-rewrite-percentage` /
   `auto-aof-rewrite-min-size`（上游默认 100 与 64mb，`server.h:98-99`，`CONFIG GET` 里
-  `config.c:1361 / :1363`）两项配置在 `CONFIG` 里查不到，也没有后台调度方在量日志体积。
+  `config.c:1361-1362` / `:1363-1364`——本轮 13k 现读，13j 校正行号那一节漏改了本条）两项配置在
+  `CONFIG` 里查不到，也没有后台调度方在量日志体积。
   也就是说 13i 之后重写<em>有人能踩油门</em>，但<em>自动挡</em>还是没有。
 - **基线 907 → `908`**（`358 + 413 + 135 + 2`，core 412 → 413 是本格新增的那 1 个 `@Test`；
   `mvn -o -B clean test` rc=0 / BUILD SUCCESS，日志
@@ -2138,8 +2139,9 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   `aof_rewrite_perc` 非零、`aof_current_size > aof_rewrite_min_size` 严格大于），
   `base = aof_rewrite_base_size ? : 1` 在 `:1308-1309`，`growth = (aof_current_size*100/base) - 100`
   在 `:1310`，`if (growth >= server.aof_rewrite_perc)` 在 `:1311`，真的去
-  `rewriteAppendOnlyFileBackground()` 在 `:1313`。它待在 serverCron 的 `else` 分支里，
-  也就是"这一台当前没有后台保存 / 后台重写"那一支；节奏 = `return 1000/server.hz`（`server.c:1374`），
+  `rewriteAppendOnlyFileBackground()` 在 `:1313`。它待在 serverCron 的 `} else {`（`:1276`）里，
+  那句注释原话是 `If there is not a background saving/rewrite in progress check if we have to
+  save/rewrite now`（`:1277-1278`）；节奏 = `return 1000/server.hz`（`server.c:1374`），
   而 `CONFIG_DEFAULT_HZ 10` 在 `server.h:83` ⇒ **100ms 一拍**。默认值 `AOF_REWRITE_PERC 100`
   与 `AOF_REWRITE_MIN_SIZE (64*1024*1024)` 是 `server.h:98` / `:99` 两行宏。
 - **做了什么**（全在 `AofPersistence`，命令层一个字没动）：
@@ -2148,7 +2150,8 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   `0,INT_MAX`，`:1262-1263` 是 `ll,0,LONG_MAX`），消息用上游原文
   `Invalid negative percentage for AOF auto rewrite`；
   ③ `shouldAutoRewrite(aofOn, rewriteInProgress, current, base, percentage, minSize)` ——
-  把那五个条件加增幅原样写成一个纯函数，表判据直接打它，不需要真起服务器；
+  把上游那一拍的条件（`rdb_child_pid` 那一项除外，见下面差别 ③）连增幅算式一起写成一个纯函数，
+  表判据直接打它，不需要真起服务器；
   ④ `checkAutoRewrite()` 是走真实实例的那一份，够条件就交给 `rewriteAsync()`；
   ⑤ `start()` 末尾挂 `AUTO_REWRITE_TICK_MS = 1000L / 10` 的 `scheduleAtFixedRate`，`stop()` 里撤。
   这一拍**与 `fsyncFuture` 是两支**，不是把检查塞进每秒刷盘那一拍里：上游本来就是两件事 ——
@@ -2198,8 +2201,23 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   正是这三张表的三支 @Test）。**这一轮只有本机**，250 上一格都没复算（13j 那条双机逐字节对账
   是上一轮的事，别顺延到本轮）。本轮动过 `AofPersistence` 与 `RedisServerLifecycleTest`，
   而 `aof_rw_mut` / `bgrewriteaof_mut` / `fsync_mut` / `info_aof_sizes_mut` / `stream_rw_mut`
-  五族的 TRACKED 集里都有这两份文件之一 ⇒ 它们 13j 时段的读数对这副字节**作废**，
-  复跑结果紧跟着记在下一条（未复跑完之前，那一格按"待主编复跑"读）。
+  五族的 TRACKED 集里都有这两份文件之一 ⇒ 它们 13j 时段的读数对这副字节**作废**。
+- **五族已对这副字节复跑完毕**（15:03—15:07 串行一条链，同一台机器）：每族开头都现读并打印自己那份
+  `.good` 的 md5（`measured AofPersistence.java md5 12a85805…`，fsync 那族连判据表一起打），
+  跑完 `finally` 从本次的 `.good` 还原 —— 其中 `aof_rw` / `fsync` 两族会把
+  `restored … match=True` 贴进日志，另三族不贴，所以链尾我另取一次 md5 复核 =
+  `AofPersistence 12a85805…` / 判据表 `8c141f76…` / `CommandHandler 98216322…`，与链首一致：
+  `logs/info_aof_sizes_run_13k.txt` `mutants=8 bad=0`（S1 2 / S2 4 / S3 2 / S4 1 / S5 1 / S6 1 / S7 2），
+  `logs/bgrewriteaof_run_13k.txt` `mutants=6 bad=0`（B1 2 / B2 1 / B3 1 / B4 2 / B5 3），
+  `logs/stream_rw_run_13k.txt` `mutants=9 bad=0`（M1 20 / M2 5 / M3 3 / M4 2 / M5 7 / M6 2 / M7 1 / M8 3），
+  `logs/aof_rw_run_13k.txt` `mutants=11 bad=0`，`logs/fsync_run_13k.txt` `mutants=10 bad=0`
+  且首行 `baseline rc=0 reds=[] ran=6`。
+  **bgrewriteaof 与 stream_rw 逐支红数与 13j 那次一字不差** ⇒ 新装的自动挡没有把这两族任何一格挤宽或挤窄
+  （这五族都在本机，250 本轮仍是一格都没复算）。
+- **一处口径不齐，先写下来免得下一轮误比**：`bgrewriteaof`(6) / `info_aof_sizes`(8) / `stream_rw`(9)
+  三族的 `SUMMARY mutants=` 把控制组也算进了分母（脚本里是 `len(MUTANTS) + 1`，真实变异支数是 5 / 7 / 8），
+  而 `aof_rw`(11) / `fsync`(10) 与本节新写的 `auto_rewrite_mut`(11) 按变异支数计。
+  跨族比"跑了多少支"要数 `MUTANT` 行，别拿 SUMMARY 那个数当分母。
 - **下一格（13l，两件事，先后由这一节的两条差别决定）**：
   ① 把 `rdb_child_pid == -1` 那一项补进那一拍（差别 ③ 记的就是它，先要给 `RdbPersistence.bgSaving`
   露一个读口并定耦合方向），补完在表里加一格"后台保存在跑 ⇒ 这一拍不许换文件"并给它一个反向邻居；
