@@ -1858,7 +1858,17 @@ public class CommandHandler {
                 Object r = transactionManager.exec(transactionContext, a -> {
                     String[] s = new String[a.length];
                     for (int i = 0; i < a.length; i++) s[i] = a[i] == null ? null : a[i].toString();
-                    return handle(RespArray.of(Arrays.stream(s).map(x -> (Object) RespBulkString.of(x)).toArray()));
+                    Object one = handle(RespArray.of(Arrays.stream(s).map(x -> (Object) RespBulkString.of(x)).toArray()));
+                    // RespFrames 只能待在管道顶层：落到数组元素的位置上会被就地展开成 N 帧，外层长度
+                    // 就对不上号了。排队执行这一腿把多帧折回一条嵌套数组，字节与 13w 之前逐字同形 ——
+                    // 上游在 EXEC 里是"第一帧进数组、其余帧另外推"（250 原文 m1/m2/m5 三格），那一格另开卡跟。
+                    // 只有一帧时必须<em>不</em>包数组：EXEC 自己会把这个返回值当元素嵌一层，再包一层就成了
+                    // [[[...]]]（250 原文 m3 是 [['subscribe','a','1']]）。
+                    if (one instanceof RespFrames) {
+                        List<Object> queued = ((RespFrames) one).frames();
+                        return queued.size() == 1 ? queued.get(0) : RespArray.of(queued);
+                    }
+                    return one;
                 });
                 // exec() 只在一种情况下回 null：WATCH 的键被别的连接改过。Redis 对这种中止
                 // 回的是空多批量 *-1（客户端按"nil = 没提交"判断），不是 -EXECABORT ——
@@ -1887,42 +1897,87 @@ public class CommandHandler {
         if (args.length<2) return RespError.wrongNumberOfArguments("SUBSCRIBE");
         PubSubManager pubSub = pubSub();
         if (pubSub==null) return RespError.of("ERR","Pub/Sub not configured");
-        String[] ch = Arrays.copyOfRange(args,1,args.length);
-        int already = pubSub.channelCount(channelContext) + pubSub.patternCount(channelContext);
-        pubSub.subscribe(channelContext, ch);
-        Object[] r = new Object[ch.length]; for (int i=0;i<ch.length;i++) r[i]=RespArray.of(RespBulkString.of("subscribe"),RespBulkString.of(ch[i]),RespInteger.of(already + i + 1));
-        return ch.length==1 ? r[0] : RespArray.of(r);
+        return subscriptionConfirmations(pubSub, false, "subscribe", Arrays.copyOfRange(args,1,args.length));
     }
     private Object handleUnsubscribe(String[] args) {
         PubSubManager pubSub = pubSub();
         if (pubSub==null) return RespSimpleString.of("OK");
-        String[] ch = args.length<2 ? new String[0] : Arrays.copyOfRange(args,1,args.length);
-        int before = pubSub.channelCount(channelContext) + pubSub.patternCount(channelContext);
-        pubSub.unsubscribe(channelContext, ch);
-        if (ch.length==0) return RespArray.empty();
-        Object[] r = new Object[ch.length]; for (int i=0;i<ch.length;i++) r[i]=RespArray.of(RespBulkString.of("unsubscribe"),RespBulkString.of(ch[i]),RespInteger.of(Math.max(0, before - (i + 1))));
-        return ch.length==1 ? r[0] : RespArray.of(r);
+        return cancellationConfirmations(pubSub, false, "unsubscribe",
+                args.length<2 ? new String[0] : Arrays.copyOfRange(args,1,args.length));
     }
     private Object handlePsubscribe(String[] args) {
         if (args.length<2) return RespError.wrongNumberOfArguments("PSUBSCRIBE");
         PubSubManager pubSub = pubSub();
         if (pubSub==null) return RespError.of("ERR","Pub/Sub not configured");
-        String[] p = Arrays.copyOfRange(args,1,args.length);
-        int already = pubSub.channelCount(channelContext) + pubSub.patternCount(channelContext);
-        pubSub.psubscribe(channelContext, p);
-        Object[] r = new Object[p.length]; for (int i=0;i<p.length;i++) r[i]=RespArray.of(RespBulkString.of("psubscribe"),RespBulkString.of(p[i]),RespInteger.of(already + i + 1));
-        return p.length==1 ? r[0] : RespArray.of(r);
+        return subscriptionConfirmations(pubSub, true, "psubscribe", Arrays.copyOfRange(args,1,args.length));
     }
     private Object handlePunsubscribe(String[] args) {
         PubSubManager pubSub = pubSub();
         if (pubSub==null) return RespSimpleString.of("OK");
-        String[] p = args.length<2 ? new String[0] : Arrays.copyOfRange(args,1,args.length);
-        int before = pubSub.channelCount(channelContext) + pubSub.patternCount(channelContext);
-        pubSub.punsubscribe(channelContext, p);
-        if (p.length==0) return RespArray.empty();
-        Object[] r = new Object[p.length]; for (int i=0;i<p.length;i++) r[i]=RespArray.of(RespBulkString.of("punsubscribe"),RespBulkString.of(p[i]),RespInteger.of(Math.max(0, before - (i + 1))));
-        return p.length==1 ? r[0] : RespArray.of(r);
+        return cancellationConfirmations(pubSub, true, "punsubscribe",
+                args.length<2 ? new String[0] : Arrays.copyOfRange(args,1,args.length));
     }
+
+    /**
+     * 一个名字<em>一条独立确认帧</em>，不是一条 {@code *N} 数组。
+     *
+     * <p>判据来自 5.0.14：{@code subscribeCommand} 是逐名循环（{@code pubsub.c:280-281}），
+     * 每一手自己 {@code addReply(mbulkhdr[3]) + "subscribe" + 名字 + 计数}（{@code :79-82}），
+     * 图案那一族同形（{@code :141-144}）。250 一次性实例量出来的原文（4.0.9，
+     * {@code ~/.cache/zcache_gauges/pubsub_frame_mut/ref_pubsub_frames.tr}）：
+     * {@code SUBSCRIBE a b} 回两条 30 字节的帧、三名字回三条；改之前这台回的是<em>一条</em> 64/94 字节的
+     * 嵌套数组，任何按帧解析的订阅端都会把第 2..N 手读丢。</p>
+     *
+     * <p>计数取"这一手<em>落定之后</em>的频道数 + 图案数"（{@code clientSubscriptionsCount}，
+     * {@code pubsub.c:51-54}），所以重复名字不会把计数顶上去：{@code SUBSCRIBE a a} 两帧都回 1，
+     * {@code PSUBSCRIBE news.* news.*} 也一样 —— 原文在 {@code c5}/{@code c6} 两格里。</p>
+     */
+    private Object subscriptionConfirmations(PubSubManager pubSub, boolean pattern, String type, String[] names) {
+        List<Object> frames = new ArrayList<>(names.length);
+        for (String name : names) {
+            if (pattern) pubSub.psubscribe(channelContext, name); else pubSub.subscribe(channelContext, name);
+            frames.add(subscriptionFrame(type, name, pubSub));
+        }
+        return RespFrames.of(frames);
+    }
+
+    /**
+     * 退订的确认帧。三条读数都来自原文（同一份 {@code ref_pubsub_frames.tr}）：
+     * <ul>
+     *   <li>给了名字：逐名一条帧，计数是"这一手退完之后"的余量。名字<em>根本没订过</em>时余量不变
+     *       （上游 {@code pubsub.c:113-121} 的 notify 不看退没退掉）—— {@code UNSUBSCRIBE zz} 在
+     *       手上还有 {@code a} 时回 {@code [unsubscribe, zz, 1]}，不是 0。</li>
+     *   <li>没给名字：把<em>这一族</em>手上的逐个退掉、各回一条帧（{@code pubsub.c:178-187}），
+     *       另一族不动（{@code UNSUBSCRIBE} 不碰图案，原文 {@code c12} 里图案那一手活到最后、计数回 1）。</li>
+     *   <li>没给名字且这一族本来就空：仍要回<em>一条</em>帧，名字栏是 nil（{@code :189-195}，
+     *       原文 {@code c9}/{@code c10} 是 {@code [unsubscribe, nil, 0]}），不是 {@code *0}。</li>
+     * </ul>
+     * 逐条退的那几帧，先后顺序上游是自己内部表的迭代序（同一份表两跑就会换序：{@code c8} 两跑一支
+     * 先 {@code b} 一支先 {@code a}），所以这里只保证"每条一帧、计数对"，不承诺顺序。
+     */
+    private Object cancellationConfirmations(PubSubManager pubSub, boolean pattern, String type, String[] names) {
+        String[] targets = names.length == 0
+                ? (pattern ? pubSub.subscribedPatterns(channelContext).toArray(new String[0])
+                           : pubSub.subscribedChannels(channelContext).toArray(new String[0]))
+                : names;
+        List<Object> frames = new ArrayList<>();
+        for (String name : targets) {
+            if (pattern) pubSub.punsubscribe(channelContext, name); else pubSub.unsubscribe(channelContext, name);
+            frames.add(subscriptionFrame(type, name, pubSub));
+        }
+        // 这一族本来就空：仍回一帧，名字栏是 nil（上游 :189-195），不是 *0。
+        if (frames.isEmpty()) frames.add(subscriptionFrame(type, null, pubSub));
+        return RespFrames.of(frames);
+    }
+
+    /** {@code [type, 名字, 余量]}：名字给 null 就是 nil 那一手（{@link RespBulkString#nullBulkString()}）。 */
+    private Object subscriptionFrame(String type, String name, PubSubManager pubSub) {
+        long left = pubSub.channelCount(channelContext) + pubSub.patternCount(channelContext);
+        return RespArray.of(RespBulkString.of(type),
+                name == null ? RespBulkString.nullBulkString() : RespBulkString.of(name),
+                RespInteger.of(left));
+    }
+
     private Object handlePublish(String[] args) {
         if (args.length!=3) return RespError.wrongNumberOfArguments("PUBLISH");
         PubSubManager pubSub = pubSub();

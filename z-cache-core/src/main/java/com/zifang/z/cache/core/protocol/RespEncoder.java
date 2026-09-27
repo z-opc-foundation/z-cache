@@ -47,6 +47,12 @@ public class RespEncoder extends MessageToByteEncoder<Object> {
             encodeBulkString((RespBulkString) msg, out);
         } else if (msg instanceof RespArray) {
             encodeArray((RespArray) msg, out);
+        } else if (msg instanceof RespFrames) {
+            // 多帧回复：<em>不带</em>外层数组头，一帧一帧连着写（同上游逐手 addReply 的字节流）。
+            // 只在该对象出现在管道顶层时才走到这里；数组元素位置上不许放它，见 RespFrames 的不变式。
+            for (Object frame : ((RespFrames) msg).frames()) {
+                encode(ctx, frame, out);
+            }
         } else if (msg instanceof String) {
             // Treat plain String as Simple String
             encodeSimpleString(RespSimpleString.of((String) msg), out);

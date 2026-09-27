@@ -45,6 +45,23 @@ public class PubSubManager {
     }
 
     /**
+     * 这条连接当前订阅的精确频道名。没给名字的 {@code UNSUBSCRIBE} 要<em>逐条</em>回确认帧
+     * （5.0.14 {@code pubsub.c:178-198}：先按手上的每一手各推一条，手上是空的才推那一条 nil），
+     * 所以要拿得到名字本身，不能只拿到个数。
+     * 回的是快照副本：调用方会在迭代过程中就地把这些订阅退掉。
+     */
+    public Set<String> subscribedChannels(ChannelHandlerContext ctx) {
+        Set<String> channels = ctx == null ? null : clientChannels.get(ctx);
+        return channels == null ? Collections.emptySet() : new HashSet<>(channels);
+    }
+
+    /** 同上，图案那一族（{@code PUNSUBSCRIBE} 不带名字时走这一支，{@code pubsub.c:202-222}）。 */
+    public Set<String> subscribedPatterns(ChannelHandlerContext ctx) {
+        Set<String> patterns = ctx == null ? null : clientPatterns.get(ctx);
+        return patterns == null ? Collections.emptySet() : new HashSet<>(patterns);
+    }
+
+    /**
      * 检查客户端是否有任何订阅（精确频道或模式）。
      *
      * @param ctx 客户端连接上下文
