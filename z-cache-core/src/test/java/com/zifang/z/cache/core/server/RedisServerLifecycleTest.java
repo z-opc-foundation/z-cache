@@ -1558,16 +1558,17 @@ class RedisServerLifecycleTest {
                     busyReplies.add(readReply(in));
                 }
             }
-            seen.put("正在重写时连着两问", busyReplies.toString());
             String first = busyReplies.isEmpty() ? "(一问都没答)" : busyReplies.get(0);
             String second = busyReplies.size() < 2 ? "(只答了一问)" : busyReplies.get(1);
-            if (!"+Background append only file rewriting started".equals(first)) {
-                wrong.put("正在重写时连着两问", "锁攥着不放时，第一问还该受理（上一问的标志已经抢到了）："
-                        + notBusy + "实际 " + busyReplies);
-            } else if (!"-ERR Background append only file rewriting already in progress".equals(second)) {
-                wrong.put("正在重写时连着两问", "第二问要的是上游 aof.c:1631 那句原文（受理了第二问 = "
-                        + "标志没在入队之前抢，两份重写会排进同一个线程池）；" + notBusy + "实际 " + second);
-            }
+            // 两问各钉一格：原先是一条 if/else-if 链，第一问一坏第二问就不检查了 —— 那正是
+            // "标志抢晚了"与"标志没还"两支变异落在同一个格名上的原因（量具据此分不开两种坏法）。
+            expectTextCell(seen, wrong, "锁内第一问仍受理", first,
+                    "+Background append only file rewriting started",
+                    "锁攥着不放时，第一问还该受理（上一问抢到的标志到重写跑完才还）；" + notBusy);
+            expectTextCell(seen, wrong, "锁内第二问撞闸", second,
+                    "-ERR Background append only file rewriting already in progress",
+                    "第二问要的是上游 aof.c:1631 那句原文：受理了第二问 = 标志没在<em>入队之前</em>抢，"
+                            + "两份重写会排进同一个线程池，后一份会拿前一份换过的日志再导一遍；" + notBusy);
         } finally {
             gen1.stop();
             t1.join(DEADLINE_MS);

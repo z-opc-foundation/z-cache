@@ -1946,6 +1946,83 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   `~/.cache/zcache_gauges/logs/full_13h_131221.log`）。
 - 250 那一侧仍然 ssh 不通（sshd banner 不发）：本轮全部读数**只有单机**。
 
+#### 机器修好了两台，踩下它的那一脚一直没有：`BGREWRITEAOF` 接上命令层（13i）
+
+- **来账**：13g 把"导出最小命令集"修好、13h 把同一族送进快照，而那一整段在命令层**没有入口** ——
+  `z-cache-core/src/main` 里 `BGREWRITEAOF` 0 命中（阳性对照同尺：`BGSAVE` 1 命中），
+  `AofPersistence` 那个专门为重写开的 `rewriteExecutor` 线程池从头到尾没被提交过任务。
+  README 与 `_doc/001_arch/01-module-structure.md` 当时写的"不要指望 BGREWRITEAOF"是真话 ——
+  本节把那句话改口，两句旧话已按实测同步改掉。
+- **改动前的形状**（生产侧就是 `5d053ef` 那份字节，工作区只加判据；日志
+  `~/.cache/zcache_gauges/logs/prefix_bgrewriteaof.txt`）：`Tests run: 1, Failures: 1`，红 **3 格** ——
+  `BGREWRITEAOF 的答复` 与 `没配 dataDir 时如实拒绝` 两句都是 `-ERR unknown command 'BGREWRITEAOF'`，
+  `结构层 k 只剩一笔` 读回的是 `3`（三笔流水原样留在日志里）。改前那一跑共 13 格、红 3 绿 10
+  （"正在重写"那时还是一格，收口时拆成两格 ⇒ 本表格子数按 `13 → 15` 走）：**其余十格改前就是绿的**：
+  表顶、组、时刻、分库、重启读回那些格子量的是"换过一份日志之后别弄坏东西"，机器好着而没人踩
+  油门，它们当然全绿 —— 这一族的缺口结构上就只能由"答复的原文"与"日志有没有真的换过"两格看见。
+- **上游权威**（本轮现读的行号）：`bgrewriteaofCommand`（`aof.c:1629-1640`）三支 ——
+  已经有人在重写 → `:1631` 的 `-ERR Background append only file rewriting already in progress`；
+  有 `BGSAVE` 在跑 → `:1633-1634` 挂一个 `aof_rewrite_scheduled` 并回 `+...scheduled`；
+  否则 `:1635` 起子进程、`:1636` 回 `+Background append only file rewriting started`
+  （打的是 `addReplyStatus`，也就是**简单字符串**而不是错误）。
+  `rewriteAppendOnlyFileBackground`（`:1569`）在 `:1573` 一并挡住"两种子进程任一在跑"。
+  命令表 `server.c:248` 那一行是 `{"bgrewriteaof",bgrewriteaofCommand,1,"as",…}`。
+  全树搜 `append only mode is disabled` / `Cannot BGREWRITEAOF` **0 命中** ⇒ 上游这一支不查
+  `appendonly` 档位，它只要一个写得出去的路径。
+- **改动**：
+    - `rewriteAof` 拆成"闸 + `rewriteInternal`"：闸那半边还是原来那三道（路径非空、必须 started、
+      抢 `rewriting`），业务那半边一字未动 —— 线格式与 13g/13h 两份判据读的是同一份字节。
+    - 新增 `isRewriteSupported()`（只读、不抛，命令层要的就是"能不能"而不是异常）与
+      `rewriteAsync()`。**标志必须在<em>入队之前</em>抢**：线程池什么时候排到不可知，抢晚半步，
+      期间进来的第二问就会看到"没人重写"而把同一份日志再排一遍。`RejectedExecutionException`
+      那一支把标志还回去并回 `false` —— 排不上而不还，这份日志从此"永远有人在重写"。
+    - **两处归还收成一处**（这是量具替我们找出来的缺陷，不是顺手重构）：`rewriteInternal` 的
+      `finally` 与异步那个 lambda 的 `finally` 原本各还一次，摘掉任一处都不红 —— 也就是
+      "忘了还标志"这一种坏法在两条路上各只测得到一半。归还现在只有 `rewriteInternal` 一处，
+      两条路共用同一个出口。
+    - 命令层 `case "BGREWRITEAOF"` → `handleBgrewriteaof()`。与上游的差别两处，都是方向性的：
+      不 fork ⇒ 没有"排在 `BGSAVE` 之后"那一支（`+...scheduled` 这一版不存在，B4 就是钉这一句）；
+      `aofFilePath` 只在带 dataDir 启动时才成立 ⇒ "没配 dataDir"是"没有一份日志可换"的对应物，
+      那一支如实回 `-ERR BGREWRITEAOF is not supported: no data directory configured`，
+      宁可回错也不许回一句 `started` 却什么都没干。
+- **判据**：新增 `RedisServerLifecycleTest#bgrewriteaofStartsTheRewriteAndTheLogStaysAppendable`，
+  一张表 **15 格**（数过：`seen` 的键 15 个，含 `expectTtlCell` 自命名的那一格）、一次合并断言。三格是这一族的新形状：`BGREWRITEAOF 的答复` 钉 `:1636` 原文；
+  `结构层 k 只剩一笔` 钉"日志真的换过一份"（等的是**因**不是睡：5 秒有界空档内轮询到三笔收成一笔，
+  换文件那一瞬间可能读到半截，`IOException` 只记账、下一轮再读）；`锁内第一问仍受理` 加
+  `锁内第二问撞闸` 钉 `:1631` —— 这两格不许靠 sleep：重写排在 `appendCommand` 那把锁上，判据把
+  锁攥在手里，排队那一份就走不完、标志就一直是 `true`，锁内连问两遍。**锁内只发 `PING` 不发写
+  命令**（写命令的线程会来抢我们手里这把锁，我们又在等它的答复 ⇒ 两边互等，这一格会挂住整条腿）。
+  锁放开之后那份排队的重写会跑完，而重写按构造幂等（导的是当前状态），所以"只留这一份 AOF 重启"
+  的格子读回的还是同一形状。
+- **牙**（新量具 `~/.cache/zcache_gauges/bgrewriteaof_mut/teeth.py`，五支 + 控制组，收口跑
+  `teeth_run4.txt`）：`CONTROL → OK`，`SUMMARY mutants=6 bad=0`，五支全部「漏 无；多 无」，
+  红集 **B1 2 / B2 1 / B3 1 / B4 2 / B5 3** 格，且五张红集**两两不同名**（实测从
+  `[RED_CELLS=…]` 抽出来比过）：
+    - `B1` 命令层只回一句 started、一个任务都不提交（广告与兑现分家）→ `结构层 k 只剩一笔` +
+      `锁内第二问撞闸`；`B2` 标志改到工作线程里抢 → 只红 `锁内第二问撞闸`；
+      `B3` 重写跑完不还标志 → 只红 `锁内第一问仍受理`；`B4` 把 started 写成上游 `:1634` 那句
+      scheduled → `BGREWRITEAOF 的答复` + 第一问；`B5` 受理与拒绝两支接反 → 三格同红。
+    - `B2` 与 `B3` 落在同一个"正在重写"格上，是**改判据之前**的形状：那一格原先是一条
+      `if / else if` 链，第一问一坏就不看第二问 ⇒ 两支变异报同一个格名，分不开"抢晚"与"不还"。
+      拆成两格之后两支各自点名，**这里改的是判据，而 B2/B3 的行为缺陷（两处归还）是另修的**。
+    - run1 里 `B3` 是 COMPILE-BROKEN（把 `finally` 整块摘掉，`try` 成了孤儿 —— 量具自己的错），
+      run2 里 `B3` 合法之后 **SURVIVED**，那一次红不了的不是判据，是代码真有两处归还；
+      run3（收成一处归还）之后 `B3` 才有牙。**记这一笔是不许把"改判据让变异变红"当成"修了缺陷"。**
+    - 未覆盖面照实记：`锁内第二问撞闸` 钉的是"标志在不在"，钉不了"重写<em>成功</em>"——
+      受理之后导出失败（没有 `StoreAccessor`、换文件失败）答复已经交出去了，只剩一行
+      `LOGGER.log(Level.WARNING, …)`，与上游子进程失败同形，没有任何格子看得见；
+      同步腿 `rewriteAof` 在这一跑的 14 格里没有专属格子（13g/13e 那几格量的是它的导出与拒绝）。
+- **两份旧量具据本格的测试字节各重跑一遍**（测试文件被三份量具共同 TRACKED，改一寸就得三处复验）：
+  `rdb_stream_mut/teeth_run4.txt` 与 `stream_rw_mut/teeth_run8.txt` 都是 `bad=0`。
+- **仍然没接上的（下一格）**：按体积触发的那一台 —— `auto-aof-rewrite-percentage` /
+  `auto-aof-rewrite-min-size`（上游默认 100 与 64mb，`server.h:98-99`，`CONFIG GET` 里
+  `config.c:1361 / :1363`）两项配置在 `CONFIG` 里查不到，也没有后台调度方在量日志体积。
+  也就是说 13i 之后重写<em>有人能踩油门</em>，但<em>自动挡</em>还是没有。
+- **基线 907 → `908`**（`358 + 413 + 135 + 2`，core 412 → 413 是本格新增的那 1 个 `@Test`；
+  `mvn -o -B clean test` rc=0 / BUILD SUCCESS，日志
+  `~/.cache/zcache_gauges/logs/full_13i_run2.txt`）。
+- 250 那一侧仍然 ssh 不通：本轮全部读数**只有单机**。
+
 ### Added
 - `RedisServer.serverScope()`：只读拿到本台那一份，测试与嵌入式据此判断作用域边界。
 - `StreamIdFormat`（z-cache-common）：stream ID 的唯一文法（uint64 两段、`-` / `+` 两种位置、
