@@ -654,8 +654,16 @@ arg2\r
                         "rewriteAof 没有接上 StoreAccessor：导出不了任何东西，不许换掉现有的日志");
             }
             File tempFile = new File(aofFilePath + ".rewrite.tmp");
-            List<String[]> commands = exportMinimalCommandSet(accessor);
+            List<String[]> commands;
             synchronized (this) {
+                // 快照必须和"换文件"取同一把锁，早一寸就丢一笔已确认的写：追加那一步是在这把锁里
+                // 做的，所以一笔写只有两种落点 —— 排在快照之前（它的值必然已在表里，因为命令层先写
+                // 内存再记日志），或排在 rename 之后（它进的是新日志）。快照取在锁外，中间那一段时间里
+                // 客户端已经收到 +OK 的写就只落在旧 inode 上，rename 一盖就整份不见。
+                // 上游 fork 不出这一段，所以把差记进 aofRewriteBuffer（aof.c:636-641），并在 rename
+                // 之前并进新日志（:1680-1681 那句注释，调用点 :1692）；我们靠的是这把锁，代价就是
+                // 类注释里已经写明的那一句：重写期间写侧被堵住。
+                commands = exportMinimalCommandSet(accessor);
                 writeRecords(tempFile, commands);
                 closeLiveWriter();
                 boolean swapped = tempFile.renameTo(new File(aofFilePath));

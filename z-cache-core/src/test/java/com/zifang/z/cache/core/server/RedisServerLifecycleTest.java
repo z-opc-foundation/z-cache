@@ -2,6 +2,7 @@ package com.zifang.z.cache.core.server;
 
 import com.zifang.z.cache.core.command.CommandHandler;
 import com.zifang.z.cache.core.persistence.AofPersistence;
+import com.zifang.z.cache.core.persistence.MemoryStoreAccessor;
 import com.zifang.z.cache.core.stream.StreamStore;
 import org.junit.jupiter.api.Test;
 
@@ -2061,6 +2062,126 @@ class RedisServerLifecycleTest {
     }
 
     /**
+     * 一次重写<em>期间</em>被确认成功的写，不许被那份已经取完的快照换掉。
+     * <p>
+     * 上游没法原地把整份内存演一遍，于是它 fork：子进程写临时文件，父进程期间照常服务，并把这段
+     * 窗口里的每一笔 journaled 写<em>另外</em>记进一份增量缓冲 ——
+     * {@code aof.c:636-641}，注释原文 "we want to accumulate the differences between the child DB
+     * and the current one in a buffer, so that when the child process will do its work we can
+     * append the differences to the new append only file"；收尾时在 rename <em>之前</em>把它并进
+     * 新日志（{@code aof.c:1680-1681} "Flush the differences accumulated by the parent to the
+     * rewritten AOF"，调用点 {@code :1692}）。
+     * </p>
+     * <p>
+     * 我们不 fork，靠的是另一条承诺：{@link AofPersistence} 的注释写着"整段『导出 + 换文件 +
+     * 重开追加句柄』都在 {@code appendCommand} 用的那把锁里做 —— 期间的写命令排队，不会被夹在
+     * 中间丢掉"。这一支就是去量这句话兑没兑现：只有<em>客户端已经收到 {@code +OK}</em> 的那一笔
+     * 才算数，所以判据取"重启之后读不读得回来"与"日志里还有没有那一条"，都不是我们自己的记账。
+     * </p>
+     * <p>
+     * 窗口是<em>卡</em>出来的，不是睡出来的：导出逐库取字符串表必经
+     * {@code MemoryStoreAccessor.getAllStringEntries}（现读 {@code AofPersistence.java:709} 是
+     * 导出侧唯一读它的一行），在这里挂一道闸就能钉住"快照已取完、文件还没换"那一段。放行用的是
+     * <em>有界</em>等待：修好之后这道闸是在那把锁里跑的，主线程的 {@code SET} 进不来、也就轮不到
+     * 它去放行，只有超时能让两种设计都不互卡 —— 所以时间到而没有红，本身就是"写侧被堵住了"的读数。
+     * </p>
+     */
+    @Test
+    void writeAcknowledgedDuringRewriteSurvivesIt() throws Exception {
+        java.nio.file.Path dir = java.nio.file.Files.createTempDirectory("zcache-aof-window");
+        java.nio.file.Path aof = dir.resolve("appendonly.aof");
+        int p1 = freePort();
+        RedisServer gen1 = new RedisServer("127.0.0.1", p1, 0);
+        gen1.setDataDir(dir.toString());
+        Thread t1 = startAndWait(gen1, p1);
+        AofPersistence a = gen1.getAofPersistence();
+        assertNotNull(a, "前置条件: 这一台得真的起了 AOF，才谈得上窗口里的那一笔");
+
+        final java.util.concurrent.CountDownLatch snapshotTaken =
+                new java.util.concurrent.CountDownLatch(1);
+        final java.util.concurrent.CountDownLatch resume =
+                new java.util.concurrent.CountDownLatch(1);
+        final java.util.concurrent.atomic.AtomicBoolean gatedOnce =
+                new java.util.concurrent.atomic.AtomicBoolean(true);
+        // 只闸"取字符串表"这一处，其余读口原样交给父类 —— 多盖一个方法就等于把导出侧走了别的路径，
+        // 窗口成了凭空的假设。
+        a.setStoreAccessor(new MemoryStoreAccessor(gen1.getStore()) {
+            @Override
+            public Map<String, Object> getAllStringEntries(int db) {
+                Map<String, Object> snapshot = super.getAllStringEntries(db);
+                if (gatedOnce.compareAndSet(true, false)) {
+                    snapshotTaken.countDown();
+                    try {
+                        resume.await(300, java.util.concurrent.TimeUnit.MILLISECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+                return snapshot;
+            }
+        });
+
+        String lateReply = "(那一笔没走完)";
+        long lateWaitedMs = -1L;
+        try (Socket socket = connect(p1)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+            for (int i = 0; i < 3; i++) {
+                send(socket, "SET", "kept", "v1");
+                assertEquals("+OK", readReply(in), "前置条件: 窗口外的写要落得下去（第 " + (i + 1) + " 笔）");
+            }
+            send(socket, "BGREWRITEAOF");
+            String accepted = readReply(in);
+            assertTrue(!accepted.startsWith("-"), "前置条件: BGREWRITEAOF 得真的接下去，实际 " + accepted);
+            assertTrue(snapshotTaken.await(5, java.util.concurrent.TimeUnit.SECONDS),
+                    "前置条件: 导出那一步要能被卡住 —— 钉不住就没有\"快照取完而文件未换\"这段时间，"
+                            + "下面几格会一起变成空话");
+
+            long begin = System.nanoTime();
+            send(socket, "SET", "late", "v2");
+            lateReply = readReply(in);
+            lateWaitedMs = (System.nanoTime() - begin) / 1_000_000L;
+            resume.countDown();
+            awaitNotRewriting(a);
+        } finally {
+            resume.countDown();
+            gen1.stop();
+            t1.join(DEADLINE_MS);
+        }
+        java.nio.file.Files.deleteIfExists(dir.resolve("dump.rdb"));
+        java.util.List<String[]> records = readAof(aof);
+
+        int p2 = freePort();
+        RedisServer gen2 = new RedisServer("127.0.0.1", p2, 0);
+        gen2.setDataDir(dir.toString());
+        Thread t2 = startAndWait(gen2, p2);
+        Map<String, String> seen = new LinkedHashMap<>();
+        Map<String, String> wrong = new LinkedHashMap<>();
+        try (Socket socket = connect(p2)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+            expectTextCell(seen, wrong, "窗口里那一笔回的是 +OK（客户端已被告知成功）",
+                    lateReply, "+OK",
+                    "这一格是<em>前置</em>而不是判据：它回 +OK，\"确认过的写不见了\"才成立。"
+                            + "等它回了 " + lateWaitedMs + "ms");
+            expectTextCell(seen, wrong, "换过手 ⇒ 三笔同键在日志里塌成一条（这一趟真的重写过）",
+                    String.valueOf(countRecordsFor(records, "kept")), "1",
+                    "数的是盘上的记录而不是 aof_current_size 那两本账；三笔流水没塌 = 根本没换，"
+                            + "下面那格的\"没有\"就当不得数");
+            expectTextCell(seen, wrong, "窗口里确认过的那一笔，日志里必须还有一条",
+                    String.valueOf(countRecordsFor(records, "late")), "1",
+                    "上游把它记进 aofRewriteBuffer 并在 rename 前并进新日志（aof.c:640 / :1692）；"
+                            + "实际整份日志: " + renderRecords(records));
+            expectCell(seen, wrong, socket, in, "重启之后 GET kept", "v1", "GET", "kept");
+            expectCell(seen, wrong, socket, in, "重启之后 GET late（确认过的写不许失踪）",
+                    "v2", "GET", "late");
+        } finally {
+            gen2.stop();
+            t2.join(DEADLINE_MS);
+        }
+        assertTrue(wrong.isEmpty(), "重写窗口里那一笔的生死（导出快照不许把已确认的写换掉）: " + seen
+                + "；不合格: " + wrong + " [RED_CELLS=" + String.join("|", wrong.keySet()) + "]");
+    }
+
+    /**
      * 数一份 AOF 里有几条 {@code SET} 记录 —— 只按字节找 RESP 的定长头
      * （{@code $3\r\nSET\r\n}），不读我们自己的任何记账。
      */
@@ -2153,6 +2274,18 @@ class RedisServerLifecycleTest {
             }
         }
         return n;
+    }
+
+    /** 整份日志排成可读的一行 —— 红的时候要点名"那一条到底在不在"，数组的 toString 给不出这个。 */
+    private static String renderRecords(java.util.List<String[]> records) {
+        StringBuilder sb = new StringBuilder();
+        for (String[] record : records) {
+            if (sb.length() > 0) {
+                sb.append(", ");
+            }
+            sb.append(java.util.Arrays.toString(record));
+        }
+        return "[" + sb + "]";
     }
 
     @Test
