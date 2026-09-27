@@ -2402,6 +2402,95 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   那句文案，`:2186-2187` 归 `CONFIG REWRITE`。判据形状照老规矩：先红再修，越界拒不拒、拒的是谁家的文案，
   各成具名格；尺本身要挂变异验牙；行号一律现读。
 
+#### `CONFIG` 这条命令此前根本不存在：那两条旋钮从"只有 Java 侧 setter"接到线上（13n）
+
+- **来账**：13m 结尾"下一格"。13n 分三小格，①② 是命令层要用的那两把尺（`RedisMemoryFormat` =
+  上游 `util.c:197` 的 `memtoll`，`RedisGlob` = `util.c:48` 的 `stringmatch`），落在 `3459265`，
+  ①② 的验牙与判据记在那条提交信息里（复算：`python3 ~/.cache/zcache_gauges/grammar_mut/teeth.py`，
+  TRACKED 是 common 那四个文件、`EXPECT_TOTAL` 36+1=37，13 支变异全 `RED-OK`）；**它没进本表**，
+  这一节把 ①②③ 一起记账。③ 才是"接上线"：`CommandHandler` 里加 `case "CONFIG"`。
+- **先红（生产代码一个字没动）**：`mvn -o -B -pl z-cache-core test -Dtest=RedisConfigCommandTest`
+  → `Tests run: 3, Failures: 3`（日志 `~/.cache/zcache_gauges/grammar_mut/config_red_judge2.log`），
+  三段 `RED_CELLS` 去重后 **45 + 4 + 6 = 55 格**红（现读用 python 数，不手数）。红的原因不是行为不对，
+  是这条命令不在表上：每个入口回来的是 `-ERR unknown command`。
+  **在修之前，README 里"这两个旋钮可调"那句话就是一句宣传** —— 那一行原话写着"本服务未实现 CONFIG 命令"，
+  而 `AofPersistence` 上两个 setter 只有 Java 侧的自测在调。
+- **59 格，分三支 @Test**：`CONFIG 的线格式（45 格）` / `没有日志的那一台（4 格）` /
+  `CONFIG SET 真的接着自动挡（10 格）`。三个数都从 `seen.size()` 现取，不是写死的；每支一张
+  `LinkedHashMap` 一次断言（本表里立过的那条规矩，原文在"五种集合键第一次挂得上过期"那一节：
+  JUnit 见到第一条红就抛，同一方法里第 2—N 条判据全被第一条遮住）。
+  第三支不止答"SET 回了 +OK"，它把改过的旋钮真交给自动挡那一拍，量的是"四笔塌成一笔"的日志与
+  换过手之后 `GET` 读回来的值 —— 命令层与那一拍之间没有第二把尺能证明接上了。
+- **检查顺序本身是一格判据**：名字 → 文法 → 落点。所以"认不出的名字"在那台没日志的服务器上也还是
+  `Unsupported CONFIG parameter`，而不是先报"没有落点"。分派与文案分工照上游：比较用
+  `equalsIgnoreCase`（`config.c:877` 那串宏是 `strcasecmp`），报错里回的是**客户端打进来的那一串原样**
+  （`c->argv[1]->ptr` / `argv[2]->ptr`）—— 这两半不能共用一个字符串，于是 CH4/CH6 各自打死一次。
+- **与上游不同处三条，都写进了 `handleConfig` 的注释**：① 只有那两条旋钮有值可读，
+  `CONFIG GET maxmemory` 回 `*0`、`CONFIG SET maxmemory 100mb` 回上游"认不出的名字"那一档文案，
+  没有自造句子；② 没配 dataDir 的那一台**拒 SET 但照常答 GET**（上游那两个字段挂在 `server` 上永远存在，
+  我们的旋钮挂在 `AofPersistence` 上，而那个对象只在带 dataDir 启动时才有 —— 回 `+OK` 等于"当场收下、
+  下一刻没有落点"，与 `BGREWRITEAOF` 在同一位置的取舍一致）；③ `RESETSTAT` / `REWRITE` 不接，
+  回的正是 `networking.c:623-629` 那一句 —— 与只列 GET/SET 的 `CONFIG HELP` 是同一套说法，两处必须一起对得上。
+- **绿路上红了一次，红的是我这把尺**：`logs/config_green_1.log` `Failures: 1`，
+  格名 `换过手之后 GET 读得到最后那个值`（`RedisConfigCommandTest.java:326`）
+  —— 期望 `$401=` 实际 `$400=`：400 个 padding 字符我按 401 算。**服务器是对的**，改掉期望后
+  `config_green_2.log` 起 6 连绿（`config_rep_1..5.log` 各 `Tests run: 3, Failures: 0`）。
+- **验牙：21 支变异全死于自己点名的那一格，且没有一支多红**
+  （`~/.cache/zcache_gauges/grammar_mut/config_teeth.py`，TRACKED = `CommandHandler.java` +
+  `RedisConfigCommandTest.java`）。`PREFLIGHT OK 21 支 needle 各自唯一`，控制组 head1/head2/tail1/tail2
+  各 `OK total=3`，末行 `SUMMARY mutants=21 bad=0 control=OK`；21 行全 `RED-OK`，
+  `多红=0` 出现 21 次（现读 `grep -c '多红=0' logs/teeth_cfg.txt` → **21**）。
+  预期红集**不手写**：`TEETH_MEASURE=1` 量一轮落成 `config_expect.json`（21 臂、合计 79 格），
+  本轮量了两次（`logs/measure_cfg.txt` / `measure_cfg_b.txt`）⇒ 两份 expect **md5 逐字相同**
+  `45fc8b41a08c3e9362a6566a1f585a9d` —— 这是"中途没有别的进程污染字节"的独立凭据；必须先交代：
+  我先前用 `nohup` 后台起跑过一次，那一跑确实叠出了第二个 python 进程、日志被截成 0 字节，
+  所以我没信它的通知，改成前台独占重跑并做了这次对账。
+  几支说明牙长在哪（句子从 `logs/teeth_cfg.txt` 逐字复制）：
+  CH4 `子命令分派改成区分大小写（上游是 strcasecmp）` ⇒ 红 3 条、具名 20/20；
+  CH10 `percentage 用错了尺（拿 memtoll 量不带单位的那一栏）` 与 CH11 `min-size 用错了尺（拿整数尺量带单位的那一栏）`
+  ⇒ 两把尺各自的具名集 4/4 与 8/8，也就是"同一句话里两栏合法性不同"这一族被分别钉住；
+  CH16 `没有落点也照样回 +OK（收下而没人管）` 与 CH19 `被拒的 SET 嘴上拒了、旋钮还是动了`
+  ⇒ 差的正是差距 ② 那一档与它的反面；CH20 `HELP 里列进做不到的子命令（与 RESETSTAT 那格自相矛盾）`
+  ⇒ 拿 HELP 承诺一个当场落回语法错的子命令，这一格就是本轮补上的那条宣传纪律的牙齿。
+  `--selftest` 四臂拦针（needle 命中多次 / 不存在 / 还原对账 / 编译不过判 FATAL）：四行全 `OK`、
+  `rc=0`（现跑 `python3 config_teeth.py --selftest`，读数存档 `logs/selftest_cfg3.txt`）。
+  这一轮还意外多了一次复跑：我先误把开关当环境变量（`TEETH_SELFTEST=1`）传，那一跑走的仍是完整 21 支，
+  于是 `logs/selftest_cfg2.txt` 与 `logs/teeth_cfg.txt` 成了同副字节上的两跑 —— 除掉控制组日志名里的
+  时间戳，两份 27 行读数**逐字相同**（现读用 python 比对两文件）。
+- **顺带修掉一把会自己走瞎的尺**：全量 run1（`logs/full_13n_run1.log`）BUILD FAILURE，红在
+  `RedisServerProtocolSemanticsTest.batchWordingCountsAndPushxFollowTheReference:2983`，原文
+  `时刻在远未来时 TTL 要照它算（实测 2209587794 量级）: :2209498902 ==> expected: <true> but was: <false>`。
+  那一格钉的是 `EXPIREAT 4000000000` 之后的 `TTL`，而地板 `2_209_500_000` 是**抄当天一条真读数**写死的 ⇒
+  日子过下去服务器一个字没错，是尺自己走进来。归属也用字节对过而不是凭印象：
+  `git show 1f08c84:z-cache-core/src/test/java/com/zifang/z/cache/core/server/RedisServerProtocolSemanticsTest.java
+  | grep -c '2_209_500_000'` → **1**，那个数在本轮动手之前就已在 HEAD 上 ⇒ 既有量具缺陷，与 `CONFIG` 无关。
+  改成从同一口气里取的 `sentAtSec` 推出 `remaining` 再判 `(remaining-2, remaining]`，run2 BUILD SUCCESS。
+  这与 13l/13m 那条"会跳的读数不当验收线"是同一族：**钉绝对值的读数会随日历跳红**，区别是这一格跳得慢。
+- **基线 915 → 955**：`mvn -o -B clean test` BUILD SUCCESS（`Total time: 45.737 s`），
+  `python3 ~/.cache/zcache_gauges/tally_log.py ~/.cache/zcache_gauges/grammar_mut/logs/full_13n_run2.log`
+  → `MODULES=4 run=955 failures=0 errors=0 skipped=0`（`395 + 423 + 135 + 2`）。增量能逐笔对上账：
+  common 358 → 395 是 ①② 那两把尺的 36+1=37 例，core 420 → 423 是 ③ 这 3 个 @Test。**只有本机**，
+  250 自 13k 起一格未复算（至今 ssh 不通：banner 被 RST）。
+  一笔副作用：本轮为编译 core 跑过 `-am -Dmaven.test.skip=true install`，于是
+  `~/.m2/repository/io/github/yuku123/z-cache-common/1.3.6/z-cache-common-1.3.6.jar`（17:09:20）与
+  `.../z-cache-core/1.3.6/z-cache-core-1.3.6.jar`（17:17:36）是本机装的，别拿当发布件；基线命令仍是不 install 的 `clean test`。
+- **字节作废面（现读）**：本轮动了 `CommandHandler.java`（md5 `b9fe1d9403d155947b124eb0a0587ca0`）与
+  `RedisServerProtocolSemanticsTest.java`。`cd ~/.cache/zcache_gauges && /usr/bin/grep -rl 'CommandHandler\.java'
+  --include='*.py' .` 命中 11 份（`aof_rw_mut` / `aof_ttl_mut` / `bgrewriteaof_mut` / `info_aof_sizes_mut` /
+  `ttl_mut/{keyspace,sleep}` / 顶层 `code_mut` / `gate_mut` / `read_mut` / `sid_mut` 及本轮的 `config_teeth`），
+  `grep -rl 'RedisServerProtocolSemanticsTest\.java'` 命中 1 份（`ttl_mut/move_teeth.py`）⇒ 这批 13k／13m
+  时段的读数对这副字节作废：要么复跑，要么引用时注明量的是哪一副字节。`grammar_mut/teeth.py`（①② 那把）
+  TRACKED 里没这两份，不受影响。
+- **本轮闭的是五分之一**：13j 那一条把 `CONFIG` / `COMMAND` / `ACL` / `TIME` / `SWAPDB` 五个标签一起
+  记为"一个都没有"。现读 `cd z-cache-core/src/main/java/com/zifang/z/cache/core/command &&
+  for t in COMMAND ACL TIME SWAPDB CONFIG; do grep -c "case \"$t\"" CommandHandler.java; done`
+  → `0 / 0 / 0 / 0 / 1`，也就是那一串里只闭掉 `CONFIG`，其余四家照旧（`CONFIG REWRITE` /
+  `CONFIG RESETSTAT` 这两格算在 `CONFIG` 家里，也照旧，见上面差距 ③）。
+- **下一格**：① 卡 #32 —— 让配置持有者永远存在，把差距 ② 消掉。判据已写在卡上：同一台无日志服务器
+  `CONFIG SET auto-aof-rewrite-percentage 5` 要 `+OK` 且 `GET` 读回 5，现在那 4 格（`aServerWithoutALogAnswersGetButRefusesSet`）
+  当场故意翻面 —— 翻面必须是**改判据那一次**发生的，不许悄悄重定义；② 250 恢复后补跑
+  `RedisMemoryFormatTest` / `RedisGlobTest` / `RedisConfigCommandTest` 对参考实例的期望（三支测试的类注释里都记着这一笔）。
+
 ### Added
 - `RedisServer.serverScope()`：只读拿到本台那一份，测试与嵌入式据此判断作用域边界。
 - `StreamIdFormat`（z-cache-common）：stream ID 的唯一文法（uint64 两段、`-` / `+` 两种位置、
