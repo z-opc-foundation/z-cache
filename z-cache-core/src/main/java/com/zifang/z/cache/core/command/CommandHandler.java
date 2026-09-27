@@ -2014,6 +2014,25 @@ public class CommandHandler {
             sb.append("max_entries:").append(store.getMaxEntries()).append("\r\n");
             sb.append("\r\n");
         }
+        if (sec == null || "PERSISTENCE".equals(sec)) {
+            // 上游这一段从 "# Persistence\r\n"（server.c:3358）起，AOF 那几个数各由一处真实状态喂：
+            // aof_enabled ← server.aof_state != AOF_OFF（声明 :3367、取值 :3383），
+            // aof_rewrite_in_progress ← server.aof_child_pid != -1（:3368 / :3384），而
+            // aof_current_size 与 aof_base_size 整个在 if (server.aof_state != AOF_OFF) 里
+            // （:3394 那道闸，字段 :3396-3397，取值 :3403-3404）。闸要跟着一起搬：给一台没起 AOF 的
+            // 服务器报 aof_current_size:0，等于说"日志存在，只是空的"。
+            // 这一段还不带的 rdb_* 一族与 *_cow_size 为什么不带，记在 CHANGELOG 13j。
+            AofPersistence a = aof();
+            boolean aofOn = a != null && a.isStarted();
+            sb.append("# Persistence\r\n");
+            sb.append("aof_enabled:").append(aofOn ? 1 : 0).append("\r\n");
+            sb.append("aof_rewrite_in_progress:").append(a != null && a.isRewriting() ? 1 : 0).append("\r\n");
+            if (aofOn) {
+                sb.append("aof_current_size:").append(a.getAofCurrentSize()).append("\r\n");
+                sb.append("aof_base_size:").append(a.getAofBaseSize()).append("\r\n");
+            }
+            sb.append("\r\n");
+        }
         if (sec == null || "STATS".equals(sec)) {
             sb.append("# Stats\r\n");
             sb.append("total_connections_received:").append(store.getTotalConnections()).append("\r\n");

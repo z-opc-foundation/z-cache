@@ -210,7 +210,7 @@ redis-cli -h localhost -p 16379 SLOWLOG GET 10
 | **📡 Pub/Sub** | PUBLISH / SUBSCRIBE / UNSUBSCRIBE / PSUBSCRIBE / PUNSUBSCRIBE / PUBSUB | ✅ 确认包的第 3 个数从 1.3.5 起是"这条连接的频道数+模式数"（此前每条命令各自从 1 数，客户端据此记账会错位） |
 | **📋 Stream** | XADD / XREAD / XREADGROUP / XACK / XPENDING / XGROUP / XINFO | ✅ `XINFO CONSUMERS` 1.3.5 起才有实现（此前只有注释里没有 case）；XCLAIM 🚧 未实现；`XPENDING` 只有汇总形态，明细形式（`IDLE`/`start end count`）明确报错 |
 | **💾 持久化** | SAVE / BGSAVE / LASTSAVE / BGREWRITEAOF | ✅ 1.3.4 起才真正落盘（此前三条命令只回一个写死的成功回复）；1.3.6 起这三板的作用域是"本台服务器"，同 JVM 里再起一台不带 `--data-dir` 的不会把这台关掉；1.3.6 起 `rewriteAof()` 导出的是当前状态（不再是空日志），13i 起 `BGREWRITEAOF` 真的能触发它（答复三支照上游 `aof.c:1629-1640`，另有一格"没配 dataDir 就如实拒绝"）；体积自动重写 🚧 仍未实现 |
-| **📊 运维** | INFO / MONITOR / DEBUG / CLIENT / SLOWLOG | ✅ `CLIENT LIST` 从 1.3.5 起列出本机全部连接且 `sub=`/`psub=` 是真值（此前只有发起者一行、两个数写死 0）、`CLIENT KILL` 真关连接、新增 `CLIENT INFO`；SLOWLOG 1.3.5 才接上真实服务器（此前恒回 not configured） |
+| **📊 运维** | INFO / MONITOR / DEBUG / CLIENT / SLOWLOG | ✅ `CLIENT LIST` 从 1.3.5 起列出本机全部连接且 `sub=`/`psub=` 是真值（此前只有发起者一行、两个数写死 0）、`CLIENT KILL` 真关连接、新增 `CLIENT INFO`；SLOWLOG 1.3.5 才接上真实服务器（此前恒回 not configured）；`INFO` 从 13j 起有 `# Persistence` 段 —— `aof_enabled` / `aof_rewrite_in_progress` / `aof_current_size` / `aof_base_size` 四个数都出自真实状态，两个大小逐寸对得上盘上那份日志的真实字节数（此前整段一个字段都没有），上游同段的 `rdb_*` / `aof_last_bgrewrite_status` / `*_cow_size` 🚧 还没有对应状态可报 |
 | **事务** | MULTI / EXEC / DISCARD / WATCH / UNWATCH | ✅ 1.3.5 修掉 WATCH 的两处失效：复查用的版本尺恒返回 0（该中止的中止不了），且 EXEC/DISCARD 不清 WATCH（上一条事务的观察键会永久挂着，把后来的事务无端打掉） |
 | **Pipeline** | 客户端 SDK 自动支持 | ✅ |
 | **Lua** | EVAL / EVALSHA / SCRIPT | 🚧 **未实现**（`src/main` 里三条命令零处理，回 `ERR unknown command`；本表此前标的是 ✅） |

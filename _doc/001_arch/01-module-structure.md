@@ -53,7 +53,12 @@ z-cache 是一个基于 Java 实现的高性能内存键值存储系统，设计
 - **类型操作**: `TYPE`, `OBJECT`, `ENCODING`
 - **数据库操作**: `SELECT`, `SWAPDB`, `MOVE`, `FLUSHDB`, `FLUSHALL`, `DBSIZE`
 - **事务操作**: `MULTI`, `EXEC`, `DISCARD`, `WATCH`, `UNWATCH`
-- **服务器信息**: `INFO`, `CONFIG`, `CLIENT`, `SLOWLOG`, `MONITOR`, `TIME`, `ECHO`, `PING`, `QUIT`, `COMMAND`, `ACL`
+- **服务器信息**: `INFO`, `CLIENT`, `SLOWLOG`, `MONITOR`, `ECHO`, `PING`, `QUIT`
+  （同一把尺现读：`CommandHandler` 的 case 表里 `CONFIG` / `COMMAND` / `ACL` / `TIME` / `SWAPDB`
+  **0 命中**，阳性对照 `INFO` / `SLOWLOG` / `BGREWRITEAOF` 同一次量具 5 命中 —— 也就是这四个不是
+  "名字没搜到"而是真的没有入口。`CONFIG` 那一格不只是少一条命令：`auto-aof-rewrite-percentage` /
+  `auto-aof-rewrite-min-size` 这类可调项在网线上既设不了也查不到，按体积触发的自动重写因此还没有
+  能装上它的地方，见 CHANGELOG 13i / 13j。）
 - **Lua脚本**: `EVAL`, `EVALSHA`, `SCRIPT`, `FUNCTION`
 - **集群命令**: `CLUSTER`, `READONLY`, `READWRITE`, `ASKING`, `MIGRATE`, `RESTORE`, `DUMP`
 - **发布订阅**: `SUBSCRIBE`, `UNSUBSCRIBE`, `PUBLISH`, `PSUBSCRIBE`, `PUNSUBSCRIBE`, `PUBSUB`

@@ -1614,6 +1614,220 @@ class RedisServerLifecycleTest {
                 + "；不合格: " + wrong + " [RED_CELLS=" + String.join("|", wrong.keySet()) + "]");
     }
 
+    /**
+     * 13j：{@code INFO} 的 {@code # Persistence} 段里那几个 AOF 数，必须量得出盘上真实的字节数。
+     * <p>
+     * 上游同段从 {@code server.c:3358} 的 {@code "# Persistence\\r\\n"} 起：{@code aof_enabled} 由
+     * {@code server.aof_state != AOF_OFF} 喂（{@code :3367} 声明、{@code :3383} 取值），
+     * {@code aof_rewrite_in_progress} 由 {@code server.aof_child_pid != -1} 喂（{@code :3368} / {@code :3384}），
+     * 而 {@code aof_current_size} 与 {@code aof_base_size} 只在 AOF 开着时才出现
+     * （{@code :3394} 的 {@code if (server.aof_state != AOF_OFF)}，字段 {@code :3396-3397}，
+     * 取值 {@code :3403-3404}）。这两个数的写入点是这一格的要害：
+     * <ul>
+     *   <li>{@code aof_current_size} 每次写完自增（{@code aof.c:466}、{@code :480}），换过文件之后
+     *       按 stat <em>重取</em>而不是接着加 —— {@code aofUpdateCurrentSize}（{@code aof.c:1653-1665}，
+     *       注释原文 "normally the size is updated just adding the write length"），调用点在载入收尾
+     *       （{@code :865}）与重写收尾（{@code :1772}）。</li>
+     *   <li>{@code aof_rewrite_base_size} 是"接手时或上次重写后的底座"（{@code server.h:1079}），
+     *       全上游只有三处赋值：初值 0（{@code server.c:1594}）、载入收尾（{@code aof.c:866}）、
+     *       重写收尾（{@code aof.c:1773}）；它<em>不跟着写命令涨</em>，因为它是自动重写算增幅的分母
+     *       （{@code server.c:1308-1310}）。</li>
+     * </ul>
+     * 判据按这四个数各自"该等于什么"来问，而不是"字段在不在"：当前大小对磁盘真实长度、底座对
+     * 接手那一刻的长度、重写前后各一站。缺的字段也照实在 {@code CHANGELOG} 里点名（{@code loading}
+     * 一族、{@code aof_rewrite_scheduled}、{@code aof_last_bgrewrite_status}、{@code *_cow_size} ——
+     * 前三个我们<em>没有那台机器</em>，后两个没有 fork 就没有可报的量），先把有尺的四个钉住。
+     */
+    @Test
+    void infoReportsTheRealAofSizes() throws Exception {
+        java.nio.file.Path dir = java.nio.file.Files.createTempDirectory("zcache-info-aof-sizes");
+        java.nio.file.Path aof = dir.resolve("appendonly.aof");
+        int p1 = freePort();
+        RedisServer gen1 = new RedisServer("127.0.0.1", p1, 0);
+        gen1.setDataDir(dir.toString());
+        Thread t1 = startAndWait(gen1, p1);
+        Map<String, String> seen = new LinkedHashMap<>();
+        Map<String, String> wrong = new LinkedHashMap<>();
+        String rewriteWait = "";
+        long sizeAtStart;
+        long sizeAfterRewrite;
+        try (Socket socket = connect(p1)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+
+            // 接手那一刻：日志还没被写过，三个数（盘上长度、current、base）只能是同一个数。
+            sizeAtStart = java.nio.file.Files.size(aof);
+            String atStart = persistenceSection(socket, in);
+            expectTextCell(seen, wrong, "段头", firstInfoLine(atStart), "# Persistence",
+                    "上游同段以 \"# Persistence\\r\\n\" 起头（server.c:3358），实际整段的第一行见读数");
+            expectTextCell(seen, wrong, "aof_enabled", infoField(atStart, "aof_enabled"), "1",
+                    "这一台配了 dataDir，AOF 真开着（上游 :3383 判的就是 aof_state != AOF_OFF）");
+            expectTextCell(seen, wrong, "接手时 current 等于盘上长度",
+                    infoField(atStart, "aof_current_size"), String.valueOf(sizeAtStart),
+                    "aof.c:466/:480 那两次自增的每一寸都该在这里");
+            expectTextCell(seen, wrong, "接手时 base 等于同一份长度",
+                    infoField(atStart, "aof_base_size"), String.valueOf(sizeAtStart),
+                    "aof.c:866 载入收尾把底座对齐到接手时的大小");
+            expectTextCell(seen, wrong, "没人重写时 in_progress 为 0",
+                    infoField(atStart, "aof_rewrite_in_progress"), "0",
+                    "上游喂的是 aof_child_pid != -1（:3384）；我们只有 rewriting 那一个标志");
+
+            send(socket, "SET", "k", "v1");
+            assertEquals("+OK", readReply(in));
+            send(socket, "SETEX", "k", "3600", "v2");
+            assertEquals("+OK", readReply(in));
+            send(socket, "SELECT", "3");
+            assertEquals("+OK", readReply(in));
+            send(socket, "SET", "k3", "v3db");
+            assertEquals("+OK", readReply(in));
+            send(socket, "SELECT", "0");
+            assertEquals("+OK", readReply(in));
+
+            long sizeAfterWrites = java.nio.file.Files.size(aof);
+            String afterWrites = persistenceSection(socket, in);
+            expectTextCell(seen, wrong, "写了几笔之后 current 等于盘上长度",
+                    infoField(afterWrites, "aof_current_size"), String.valueOf(sizeAfterWrites),
+                    "这一格是下面两格的阳性对照：写侧涨的时候 current 得跟着涨");
+            expectTextCell(seen, wrong, "写了几笔之后 base 还停在接手时",
+                    infoField(afterWrites, "aof_base_size"), String.valueOf(sizeAtStart),
+                    "底座只有载入与重写两处会动（aof.c:866/:1773）；它跟着写命令涨，自动重写算出来的增幅就是 0");
+
+            AofPersistence aofHandle = gen1.getAofPersistence();
+            assertNotNull(aofHandle, "前置条件: 这一台得真的起了 AOF，才谈得上重写");
+            send(socket, "BGREWRITEAOF");
+            assertEquals("+Background append only file rewriting started", readReply(in),
+                    "前置条件: 这一格借 13i 那台机器发起重写，它得先受理");
+            // 等的是"重写那一份跑完了"这一因 —— 拿 rewriting 标志的归还当信号（13i 钉过它只有一个
+            // 归还点，还的时候文件已经换完）。这里<em>不能</em>等自己正在审的那个字段：让被审的渲染
+            // 决定"什么时候才开始审它"，一硬编码成 0 就一等就中，后面的 base/current 全在读一份
+            // 还没换完的日志 —— 量具 S6 实测就是这么把重写那两站绕过去的。
+            long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
+            while (aofHandle.isRewriting() && System.nanoTime() < deadline) {
+                Thread.sleep(5);
+            }
+            if (aofHandle.isRewriting()) {
+                rewriteWait = "等 rewriting 标志归还超时，重写没跑完；";
+            }
+            String afterRewrite = persistenceSection(socket, in);
+            sizeAfterRewrite = java.nio.file.Files.size(aof);
+            expectTextCell(seen, wrong, "重写收尾后 in_progress 归零",
+                    infoField(afterRewrite, "aof_rewrite_in_progress"), "0",
+                    "标志还了而字段还在报 1 = 渲染没跟着状态走；" + rewriteWait);
+            expectTextCell(seen, wrong, "重写之后 current 等于新日志长度",
+                    infoField(afterRewrite, "aof_current_size"), String.valueOf(sizeAfterRewrite),
+                    "重写收尾按 stat 重取（aof.c:1653 的 aofUpdateCurrentSize，调用点 :1772）而不是接着往旧数上加 —— "
+                            + "旧日志的三笔流水已经不在新文件里，加出来的数比真实文件大一截");
+            expectTextCell(seen, wrong, "重写之后 base 挪到新日志大小",
+                    infoField(afterRewrite, "aof_base_size"), String.valueOf(sizeAfterRewrite),
+                    "aof.c:1773 就在 aofUpdateCurrentSize 下一行：新的一份就是新的起点，"
+                            + "不然下一次自动重写拿旧底座算，一算就是几百个百分点");
+
+            send(socket, "SET", "k4", "v4");
+            assertEquals("+OK", readReply(in), "前置条件: 换过文件之后追加句柄得还接得上");
+            long sizeAfterMore = java.nio.file.Files.size(aof);
+            String afterMore = persistenceSection(socket, in);
+            expectTextCell(seen, wrong, "再写一笔 current 跟上新长度",
+                    infoField(afterMore, "aof_current_size"), String.valueOf(sizeAfterMore),
+                    "重写之后写侧还在动，current 必须继续跟着盘上走");
+            expectTextCell(seen, wrong, "再写一笔 base 不跟着涨",
+                    infoField(afterMore, "aof_base_size"), String.valueOf(sizeAfterRewrite),
+                    "底座只在载入/重写两处动，写命令不算它");
+
+            // 攥住重写那把锁：排进线程池的那一份进不来，标志就一直该是 1。
+            // 锁内只发不碰这把锁的命令（BGREWRITEAOF 只抢 CAS、INFO 只读字段）。
+            String insideLock;
+            synchronized (aofHandle) {
+                send(socket, "BGREWRITEAOF");
+                String accepted = readReply(in);
+                assertEquals("+Background append only file rewriting started", accepted,
+                        "前置条件: 锁内第一问要受理，才有\"正在重写\"这回事；实际 " + accepted);
+                insideLock = persistenceSection(socket, in);
+            }
+            expectTextCell(seen, wrong, "重写进行中 in_progress 为 1",
+                    infoField(insideLock, "aof_rewrite_in_progress"), "1",
+                    "上游喂 aof_child_pid != -1（:3384）；我们那份对应的是 rewriting 标志（13i 钉过它在入队之前抢）");
+
+            // 放开锁之后那份排着的重写要跑完才谈得上"重开一代"：它在收尾时会整个换掉文件，
+            // 下面的 station 读的就是换完之后的长度。等的还是标志归还，不是自己审的那个字段。
+            long drainDeadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
+            while (aofHandle.isRewriting() && System.nanoTime() < drainDeadline) {
+                Thread.sleep(5);
+            }
+            if (aofHandle.isRewriting()) {
+                rewriteWait = "锁放开后排着的那份重写没跑完；";
+            }
+        } finally {
+            gen1.stop();
+            t1.join(DEADLINE_MS);
+        }
+
+        // 重开一代：日志早就不再是空的了，接手那一刻 current 与 base 只能一起等于盘上那份的真实长度
+        //（上游 aof.c:865 现 stat、:866 紧接着把 aof_rewrite_base_size 对齐过去）。少了 :866 那一行，
+        // 底座停在 0，下一次自动重写拿 1 当分母（server.c:1308-1309 那个三元），一重启就立刻重写。
+        int p2 = freePort();
+        RedisServer gen2 = new RedisServer("127.0.0.1", p2, 0);
+        gen2.setDataDir(dir.toString());
+        Thread t2 = startAndWait(gen2, p2);
+        long sizeOnReload = java.nio.file.Files.size(aof);
+        try (Socket socket = connect(p2)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+            String onReload = persistenceSection(socket, in);
+            expectTextCell(seen, wrong, "重开一代 current 等于盘上长度",
+                    infoField(onReload, "aof_current_size"), String.valueOf(sizeOnReload),
+                    "这一台是接手一份有内容的日志，不是从零开始；" + rewriteWait);
+            expectTextCell(seen, wrong, "重开一代 base 等于同一份长度",
+                    infoField(onReload, "aof_base_size"), String.valueOf(sizeOnReload),
+                    "aof.c:866 就在载入收尾那两句里；不摆底座就等于把上一次的重写当成从没发生");
+        } finally {
+            gen2.stop();
+            t2.join(DEADLINE_MS);
+        }
+
+        // 没配 dataDir 的那一台：AOF 没开，这一族字段在上游是整块不出现的。
+        int p3 = freePort();
+        RedisServer bare = new RedisServer("127.0.0.1", p3, 0);
+        Thread t3 = startAndWait(bare, p3);
+        try (Socket socket = connect(p3)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+            String body = persistenceSection(socket, in);
+            expectTextCell(seen, wrong, "没起 AOF 时 aof_enabled 为 0",
+                    infoField(body, "aof_enabled"), "0",
+                    "上面\"aof_enabled\"那一格是这一格的阳性对照：同一个字段名在开着的那一台读到 1");
+            expectTextCell(seen, wrong, "没起 AOF 时不报 current 长度",
+                    infoField(body, "aof_current_size"), "(这一行没有)",
+                    "上游那一块整个在 if (server.aof_state != AOF_OFF) 里（server.c:3394）；"
+                            + "报一个 0 就等于说\"有日志，只是空的\"");
+        } finally {
+            bare.stop();
+            t3.join(DEADLINE_MS);
+        }
+        assertTrue(wrong.isEmpty(), "INFO 的 Persistence 段要量得出盘上真实的 AOF 大小，逐格: " + seen
+                + "；不合格: " + wrong + " [RED_CELLS=" + String.join("|", wrong.keySet()) + "]");
+    }
+
+    /** 问一次 {@code INFO persistence}，整段原样交回（已经剥掉 RESP 头）。 */
+    private static String persistenceSection(Socket socket, DataInputStream in) throws IOException {
+        send(socket, "INFO", "persistence");
+        return readReply(in);
+    }
+
+    /** 段体的第一行 —— 只用来判段头那一句。 */
+    private static String firstInfoLine(String body) {
+        return body.isEmpty() ? "(整段没有)" : body.split("\r\n")[0];
+    }
+
+    /**
+     * 从 INFO 段体里取一个字段。行不存在时交回 {@code "(这一行没有)"} —— 否定式判据要分得开
+     * "这行没有"与"这行的值是空串"，否则上游那个 {@code if (aof_state != AOF_OFF)} 的闸门坏了也量不出来。
+     */
+    private static String infoField(String body, String name) {
+        for (String line : body.split("\r\n")) {
+            if (line.startsWith(name + ":")) {
+                return line.substring(name.length() + 1);
+            }
+        }
+        return "(这一行没有)";
+    }
+
     /** 只读磁盘上的日志，逐条交回命令数组。用一份新实例读，不碰在跑的那一台的句柄。 */
     private static java.util.List<String[]> readAof(java.nio.file.Path aof) throws IOException {
         java.util.List<String[]> records = new java.util.ArrayList<>();

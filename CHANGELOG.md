@@ -2014,6 +2014,13 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
       同步腿 `rewriteAof` 在这一跑的 14 格里没有专属格子（13g/13e 那几格量的是它的导出与拒绝）。
 - **两份旧量具据本格的测试字节各重跑一遍**（测试文件被三份量具共同 TRACKED，改一寸就得三处复验）：
   `rdb_stream_mut/teeth_run4.txt` 与 `stream_rw_mut/teeth_run8.txt` 都是 `bad=0`。
+  ⇒ 13j 又动了这张判据表与 `AofPersistence` / `CommandHandler`，按同一条规矩三族一起复验，
+  三份新读数（字节均为判据表 `92e1b715…` / `AofPersistence` `42658e48…` / `CommandHandler` `98216322…`）：
+  `bgrewriteaof_mut/teeth_run_13j.txt` = `CONTROL → OK` + `SUMMARY mutants=6 bad=0`（红集仍是
+  B1 2 / B2 1 / B3 1 / B4 2 / B5 3），`rdb_stream_mut/teeth_run_13j.txt` = `mutants=8 bad=0`
+  （R1 14 / R2 4 / R3 2 / R4 1 / R6 14 / R7 4 / R8 3），`stream_rw_mut/teeth_run_13j.txt`
+  = `mutants=9 bad=0`（M1 20 / M2 5 / M3 3 / M4 2 / M5 7 / M6 2 / M7 1 / M8 3）—— 三族与 13j 新装的那族
+  在这一版字节上全绿，没有互相踩坏。
 - **仍然没接上的（下一格）**：按体积触发的那一台 —— `auto-aof-rewrite-percentage` /
   `auto-aof-rewrite-min-size`（上游默认 100 与 64mb，`server.h:98-99`，`CONFIG GET` 里
   `config.c:1361 / :1363`）两项配置在 `CONFIG` 里查不到，也没有后台调度方在量日志体积。
@@ -2021,6 +2028,77 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
 - **基线 907 → `908`**（`358 + 413 + 135 + 2`，core 412 → 413 是本格新增的那 1 个 `@Test`；
   `mvn -o -B clean test` rc=0 / BUILD SUCCESS，日志
   `~/.cache/zcache_gauges/logs/full_13i_run2.txt`）。
+- 250 那一侧仍然 ssh 不通：本轮全部读数**只有单机**。
+
+#### 自动重写要先有分子与分母：`INFO` 里那两个 AOF 大小此前一个字都没有（13j）
+
+- **来账**：13i 把"下一格"记成自动挡（`auto-aof-rewrite-percentage` / `auto-aof-rewrite-min-size`）。
+  动手前先读上游那一台机器：`server.c:1305-1312` 算的是
+  `base = aof_rewrite_base_size ? : 1`、`growth = aof_current_size*100/base - 100` —— 分子分母两个数
+  我们只有分子的一半（`appendedBytes` 有记账，但没有任何出口读得到它），分母**整个概念都不存在**；
+  而上游把这两个数交出去看的那张嘴（`INFO` 的 `# Persistence` 段）在本仓**一个字段都没有**：
+  `handleInfo` 只有 Server / Clients / Memory / Stats / Keyspace / Replication 六段。
+  所以本格先装"看得见的大小"，自动挡留到下一格。
+- **上游权威**（本轮现 grep `~/.cache/zcache_gauges/full5x/redis-5.0.14/src`，行号为那一跑所读）：
+  段头 `"# Persistence\r\n"` `server.c:3358`；`aof_enabled:%d` 声明 `:3367`、取值
+  `server.aof_state != AOF_OFF` `:3383`；`aof_rewrite_in_progress:%d` 声明 `:3368`、取值
+  `server.aof_child_pid != -1` `:3384`；`aof_current_size` / `aof_base_size` 声明 `:3396-3397`、
+  取值 `:3403-3404`，而这两行整个在 `if (server.aof_state != AOF_OFF)`（`:3394`）里面。
+  两个字段的写入点更要紧：`aof_current_size`（`server.h:1080`）随每次写完自增（`aof.c:466`、`:480`），
+  **换过一份之后是按 stat 重取而不是接着加** —— `aofUpdateCurrentSize`（`aof.c:1653-1665`，注释原文
+  "normally the size is updated just adding the write length"）的调用点在载入收尾 `:865` 与重写收尾
+  `:1772`；`aof_rewrite_base_size`（`server.h:1079`，"AOF size on latest startup or rewrite"）全上游
+  只有三处赋值：初值 0（`server.c:1594`）、载入收尾 `aof.c:866`、重写收尾 `aof.c:1773`，后两处都紧跟
+  在 `aofUpdateCurrentSize()` 的下一行。写命令不算它 —— 它是上面那个增幅的**分母**。
+- **改动前的形状**（生产侧就是 `30ac37a` 那份字节 `697c5eca…` / `769b9bfa…`，工作区只加判据；日志
+  `~/.cache/zcache_gauges/info_aof_sizes_mut/logs/prefix_head_bytes.txt`）：`Tests run: 1, Failures: 1`，
+  全表 17 格里**红 16 格**，每一格的读数都是 `(这一行没有)`。唯一改前就绿的那格是否定式的
+  "没起 AOF 时不报 current 长度" —— 整段不存在时它必然成立，所以它的牙不在这里，在 S5 那一支。
+  同一跑里 `Files.size` 量到的盘上真实长度是 `0 → 179 → 151 → 203 → 180`（接手 → 写四笔 →
+  重写之后 → 再写一笔 → 重开一代），也就是**被量的那台机器早就在正确地换文件**，缺的只是把它报出去。
+- **改了什么**：`AofPersistence` 新增 `rewriteBaseBytes` 字段与 `getAofCurrentSize()` /
+  `getAofBaseSize()` 两个出口；写入点跟上游一一对应 —— `start()` 接手一份已有日志时把底座对齐到
+  `file.length()`（上游 `aof.c:865` + `:866`），`rewriteInternal()` 换完文件后
+  `appendedBytes = new File(path).length()` 之后紧跟 `rewriteBaseBytes = appendedBytes`
+  （上游 `:1772` + `:1773`）。`CommandHandler.handleInfo` 新增 `# Persistence` 段：`aof_enabled` 由
+  `aof() != null && isStarted()` 喂，`aof_rewrite_in_progress` 由 `isRewriting()` 喂，两个大小放在
+  `if (aofOn)` 里面（对应上游 `:3394` 那道闸）。
+- **判据**：`RedisServerLifecycleTest#infoReportsTheRealAofSizes`，一张表 **17 格**跑一次断言一次，
+  五个站点：接手那一刻 → 写四笔之后 → `BGREWRITEAOF` 之后 → 再写一笔 → 重开一代，末尾再来一台
+  没配 `dataDir` 的。每个数都跟**同一次量具运行里** `Files.size` 量到的盘上长度对，不是跟另一个
+  Java 字段对（`getAofCurrentSize()` 交回的是记账值 —— 上游也是这么办的，判据要独立才量得出记账错）。
+- **量具抓出了判据自己的一个缺陷**（这条最值得记）：重写那一站的"跑完了"原先是等
+  `aof_rewrite_in_progress` 归零 —— 也就是**等正在被审的那个字段**。S6（把该字段硬编码成 0）在
+  run1 里因此红了 4 格：一等即中，接下来读的是还没换完的日志，base/current 全对不上，红的是时序
+  而不是渲染。改成等 `rewriting` 标志归还（13i 钉过它只有一个归还点，还的时候文件已经换完）之后，
+  S6 只剩"重写进行中 in_progress 为 1"这一格 —— 那才是"渲染没跟着状态走"这一种坏法。
+- **有牙量具**：`~/.cache/zcache_gauges/info_aof_sizes_mut/teeth.py`（TRACKED = 这张判据表 +
+  `AofPersistence` + `CommandHandler`），`teeth_run3.txt` = `CONTROL 未变异 → OK` /
+  `SUMMARY mutants=8 bad=0`，七张红集两两不同：S1 追加不记账 `{写了几笔之后 current, 再写一笔 current}`、
+  S2 重写收尾接着加 `{重写之后 current, 重写之后 base, 再写一笔 current, 再写一笔 base}`、
+  S3 底座跟着每笔写涨 `{写了几笔之后 base, 再写一笔 base}`、S4 载入不摆底座 `{重开一代 base}`、
+  S5 丢掉那道闸 `{没起 AOF 时不报 current 长度}`、S6 in_progress 硬编码 `{重写进行中 in_progress 为 1}`、
+  S7 重写收尾不挪底座 `{重写之后 base, 再写一笔 base}`。两支不注入、只记码：
+  "把 `aof_enabled` 写成只看对象在不在"在这一族上量不出来（没配 `dataDir` 时 `aof()` 就是 `null`，
+  两种写法都回 0）；"`aof_base_size` 报成 current 的值"与 S3 落在同一张红集上 —— 重写收尾那一刻
+  base 与 current 本来就相等，判据结构上分不开"字段串位"与"写侧多写一次"。
+- **这一段还不带的上游字段**（各有各的欠账，不硬凑）：`loading` 与 `rdb_*` 一族（RDB 侧的
+  `lastsave` / bgsave 状态位我们没有）、`aof_rewrite_scheduled`（不 fork 就没有"排到下一轮"这一支，
+  13i 答的是 `-ERR already in progress`）、`aof_last_bgrewrite_status` / `aof_last_rewrite_time_sec` /
+  `*_cow_size`（重写失败目前只进 `LOGGER`，没有状态位可报）。另外 `INFO <未知段名>` 本仓回空串而
+  上游回错误，那是另一格。顺带量到 README「监控集成」那一节（约 299-305 行）广告出去的
+  `instantaneous_ops_per_sec` / `maxmemory` / `cluster_state` 三个名字在 `handleInfo` 里 0 命中
+  （同尺阳性对照 `blocked_clients` 1 命中；`CLUSTER` 也 0 命中），而 Memory 段报的是 `max_memory`
+  —— 那是另一格，已单独登记，不混进本节。
+- **仍然没接上的（下一格）**：自动挡本身 —— `auto-aof-rewrite-percentage` / `auto-aof-rewrite-min-size`
+  （默认 100 与 64mb，`server.h:98-99`；解析 `config.c:501` / `:509`；`CONFIG SET` 运行时口
+  `config.c:1161` / `:1263`；`CONFIG GET` `:1362` / `:1364`）—— 本仓根本没有 `CONFIG` 命令
+  （现读 `CommandHandler` 的 case 表：`CONFIG` / `COMMAND` / `ACL` / `TIME` / `SWAPDB` 各 0 命中，
+  阳性对照同一次量具 `INFO` / `SLOWLOG` / `BGREWRITEAOF` 5 命中），也没有后台调度方去算
+  `server.c:1305-1312` 那个增幅。13j 供上的是它的**分子与分母**，也就是那一格的两条腿。
+- **基线 908 → `909`**（`358 + 414 + 135 + 2`，core 413 → 414 就是本格新增的那 1 个 `@Test`；
+  `mvn -o -B clean test` BUILD SUCCESS，日志 `~/.cache/zcache_gauges/logs/full_13j_run1.txt`，
+  分模块读数由 `tally_log.py` 现算：`MODULES=4 run=909 failures=0 errors=0 skipped=0`）。
 - 250 那一侧仍然 ssh 不通：本轮全部读数**只有单机**。
 
 ### Added

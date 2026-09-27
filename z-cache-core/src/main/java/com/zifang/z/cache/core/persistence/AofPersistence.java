@@ -106,9 +106,31 @@ public class AofPersistence {
     private volatile FileOutputStream liveStream;
 
     /**
-     * 累计写进日志的字节数 —— 对应上游的 {@code server.aof_current_size}。
+     * 累计写进日志的字节数 —— 对应上游的 {@code server.aof_current_size}（{@code server.h:1080}，
+     * 注释原文 "AOF current size"）。
+     * <p>
+     * 上游有两个写入点，这一格两半都要同形：追加路径每写完一次加上写了多少
+     * （{@code aof.c:466}、{@code :480}），而<em>换过一份日志之后按 stat 重取</em>而不是接着加
+     * （{@code aofUpdateCurrentSize}，{@code aof.c:1653-1665}；调用点在载入收尾 {@code :865} 与
+     * 重写收尾 {@code :1772}）。接着加会怎样：旧日志里那些"同一个键写三笔"的流水已经不在新文件里了，
+     * 于是这个数比真实文件大一截 —— 而它是自动重写算增幅的分子（{@code server.c:1305-1310}），
+     * 大一截就等于<em>提前重写</em>，小一截就等于<em>永不重写</em>。
+     * </p>
      */
     private volatile long appendedBytes;
+
+    /**
+     * 重写算增幅时的那块底座 —— 对应上游的 {@code server.aof_rewrite_base_size}
+     * （{@code server.h:1079}，注释原文 "AOF size on latest startup or rewrite"）。
+     * <p>
+     * 全上游只有三处会动它：初值 0（{@code server.c:1594}）、载入收尾 {@code aof.c:866}、
+     * 重写收尾 {@code aof.c:1773}，两处收尾都是紧跟在 {@code aofUpdateCurrentSize()} 下一行，
+     * 也就是"把底座对齐到刚接手／刚换出来的那份的长度"。写命令<em>不算它</em> —— 它是
+     * {@code server.c:1308-1310} 那个分母（{@code growth = current*100/base - 100}），跟着写命令涨的话
+     * 增幅永远是 0，自动挡就此失灵。
+     * </p>
+     */
+    private volatile long rewriteBaseBytes;
 
     /**
      * 最后一次真 fsync 时的字节数 —— 对应上游的 {@code server.aof_fsync_offset}
@@ -272,6 +294,9 @@ public class AofPersistence {
             // 以追加模式打开文件
             openAppending(file);
             appendedBytes = file.length();
+            // 接手一份已有的日志，底座就从这一刻算起（上游同处：载入收尾 aof.c:865 取 stat、
+            // :866 把 aof_rewrite_base_size 对齐到这个数）。
+            rewriteBaseBytes = appendedBytes;
             fsyncedBytes = appendedBytes;   // 刚接手的这份不欠盘（上游同形：aof.c:285 / :718）
 
             // 如果是 EVERYSEC 策略，启动定时 fsync
@@ -579,6 +604,10 @@ arg2\r
                 // {@code aof_fsync_offset} 对齐到新大小（{@code aof.c:1774}）。
                 // 我们不 fork，"后台那一次"就在调用 rewriteAof 的线程里同步做（差别记在 CHANGELOG）。
                 appendedBytes = new File(aofFilePath).length();
+                // 新的一份就是新的起点：上游在 backgroundRewriteDoneHandler 里换完 fd 之后
+                // aofUpdateCurrentSize()（aof.c:1772）→ aof_rewrite_base_size = aof_current_size
+                // （:1773）→ aof_fsync_offset = aof_current_size（:1774），三行连着走。
+                rewriteBaseBytes = appendedBytes;
                 if (fsyncPolicy != FSYNC_NO) {
                     syncFile();
                 }
@@ -1085,6 +1114,26 @@ arg2\r
      */
     public boolean isRewriting() {
         return rewriting.get();
+    }
+
+    /**
+     * 当前这份日志有多长 —— 对应上游的 {@code server.aof_current_size}，{@code INFO persistence} 里
+     * 那个 {@code aof_current_size} 就是它（{@code server.c:3396} 声明字段、{@code :3403} 取值）。
+     * <p>
+     * 交回的是<em>记账值</em>而不是现 stat：上游也是这么办的（写完就加、只在接手与换完文件两处
+     * 现 stat）。判据由 {@code RedisServerLifecycleTest} 拿真实文件长度对账。
+     * </p>
+     */
+    public long getAofCurrentSize() {
+        return appendedBytes;
+    }
+
+    /**
+     * 自动重写算增幅的那块底座 —— 对应上游的 {@code server.aof_rewrite_base_size}，{@code INFO} 里的
+     * {@code aof_base_size}（{@code server.c:3397} / {@code :3404}）。
+     */
+    public long getAofBaseSize() {
+        return rewriteBaseBytes;
     }
 
     /**
