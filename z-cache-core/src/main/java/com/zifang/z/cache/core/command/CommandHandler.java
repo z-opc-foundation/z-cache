@@ -290,11 +290,13 @@ public class CommandHandler {
                 case "UNSUBSCRIBE":  return handleUnsubscribe(args);
                 case "PSUBSCRIBE":   return handlePsubscribe(args);
                 case "PUNSUBSCRIBE": return handlePunsubscribe(args);
-                case "PING":         return RespSimpleString.of("PONG");
+                case "PING":         return pubSubPing(args);
                 case "QUIT":         return RespSimpleString.of("OK");
                 default:
+                    // 上游闸门（server.c:2727-2733）打的是<em>这一句</em>，句子里不带命令名 ——
+                    // 白名单外每一家（MULTI／SET／GET／EXEC／AUTH／INFO）回的都是同一串原文。
                     return RespError.of("ERR",
-                            "Can't execute this command in subscribe mode");
+                            "only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT allowed in this context");
             }
         }
 
@@ -532,6 +534,18 @@ public class CommandHandler {
         if (args.length == 1) return RespSimpleString.of("PONG");
         if (args.length == 2) return RespBulkString.of(args[1]);
         return RespError.wrongNumberOfArguments("PING");
+    }
+
+    /**
+     * 订阅态下的 PING —— 上游 {@code pingCommand}（server.c:2959-2975）在
+     * {@code CLIENT_PUBSUB} 那一支回的是<em>两条 bulk 的数组</em>（{@code pong} + 载荷，
+     * 没给载荷是<em>空</em> bulk），不是非订阅态那一支的 {@code +PONG}／裸 bulk。
+     * arity 仍按表上那一行走（实测 {@code PING x y} 在订阅态里也是 arity 错，不是被闸门挡掉）。
+     */
+    private Object pubSubPing(String[] args) {
+        if (args.length > 2) return RespError.wrongNumberOfArguments("PING");
+        return RespArray.of(RespBulkString.of("pong"),
+                RespBulkString.of(args.length == 2 ? args[1] : ""));
     }
 
     private Object handleEcho(String[] args) {
