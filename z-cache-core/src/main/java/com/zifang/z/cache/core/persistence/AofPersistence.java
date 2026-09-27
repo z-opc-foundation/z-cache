@@ -133,6 +133,41 @@ public class AofPersistence {
     private volatile long rewriteBaseBytes;
 
     /**
+     * 自动重写的百分比门槛 —— 对应上游的 {@code server.aof_rewrite_perc}（{@code server.h:1077}，
+     * 注释原文 "Rewrite AOF if % growth is > M and..."）。默认 {@value #AUTO_AOF_REWRITE_PERCENTAGE}
+     * （上游 {@code server.h:98} 的 {@code AOF_REWRITE_PERC}），<b>0 表示整个自动挡关掉</b> ——
+     * {@code server.c:1305} 那一项就是把整数当真假用，0 直接短路。
+     * <p>
+     * 允许的范围是 {@code 0..INT_MAX}（{@code config.c:1160-1161} 那个
+     * {@code config_set_numerical_field} 的第四、五个实参），负数在配置文件那条路上也被拒
+     * （{@code config.c:501-503}，原文 "Invalid negative percentage for AOF auto rewrite"）。
+     * 这一点值得注意：负数在上游是<em>过不了配置解析</em>，而不是"过得了但行为像 0"，
+     * 所以下面那个判据用 {@code == 0} 翻译 {@code :1305}，不给负数留通道。
+     * </p>
+     */
+    private volatile int autoRewritePercentage = AUTO_AOF_REWRITE_PERCENTAGE;
+
+    /**
+     * 自动重写的体积地板 —— 对应上游的 {@code server.aof_rewrite_min_size}
+     * （{@code server.h:1078}，"the AOF file is at least N bytes"）。默认 64mb
+     * （{@code server.h:99} 的 {@code AOF_REWRITE_MIN_SIZE}，即 {@code 64*1024*1024}）。
+     * <p>
+     * 它存在的理由不是"再省一点"：几十个字节的日志重写一次，收益是零、开销是一次 fork。
+     * {@code server.c:1306} 用的是严格大于 —— 正好等于地板时<em>不</em>重写。
+     * 运行时口 {@code config.c:1262-1263} 收 {@code 0..LONG_MAX}。
+     * </p>
+     */
+    private volatile long autoRewriteMinSize = AUTO_AOF_REWRITE_MIN_SIZE;
+
+    /**
+     * 自动挡那一拍的任务句柄。挂／撤的判据是 {@link #applyAutoRewriteScheduler()}，
+     * 和 fsync 那把（{@link #fsyncFuture}）分开：<b>自动重写的触发与 fsync 档位无关</b> ——
+     * 上游两件事分别住在 {@code aof.c:341-352}（flush）和 {@code server.c:1301-1315}（cron 里的增幅判断），
+     * 把触发挂到 fsync 定时器上，等于让 {@code appendfsync always} 顺带关掉自动挡。
+     */
+    private volatile ScheduledFuture<?> autoRewriteFuture;
+
+    /**
      * 最后一次真 fsync 时的字节数 —— 对应上游的 {@code server.aof_fsync_offset}
      * （{@code aof.c:349} 判的就是这两个数不相等，{@code aof.c:506/:1774} 赋的就是这两个数）。
      * <p>
