@@ -203,7 +203,7 @@ redis-cli -h localhost -p 16379 SLOWLOG GET 10
 
 | 类别 | 命令 | 状态 |
 |---|---|---|
-| **Key** | SET / GET / DEL / EXISTS / KEYS / TYPE / EXPIRE / TTL / PERSIST | ✅ 但 `EXPIRE`/`TTL`/`PERSIST` **只对 String 键生效**：集合键上实测 `EXPIRE k 100`→`:0`、`TTL k`→`:-2`，而同一个键 `TYPE`→`hash`、`EXISTS`→`:1`（Redis 会真的挂上 TTL） |
+| **Key** | SET / GET / DEL / EXISTS / KEYS / TYPE / EXPIRE / TTL / PERSIST | ✅ 但 `EXPIRE`/`TTL`/`PERSIST` **只对 String 键生效**：集合键上实测 `EXPIRE k 100`→`:0`、`TTL k`→`:-2`，而同一个键 `TYPE`→`hash`、`EXISTS`→`:1`（Redis 会真的挂上 TTL）。另：`KEYS`/`SCAN MATCH` 的那把 glob 与 `CONFIG GET` 用的**不是同一条码**（250 上 2928 对 (图案,键名) 实测：交付分歧 74 格，其中 52 格只是没接 `RedisGlob` —— 字符集 `[a-c]`、`\` 转义在命令层根本不生效；余下是字节/码元那一族与一条 4.0.9↔5.0.14 版本差）⇒ 卡 #35 / #36 |
 | **String** | SETNX / SETEX / GETSET / APPEND / STRLEN / INCR / DECR | ✅ 用错类型读写一律 `-WRONGTYPE`（1.3.5 起，此前静默回 nil/0） |
 | **Hash** | HSET / HGET / HDEL / HMSET / HMGET / HGETALL / HEXISTS | ✅ |
 | **List** | LPUSH / RPUSH / LPOP / RPOP / LRANGE / LLEN / LSET / LTRIM / LMOVE / RPOPLPUSH / BRPOPLPUSH | ✅ 1.3.5 补 `BRPOPLPUSH` |
