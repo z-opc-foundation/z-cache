@@ -135,11 +135,6 @@ public class AofPersistence {
      * 重写收尾 {@code :1772}）。接着加会怎样：旧日志里那些"同一个键写三笔"的流水已经不在新文件里了，
      * 于是这个数比真实文件大一截 —— 而它是自动重写算增幅的分子（{@code server.c:1305-1310}），
      * 大一截就等于<em>提前重写</em>，小一截就等于<em>永不重写</em>。
-     * </p>
-     */
-    private volatile long appendedBytes;
-
-    /**
      * 重写算增幅时的那块底座 —— 对应上游的 {@code server.aof_rewrite_base_size}
      * （{@code server.h:1079}，注释原文 "AOF size on latest startup or rewrite"）。
      * <p>
@@ -1133,6 +1128,110 @@ arg2\r
             fsyncFuture.cancel(false);
             fsyncFuture = null;
         }
+    }
+
+    /**
+     * 把"每 100ms 量一次日志体积"那一拍挂上／撤掉。幂等，同 {@link #applyFsyncScheduler()}。
+     * <p>
+     * 挂在 {@link #rewriteExecutor} 上而不是 fsync 那把池上：这一拍唯一会做的<em>重活</em>就是
+     * {@link #rewriteAsync()}，而那份活本来就在这条池上排队。单线程池意味着"重写正在进行时
+     * 这一拍排在其后"，与上游用 {@code aof_child_pid == -1}（{@code server.c:1304}）挡重入同效。
+     * </p>
+     */
+    private void applyAutoRewriteScheduler() {
+        if (autoRewriteFuture == null) {
+            autoRewriteFuture = rewriteExecutor.scheduleAtFixedRate(() -> {
+                try {
+                    checkAutoRewrite();
+                } catch (Throwable t) {
+                    // 这一拍抛出去的东西没人接：不记日志的话，"自动挡从不触发"和"每拍都在抛"
+                    // 在盘面上是同一个样子。
+                    LOGGER.log(Level.WARNING, "Scheduled AOF auto-rewrite check failed", t);
+                }
+            }, AUTO_REWRITE_TICK_MS, AUTO_REWRITE_TICK_MS, TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /**
+     * 按上游那一串条件量一次：<b>这一份日志现在该不该自动重写</b>。
+     * <p>
+     * 逐条对 {@code server.c:1301-1315}：{@code aof_state == AOF_ON}（{@code :1302}）、
+     * 没有子进程在跑（{@code :1303-1304}，我们的对应物是 {@link #rewriting} 那把标志）、
+     * {@code aof_rewrite_perc} 非零（{@code :1305}）、当前体积<b>严格</b>大于地板（{@code :1306}），
+     * 然后 {@code base = aof_rewrite_base_size ?: 1}（{@code :1308-1309}）、
+     * {@code growth = current*100/base - 100}（{@code :1310}）、{@code growth >= perc}（{@code :1311}）。
+     * </p>
+     * <p>
+     * {@code ?: 1} 那一步不是防御性编程，是<em>会改判据</em>的一步：底座为 0 时若按 0 去除，
+     * 整数除法直接抛 {@code ArithmeticException}，那一拍从此只留一行日志。
+     * </p>
+     *
+     * @param aofOn             这一份日志是否处于"开着"的状态
+     * @param rewriteInProgress 是否已经有人在重写
+     * @param current           当前日志体积（分子）
+     * @param base              上次接手／换手时的体积（分母）
+     * @param percentage        百分比门槛，0 表示关掉
+     * @param minSize           体积地板
+     * @return 该不该发起一次自动重写
+     */
+    static boolean shouldAutoRewrite(boolean aofOn, boolean rewriteInProgress, long current, long base,
+                                     int percentage, long minSize) {
+        if (!aofOn || rewriteInProgress || percentage == 0 || current <= minSize) {
+            return false;
+        }
+        long baseForGrowth = base != 0 ? base : 1;
+        long growth = current * 100 / baseForGrowth - 100;
+        return growth >= percentage;
+    }
+
+    /**
+     * 自动挡的<em>唯一</em>触发点：量一次，该重写就真的排一次重写。
+     *
+     * @return 是否发起了这一趟重写
+     */
+    boolean checkAutoRewrite() {
+        if (!shouldAutoRewrite(started.get(), rewriting.get(), appendedBytes, rewriteBaseBytes,
+                autoRewritePercentage, autoRewriteMinSize)) {
+            return false;
+        }
+        LOGGER.info("Starting automatic rewriting of AOF on growth over " + autoRewritePercentage + "%");
+        return rewriteAsync();
+    }
+
+    /** 自动挡的百分比门槛（{@code server.aof_rewrite_perc}）。 */
+    public int getAutoAofRewritePercentage() {
+        return autoRewritePercentage;
+    }
+
+    /**
+     * 设自动挡的百分比门槛。范围照 {@code config.c:1160-1161}：{@code 0..INT_MAX}，
+     * 其中 0 表示关掉（{@code server.c:1305}）。
+     *
+     * @param percentage 新门槛
+     */
+    public void setAutoAofRewritePercentage(int percentage) {
+        if (percentage < 0) {
+            throw new IllegalArgumentException(
+                    "Invalid negative percentage for AOF auto rewrite: " + percentage);
+        }
+        this.autoRewritePercentage = percentage;
+    }
+
+    /** 自动挡的体积地板（{@code server.aof_rewrite_min_size}）。 */
+    public long getAutoAofRewriteMinSize() {
+        return autoRewriteMinSize;
+    }
+
+    /**
+     * 设自动挡的体积地板。范围照 {@code config.c:1262-1263}：{@code 0..LONG_MAX}。
+     *
+     * @param bytes 新地板
+     */
+    public void setAutoAofRewriteMinSize(long bytes) {
+        if (bytes < 0) {
+            throw new IllegalArgumentException("Invalid negative size for AOF auto rewrite: " + bytes);
+        }
+        this.autoRewriteMinSize = bytes;
     }
 
     /**
