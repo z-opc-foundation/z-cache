@@ -356,6 +356,9 @@ public class AofPersistence {
 
             // 如果是 EVERYSEC 策略，启动定时 fsync
             applyFsyncScheduler();
+            // 自动挡那一拍与档位无关：上游的增幅判断住在 serverCron（server.c:1301-1315），
+            // 而"有没有 AOF"是那一串条件里的第一个（:1302），不是"这台 cron 挂没挂"。
+            applyAutoRewriteScheduler();
         }
     }
 
@@ -374,6 +377,12 @@ public class AofPersistence {
             if (fsyncFuture != null) {
                 fsyncFuture.cancel(false);
                 fsyncFuture = null;
+            }
+            // 自动挡也要撤：AOF 已经停了还留着那一拍，下一拍读到的是<em>关了句柄的</em>那份日志。
+            // 上游同形 —— serverCron 一直在跑，但 :1302 那个 aof_state 判断会一直不成立。
+            if (autoRewriteFuture != null) {
+                autoRewriteFuture.cancel(false);
+                autoRewriteFuture = null;
             }
 
             // 关闭文件。上游 stopAppendOnly 的顺序是 flush → fsync → close，而且<em>不看档位</em>
