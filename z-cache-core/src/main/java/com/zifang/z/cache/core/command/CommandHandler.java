@@ -4203,9 +4203,11 @@ public class CommandHandler {
             if ("MATCH".equalsIgnoreCase(args[i]) && i + 1 < args.length) pattern = args[++i];
         }
         Object[] sr = store.getSortedSetStore(currentDb).zscan(args[1], args[2], pattern);
-        List<byte[]> members = (List<byte[]>) sr[1];
-        Object[] r = new Object[members.size()];
-        for (int i = 0; i < members.size(); i++) r[i] = RespBulkString.of(members.get(i));
+        // 负载是 member,score 成对平铺（上游 scanCallback 把分数 append 进同一个列表），
+        // 所以这里的元素数天然是偶数 —— 命令层不再"按成员数"算任何东西。
+        List<byte[]> payload = (List<byte[]>) sr[1];
+        Object[] r = new Object[payload.size()];
+        for (int i = 0; i < payload.size(); i++) r[i] = RespBulkString.of(payload.get(i));
         return RespArray.of(new Object[]{RespBulkString.of((String) sr[0]), RespArray.of(r)});
     }
 

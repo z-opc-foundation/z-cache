@@ -377,10 +377,9 @@ class RedisGlobDeliveryTest {
      * 只钉其中一边都不算数：把 {@code null} 判断摘掉 ⇒ 前一组红；把 {@code *} 快路加回来
      * ⇒ 后一组红。</p>
      *
-     * <p>另记一件这一跑顺手量到的<em>形状</em>差异（不是 glob 的账，另开卡跟）：
-     * {@code ZSCAN} 现在回的是平铺成员，上游是 {@code member, score} 成对。本测试按
-     * 今天的形状解析，所以那一家一旦补上分数，{@code D*} 里 ZSCAN 的格子会先红在这里 ——
-     * 红到这儿就是让你来看这段注释，不是过滤器坏了。</p>
+     * <p>{@code ZSCAN} 的负载从 14a 起是 {@code member, score} <em>成对</em>平铺（此前只有
+     * 平铺成员，与上游差一整列 ⇒ 卡 #43 已闭），所以这一族的格子按<em>偶数位</em>取成员名：
+     * {@code scanPayload} 在负载长度为奇数时当场抛，不会把一枚分数悄悄算成一个成员。</p>
      */
     @Test
     void memberFacesDeliverTheReferenceSets() throws Exception {
@@ -572,7 +571,7 @@ class RedisGlobDeliveryTest {
         }
 
         private Set<String> zscan(String key, String pattern) throws IOException {
-            return scanPayload("ZSCAN", key, pattern, false);
+            return scanPayload("ZSCAN", key, pattern, true);
         }
 
         private Set<String> pubsubChannels(String pattern) throws IOException {

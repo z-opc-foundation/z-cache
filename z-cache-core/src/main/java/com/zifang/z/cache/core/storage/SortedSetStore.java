@@ -911,7 +911,7 @@ public class SortedSetStore {
 
     /**
      * 增量遍历有序集合。
-     * 简化实现：直接返回所有 member（忽略 cursor）。
+     * 简化实现：一圈到底（忽略 cursor），负载是 member,score <em>成对</em>平铺。
      */
     public Object[] zscan(String key, String cursor, String pattern) {
         List<byte[]> result = new ArrayList<>();
@@ -927,6 +927,10 @@ public class SortedSetStore {
         for (String member : data.getOrderedMembers()) {
             if (pattern == null || RedisGlob.matches(pattern, member, false)) {
                 result.add(member.getBytes(StandardCharsets.UTF_8));
+                // 上游 scanCallback 的 OBJ_ZSET 那一支把分数一起 append 进同一个列表
+                // （full5x db.c:582-591：val = createStringObjectFromLongDouble(...) 之后
+                //  if (val) listAddNodeTail(keys, val)）⇒ 负载长度是成员数的两倍。
+                result.add(RedisDoubleFormat.formatBytes(data.memberScores.get(member)));
             }
         }
         return new Object[]{"0", result};
