@@ -13,6 +13,8 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -404,6 +406,27 @@ class RedisServerLifecycleTest {
             send(socket, "LPUSH", "l7", "e1");
             assertEquals(":1", readReply(in), "前置条件: DB7 列表必须真有 1 个元素");
 
+            // 四种集合键各挂一枚长 TTL，再挂一枚"停机期间会到点"的：前三者要带着时刻一起回来，
+            // 后者整枚都不许回来（上游那一判在加载侧，rdb.c:2097）。
+            send(socket, "EXPIRE", "l7", "3600");
+            assertEquals(":1", readReply(in), "前置条件: 列表键挂得上时刻行");
+            send(socket, "HSET", "h7", "f", "v");
+            assertEquals(":1", readReply(in));
+            send(socket, "EXPIRE", "h7", "3600");
+            assertEquals(":1", readReply(in), "前置条件: hash 键挂得上时刻行");
+            send(socket, "SADD", "s7", "m");
+            assertEquals(":1", readReply(in));
+            send(socket, "EXPIRE", "s7", "3600");
+            assertEquals(":1", readReply(in), "前置条件: set 键挂得上时刻行");
+            send(socket, "ZADD", "z7", "1", "m");
+            assertEquals(":1", readReply(in));
+            send(socket, "EXPIRE", "z7", "3600");
+            assertEquals(":1", readReply(in), "前置条件: zset 键挂得上时刻行");
+            send(socket, "HSET", "dead7", "f", "v");
+            assertEquals(":1", readReply(in));
+            send(socket, "EXPIRE", "dead7", "1");
+            assertEquals(":1", readReply(in), "前置条件: dead7 的时刻会在停机期间过去");
+
             // 等 gone 过期（1s + 余量），让快照根本不该带上它
             Thread.sleep(1_300);
             send(socket, "SELECT", "3");
@@ -451,6 +474,42 @@ class RedisServerLifecycleTest {
             assertEquals("+OK", readReply(in));
             send(socket, "LLEN", "l7");
             assertEquals(":1", readReply(in), "DB7 的列表必须活过重启");
+
+            // 一张表一次断言，六个格子全收进去。JUnit 见第一条红就抛：
+            // 四型各写一条 assertEquals，摘掉任何一型只红在它自己那一行，另外三型一起丢了没人说；
+            // 值、时刻、dead7 分三批断言（上一版就是这么写的），S6 那种"三样一起坏"的变异只会
+            // 归给先红的那一批 —— 于是"摘掉加载侧那道闸"到底等价不等价，量具答不出来。
+            // 收进一格之后每一次都逐格交回来，连没坏的那几格也一并交回（那就是归属的阳性对照）。
+            String[][] seeded = {{"l7", "LLEN"}, {"h7", "HLEN"}, {"s7", "SCARD"}, {"z7", "ZCARD"}};
+            Map<String, String> seen = new LinkedHashMap<>();
+            Map<String, String> wrong = new LinkedHashMap<>();
+            for (String[] cell : seeded) {
+                send(socket, cell[1], cell[0]);
+                String size = readReply(in).substring(1);
+                send(socket, "TTL", cell[0]);
+                String ttlText = readReply(in).substring(1);
+                long remaining = Long.parseLong(ttlText);
+                seen.put(cell[0], "值 " + size + " 个成员, TTL " + ttlText);
+                if (!"1".equals(size) || remaining <= 3_000L || remaining > 3_600L) {
+                    wrong.put(cell[0], seen.get(cell[0]));
+                }
+            }
+            send(socket, "EXISTS", "dead7");
+            String deadAlive = readReply(in);
+            seen.put("dead7", "EXISTS " + deadAlive);
+            if (!":0".equals(deadAlive)) {
+                wrong.put("dead7", seen.get("dead7"));
+            }
+            send(socket, "DBSIZE");
+            String howMany = readReply(in);
+            seen.put("DBSIZE", howMany);
+            if (!":4".equals(howMany)) {
+                wrong.put("DBSIZE", howMany);
+            }
+            assertTrue(wrong.isEmpty(), "四种集合键重启后要带着值、也带着剩余时间一起回来，停机期间到点的那一枚"
+                    + "整枚都不许回来（TTL -1 = restore 那条腿没读它拿到的 expireAt，键变成永久键；"
+                    + "值 0 个成员或 TTL -2 = 值那一半根本没写进去；EXISTS :1 = 只抹时刻、键留着，"
+                    + "那比留着旧时刻更糟），逐格: " + seen);
 
             // 反向证据：分库导出不是"全都塞进 DB 0"
             send(socket, "SELECT", "0");

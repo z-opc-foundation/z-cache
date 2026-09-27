@@ -1368,6 +1368,7 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
     `:4241->expiryRowDiesWhenTheKeyEmptiesItself:4305 e:list 复活之后不许继承上一枚键的时刻行 —— 上游那里键没了时刻跟着一起没 ==> expected: <:-1> but was: <:100>`；
   - P3 `ttlDb` 退回只看 `stringStores` → 2 红：`streamsAreOrdinaryKeysForKeyspaceCommands:4212 hash 键在而没挂过期：-1，不是 -2 ==> expected: <:-1> but was: <:-2>`
     与 `zstoreAndCrossDbMoveFollowTheMeasuredRows:2858 MOVE 之后集合键的 TTL 也要跟着过去: :-2`（那一格摘掉之后 `TTL` 又去问了 string 表）；
+    ⚠ 下一格（13b-iii）之后同一支在树上量到的是 **3 红** —— 多出来那条是快照判据自己走上门的，见下一格最后一条；
   - P4 `persistDb` 退回只看 `stringStores` → 1 红
     `:4216 hash 挂上之后 PERSIST 读得到那一行 ==> expected: <:1> but was: <:0>`；
   - P5 只让 `ListStore` 不通告 → 1 红且**只**红在 `e:list` 那一行（`:4305`），逐 store 的归属对得上；
@@ -1430,7 +1431,8 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   `_doc/battery*.txt` 那批原文真值复跑不了，本格的权威只有 5.0.14 源码行号。
 - 还没做的：① 快照 —— 这一格之后缺口从"只有 String 带得进快照"变成"六型都挂得上过期，而四种集合的
   restore 腿一个字都不读那个参数"（`MemoryStoreAccessor.java:134 / :144 / :151 / :158` 收了 `expireAt`
-  却没用，`:119-131` 那条才是完整的）。**格式不用动，这一句本轮查实了**：写侧四张集合表各自都取
+  却没用，`:119-131` 那条才是完整的）。**这一栏下一格闭合**；那四个行号量的是写这一格时的字节，
+  改动之后四腿长成 `:139 / :153 / :164 / :175`，而 `:119-131` 那条内联的闸也并进了共用的 `diedWhileOffline`。**格式不用动，这一句本轮查实了**：写侧四张集合表各自都取
   `expirationEntries.getOrDefault(key, -1L)`（`RdbPersistence.java:482 / :497 / :512 / :527`）并 `writeLong`
   进条目，读侧在 `:596` 无条件 `readLong` 再传给五个 `restore*` —— 也就是说**今天 SAVE 已经把集合键的时刻
   写进了文件，是 RESTORE 把它丢了**；上游同一件事也不分类型（`rdb.c:1188` 每个键 `getExpire` 一次、
@@ -1443,6 +1445,91 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   `rc!=0`/有没有红）。本轮给两支量具加了 `run_guarded`：整跑红全是 RESP 签名→重跑，**混着抢占→直接
   SystemExit(7) 中止**，宁可停也不把抢占记成正向证据；四条分支（抢占→重跑→绿 / 混着→7 / 连三跑→7 /
   真红原样交回）都用假 `run_core` 实测过才上岗。`freePort()` 本身仍是待修（已登记）。
+
+#### 集合键的时刻第一次活过一次重启：五支 restore 共用同两道闸，而时刻表上那一刀得整个拿掉
+
+- **现象**（改动前，实测得到的形状，不是推断）：带 TTL 的 hash / list / set / zset 键 `SAVE` 之后重启，值
+  完整地回来了，`TTL` 却报 `-1` —— 变成**永久键**；而停机期间到点的那一枚（`dead7`）整枚复活成永久键，
+  `DBSIZE` 从 4 变 5。这一形状不是"我猜改动前长这样"：`prefix_shape.py` 用 `git show HEAD:` 把
+  `MemoryStoreAccessor.java` 整份换回上一格的字节（`dacb87e1f4e429dbfda49021c32e2d32`，全程不 `checkout`、
+  还原只从本次运行开头存的副本 `cp`、收尾按 md5 对账 `match=True`），只跑新加的那一条判据，交回
+  `逐格: {l7=值 1 个成员, TTL -1, h7=值 1 个成员, TTL -1, s7=值 1 个成员, TTL -1, z7=值 1 个成员, TTL -1,
+  dead7=EXISTS :1, DBSIZE=:5}`（`logs/prefix_shape.log`）。被换的那一份是 HEAD 的 accessor ＋ 当前
+  `MemoryStore.java`（`8121ae2a…`，与 HEAD 逐字节相同 ⇒ 就是改动前那整棵树）。上游那里过期是**键**的属性：
+  导出侧每个键问一次 `getExpire`（`rdb.c:1188`）、`RDB_OPCODE_EXPIRETIME_MS` 写在类型 opcode 之前
+  （`:1015-1018`）、加载时 `setExpire`（`:2105`）、停机期间已到点的那一枚整键不 `dbAdd`（`:2097`）。
+- **归因**：上一格"还没做的 ①"点中的就是这四条腿 —— 收了 `expireAt` 一个字都不读。**格式不用动**，
+  本轮又按字节复对了一遍：写侧五张表各自 `expirationEntries.getOrDefault(key, -1L)` 再 `writeLong`
+  （`RdbPersistence.java:467 / :482 / :497 / :512 / :527`），读侧 `:596` 无条件 `readLong` 传给五个
+  `restore*` —— 时刻早就在文件里，是 RESTORE 把它丢了。
+- **另一处同源缺陷，是这一格真正的雷**：`getAllExpirationEntries` 跟着 `getAllStringEntries` 也带了一道
+  `isExpiredDb`，而**四种集合的值那半是从裸表枚举的**（与上游那一枚 `db->dict` 同形）。一边筛一边不筛的后果
+  不是"少写一行时刻"：`dead7` 的值进了文件、时刻行没进，于是它带着 `expireAt = -1` 走到加载步，
+  **变成永久键复活** —— 一份再也删不掉的数据。S4 就是把那道闸加回去，实测交回
+  `{l7…z7 四格 TTL 3599（全好）, dead7=EXISTS :1, DBSIZE=:5}`：坏的那一维被四格好的那几维原样衬出来。
+  现在时刻表整个不筛（`new HashMap<>(store.expirationSnapshot(db))`），决定统一放到加载那一步，与上游同位。
+- **五支腿收成一个口**：`diedWhileOffline`（`:190`）与 `armAfterRestore`（`:195`）两个私有收尾，
+  四腿在 `:139 / :153 / :164 / :175`；`restoreString` 原先自己内联写了一遍"剩余毫秒 <= 0 就 return"，
+  现在也从同一个口走（`:117-126`），语义逐字不变（同一个条件、同一个次序）。挂时刻排在写完值之后，
+  因为 `MemoryStore.armExpiry` 先问 `typeOfDb`（`MemoryStore.java:687-697`）。
+- **判据为什么又是一张表**：JUnit 见到第一条红就抛。这一格第一版把"四格值 + TTL"与"`EXISTS dead7`"
+  写成两条 `assert`，S6 那一跑只红在 TTL 那条，`EXISTS` 那一维整个没交回来，量具当场判成 RED-WRONG ——
+  上一格为 `mv` 六格立过的规矩，这一格在同一张表上第二次付学费。收进一张 `LinkedHashMap` 之后每一次红
+  都逐格全交，没坏的那几格就是归属的阳性对照（网线层 `RedisServerLifecycleTest:509`）。
+- 判据与牙（第四支量具 `snapshot_teeth.py`；TRACKED = `MemoryStoreAccessor.java f82396f434bd9e58e926ee4fafe9234a`
+  ＋ `RedisServerLifecycleTest.java 930c78084a5afaaaa47c61ef3986e0c4`，两支都在注入前存 `.good`、每支还原后
+  `match=True`；下面每一条读数都出自 09:29—09:42 那一轮链 `logs/chain_13biii_0930.out`，
+  S4 因换 hint 单独复跑过一次 `logs/snap_S4-…-again.log`，`SUMMARY mutants=6 bad=0`）：
+  - S1 只摘掉 hash 的挂时刻 → 1 红，逐格 `h7=值 1 个成员, TTL -1`，另外三格 `TTL 3599` 一起交回；
+  - S3 四种集合一起不挂时刻 → 同一格里四格全 `TTL -1`，`dead7=EXISTS :0`、`DBSIZE=:4` 仍然对；
+  - S5 摘掉 zset 写值那一步 → `z7=值 0 个成员, TTL -2`、`DBSIZE=:3` —— 同一格里两维各自点名，
+    不存在"先红的那批把后一批盖住"；
+  - S4 把 `isExpiredDb` 加回时刻表 → `dead7=EXISTS :1`、`DBSIZE=:5`，而四格全好（见上面那一条）；
+  - S6 加载侧的闸与挂时刻一起摘掉（＝改动前的结构）→ 交回的逐格与 `prefix_shape.py` 在 HEAD 字节上量到的
+    那一行**逐字相同** —— 这一条同时是"新判据确实钉住了改动前那个形状"的正面证据；
+  - S2 只摘掉加载侧那道闸 → **MEASURED-GREEN**（`reds=0`）。不许写成"等价变异，可以删"：绿只说明
+    *现有判据*看不见它。它的绿由另外两支定位，不是我自己推的：S6（把挂时刻一起摘掉就红在 `dead7=EXISTS :1`）
+    说明 S2 之下 `dead7` 确实是"先写进来、再被 `armExpiry` 的 `relativeMillis <= 0` 那一条腿当场删掉"
+    （`MemoryStore.java:670-672 → :687-697`）；String 那一腿走的是另一条路 —— `psetexDb` 不经 `armExpiry`
+    （`:380-385`），写进去的是带过去绝对时刻的行，由 `GET` / `DBSIZE` 那一问把它摘走，所以同一跑里
+    `:435 gone → $-1` 与 `DBSIZE :2` 两条都还绿，而"惰性回收那把尺是不是活的"另有正面证据：同一轮
+    `keyspace_teeth.py` 的 N1 摘掉判活那一问会红 4 条。⇒ 这道闸删掉的是"谁来做这件事"，不是"做不做"；
+    留着它的理由是它把决定放在与上游同一个位置（`rdb.c:2097`），并且省掉一次写了再删。
+  - hint 的一条自证：S4 的第三条 hint 现在写作 `l7=值 1 个成员, TTL 359`（3599 的前缀）。原本写的是
+    `TTL 3`，我怀疑它是"顺手匹配上 3599"的假牙，就拿同轮那三份日志双向量了一遍：`TTL 3` 在 S4 命中、
+    在 S3 与 S6 各 0 命中 ⇒ 它本来就分得开"四格是好的"与"四格变永久键"，**没有假牙**，我差点把一件没坏的
+    事当 bug 改掉；换成 `TTL 359` 只是为了让读的人一眼看出那是三千多秒而不是三秒，换完按新 hint 复跑 S4
+    仍然 TEETH-OK。
+- 上一格那 15 支（N1—N5 / P1—P6 / Q1—Q4）本轮在同一份新字节上整链重跑（同一轮链的 [3][4][5] 段）：
+  **15 支里 13 支的红集逐字相同**（连行号与 `but was` 的取值都一样；只有 `mv:*` 那两处的 epoch 字面值随轮次变）。
+  差的两处：一处是 **P3 从 2 红变 3 红**，多出来的那条正是本格新加的判据：
+  `RedisServerLifecycleTest.saveSnapshotsEveryDatabaseAndTheirTtls:509 … {l7=值 1 个成员, TTL -2, h7=值 1 个成员,
+  TTL -2, s7=值 1 个成员, TTL -2, z7=值 1 个成员, TTL -2, dead7=EXISTS :0, DBSIZE=:4}` ——
+  `ttlDb` 退回只看 String 表时，重启回来的四种集合键在 `TTL` 那一问眼里**根本不存在**（`-2` 而不是 `-1`）。
+  它不在本格的变异家族里，是新判据自己走上门的，所以顺手把上一格 P3 那条的读数标成了"2 红（下一格之后 3 红）"。
+  另一处是 P6 那 27 条红里 `RedisServerLifecycleTest` 那条的行号从 `:412` 挪到 `:435`（前置条件那一段变长了），
+  两边各自抄的是自己那一轮的日志。
+  **比法记在这里以免被当成眼力活**：三支量具每支的 `*.log` 文件名固定，后一轮把前一轮覆盖了，所以只能拿
+  两份链文件（`chain_13bii_0848.out` / `chain_13biii_0930.out`，它们内嵌了每支交回的红行）按支取差集，
+  归一化只把绝对时刻 `17\d{11}` 换成 `<EPOCH>`，其余逐字比。
+- 基线 `899` 不变（`358 + 404 + 135 + 2`，全量 `mvn -o -B clean test` rc=0 / BUILD SUCCESS）：本格的判据
+  全长在既有的 `@Test` 方法里，网线层多六格（四种集合 + `dead7` + `DBSIZE`）、种子多五枚键，方法数没变。
+- 250 那一侧仍然没有实测：它还是拒绝 ssh（`kex_exchange_identification` 直接 reset），
+  `_doc/battery*.txt` 那批原文真值复跑不了，本格的权威只有 5.0.14 源码行号。
+- 还没做的：① **stream 键压根进不了快照**（本轮实测）：`RdbPersistence.java` 里
+  `TYPE_STREAM|getStreamStore|StreamStore` 命中 **0**（同一条命令里 `DataOutputStream` 命中 9 当阳性对照），
+  `MemoryStoreAccessor.java` / `StoreAccessor.java` 里 `Stream` 命中 **0**（对照：`SetStore` 在前者命中 9、
+  `getAllSetEntries` 在接口命中 1）；那张表长在 `com.zifang.z.cache.core.stream.StreamStore`，由
+  `MemoryStore.bindStreams`（`MemoryStore.java:329`）从外面接进来，持久化层没有一支枚举它 ⇒
+  `XADD k * f v; SAVE; 重启; EXISTS k` 回 `:0`。上游 `rdbSaveObjectType`（`rdb.c:625`）对 `OBJ_STREAM`
+  直接给 `RDB_TYPE_STREAM_LISTPACKS`（`:655-656`，常量在 `rdb.h:93`）⇒ 流键本来就该进快照。
+  补它要动格式（多一个类型字节）＋ 定编码，是抬版而不是四行代码，所以单立一格；
+  ② 服务器侧没有 active expire cycle（不变，本格 S2 那条又给它添了一条旁证：字符串那半靠的是"没人问就不回收"）；
+  ③ `INFO keyspace` 的行形状（不变）；④ AOF 单独那一辈：`EXPIRE` 一族五支都在 `WRITE_COMMANDS` 名单里
+  （`CommandHandler.java:3308-3311`，本轮现读），所以重放会经过 13b-ii 之后那套类型无关的命令层；
+  但"删掉 `dump.rdb`、只让 AOF 把带过期的四种集合键重放回来"这一格**还没有判据** —— 现在删 rdb 的三处
+  （`RedisServerLifecycleTest:602 / :629 / :767`）量的是 SETBIT，而本格那条判据方向相反，在 `:451` 删的是 aof；
+  ⑤ 端口抢占（不变，已登记）。
 
 ### Added
 - `RedisServer.serverScope()`：只读拿到本台那一份，测试与嵌入式据此判断作用域边界。
