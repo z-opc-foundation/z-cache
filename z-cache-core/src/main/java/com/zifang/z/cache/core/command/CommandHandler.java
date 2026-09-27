@@ -3365,21 +3365,113 @@ public class CommandHandler {
             return;
         }
         try {
-            writeAofRecord(record);
+            writeAofRecords(aofRecordsFor(record, result));
         } catch (Exception e) {
             logger.warn("Failed to append to AOF: {}", e.getMessage());
         }
     }
 
     /**
-     * 落一条 AOF 记录。当前连接不在 DB 0 时必须先写 SELECT：AOF 重放用的是一个全新
-     * 连接（db 恒为 0），不带上库号的话 {@code SELECT 3} 之后写进去的数据会全部落到 DB 0。
+     * 落 AOF 之前，把"带过期时间"的写命令换写成<b>绝对时刻</b>的记录形状。上游同一处：
+     * {@code feedAppendOnlyFile}（aof.c:594-606）把 EXPIRE / PEXPIRE / EXPIREAT 换成 PEXPIREAT，
+     * SETEX / PSETEX（:598-606）与带 EX/PX 的 SET（:607-622）拆成 SET + PEXPIREAT，
+     * 换算体 {@code catAppendOnlyExpireAtCommand}（:550-577）里那句 {@code when += mstime()}
+     * （:566）就是"日志里不留相对时间"的地方，注释（:543-549）写得很直白：
+     * <i>the time is always absolute and not relative</i>。
+     * <p>
+     * 不换写的后果不是"精度差一点"：重放时相对毫秒从"重启的那一刻"重新起算，于是一枚
+     * 在停机期间早就到点的键会再活一个完整周期，而所有活着的键都被免费续期停机那一段。
+     * <p>
+     * 时刻直接问 {@link MemoryStore#expireAtDb}（命令刚刚执行完，表里那一行就是它真正挂上的
+     * 值），不去重算 argv：重算要跟着 EXPIRE/EXPIREAT/溢出饱和的文法走第二遍，而"当前库这一行"
+     * 是命令层已经裁定的唯一结果。
+     * <p>
+     * 这一族只有两种结局 —— 要么换成绝对时刻，要么一个字都不记。<b>不能</b>退回"原样记 argv"：
+     * 那正是本方法要消灭的形状。而"挂不上时刻"的那些情形（回的是错、键不在、参数读不出、
+     * NX 挡住）本来就没改过库，不记恰好与上游一致（上游只在命令真的改过库之后才 propagate）。
+     * 只看时刻不看回话尤其危险：一条失败的 {@code SETEX k 0 bad} 之后，k 身上那一行时刻是
+     * <em>上一次</em>成功挂的（{@code > 0}），照着时刻换写就会把没写进去的那个值记进日志，
+     * 重放之后 k 的内容被一条从来没成功过的命令改掉。
+     * <p>
+     * 与上游必要的保守差别：我们按动词表无条件追加记录，所以 {@code SET k v NX} 不能被削成
+     * 三条参数（那会把 NX 那一判在重放时演丢）—— 摘 EX/PX 时其余参数原样留着。
      */
-    private void writeAofRecord(String[] record) throws java.io.IOException {
+    private java.util.List<String[]> aofRecordsFor(String[] args, Object result) {
+        String cmd = args[0].toUpperCase(Locale.ROOT);
+        boolean isSet = "SET".equals(cmd);
+        boolean expiryFamily = isSet || "EXPIRE".equals(cmd) || "PEXPIRE".equals(cmd)
+                || "EXPIREAT".equals(cmd) || "PEXPIREAT".equals(cmd)
+                || "SETEX".equals(cmd) || "PSETEX".equals(cmd);
+        if (!expiryFamily) {
+            return java.util.Collections.singletonList(args);
+        }
+        if (result instanceof RespError || args.length < 2) {
+            return java.util.Collections.emptyList();
+        }
+        String key = args[1];
+        long expireAt = store.expireAtDb(currentDb, key);
+        if (expireAt <= 0) {
+            // 没挂上任何时刻：普通 SET（覆盖时连时刻一起清，db.c:216-224 那一条）照记值；
+            // EXPIRE 一族落到这里就是"这一问没改库"，不记。
+            return isSet ? java.util.Collections.singletonList(args) : java.util.Collections.emptyList();
+        }
+        String[] expireRecord = new String[]{"PEXPIREAT", key, Long.toString(expireAt)};
+        if (isSet) {
+            String[] setValue = setWithoutExpireOption(args);
+            if (setValue == null) {
+                // 时刻是别的命令挂的、也已经各自记过一遍，这条 SET 不必再带一份
+                return java.util.Collections.singletonList(args);
+            }
+            return java.util.Arrays.asList(setValue, expireRecord);
+        }
+        if ("SETEX".equals(cmd) || "PSETEX".equals(cmd)) {
+            if (args.length != 4) {
+                return java.util.Collections.emptyList();
+            }
+            // 上游这一支写的是 SET key value（aof.c:601-606）：值与时刻分成两条记录
+            return java.util.Arrays.asList(new String[]{"SET", key, args[3]}, expireRecord);
+        }
+        return java.util.Collections.singletonList(expireRecord);
+    }
+
+    /**
+     * 摘掉 SET 的 EX/PX 那一枚连同它的数值，其余参数（含 NX/XX）原样留着。
+     * 没带 EX/PX 时回 {@code null}，表示这一支不需要拆成两条。
+     */
+    private static String[] setWithoutExpireOption(String[] args) {
+        java.util.List<String> kept = new java.util.ArrayList<>(args.length);
+        boolean hadExpireOption = false;
+        for (int i = 1; i < args.length; i++) {
+            String opt = args[i].toUpperCase(Locale.ROOT);
+            if ("EX".equals(opt) || "PX".equals(opt)) {
+                hadExpireOption = true;
+                i++;   // 连它后面那一枚数值一起摘掉
+                continue;
+            }
+            kept.add(args[i]);
+        }
+        if (!hadExpireOption) {
+            return null;
+        }
+        kept.add(0, args[0]);
+        return kept.toArray(new String[0]);
+    }
+
+    /**
+     * 落一组 AOF 记录（一条命令可以换写出多条）。当前连接不在 DB 0 时必须先写 SELECT：
+     * AOF 重放用的是一个全新连接（db 恒为 0），不带上库号的话 {@code SELECT 3} 之后
+     * 写进去的数据会全部落到 DB 0。SELECT 只在前缀打一次，不必每条记录都重复。
+     */
+    private void writeAofRecords(java.util.List<String[]> records) throws java.io.IOException {
+        if (records.isEmpty()) {
+            return;
+        }
         if (currentDb != 0) {
             aof().appendCommand(new String[]{"SELECT", Integer.toString(currentDb)});
         }
-        aof().appendCommand(record);
+        for (String[] record : records) {
+            aof().appendCommand(record);
+        }
     }
 
     /** 一条命令同时改动两个键的操作（源与目标都要让 WATCH 看见）。 */

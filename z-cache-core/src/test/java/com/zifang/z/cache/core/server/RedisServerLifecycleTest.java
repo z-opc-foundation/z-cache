@@ -525,6 +525,153 @@ class RedisServerLifecycleTest {
     }
 
     /**
+     * AOF 里只能记<b>绝对</b>时刻 —— 这是"停机期间到点"那一判在重放之后仍然成立的唯一前提。
+     * <p>
+     * 上游在落盘<em>之前</em>就换写：{@code feedAppendOnlyFile}（aof.c:594-606）把
+     * EXPIRE / PEXPIRE / EXPIREAT 换成 PEXPIREAT，SETEX / PSETEX 拆成 SET + PEXPIREAT，
+     * 带 EX/PX 的 SET 同样拆开；换算体 {@code catAppendOnlyExpireAtCommand}（:550-577）里
+     * 那一句 {@code when += mstime()}（:566）就是"日志里不留相对时间"的地方，
+     * 注释（:543-549）写得很直白：<i>the time is always absolute and not relative</i>。
+     * <p>
+     * 我们此前把 argv 原样 append，相对毫秒于是从"重放的那一刻"重新起算，后果有两层：
+     * 一枚早就在停机期间死掉的键会再活一个完整周期，而所有活着的键都被免费续期停机那一段。
+     * 两层各给一格行为判据，末尾再加一格结构守卫（直接读回日志里每条记录的动词）。
+     */
+    @Test
+    void aofReplayCarriesAbsoluteExpiryAcrossDowntime() throws Exception {
+        java.nio.file.Path dir = java.nio.file.Files.createTempDirectory("zcache-aof-ttl");
+        java.nio.file.Path aof = dir.resolve("appendonly.aof");
+
+        int p1 = freePort();
+        RedisServer gen1 = new RedisServer("127.0.0.1", p1, 0);
+        gen1.setDataDir(dir.toString());
+        Thread t1 = startAndWait(gen1, p1);
+        try (Socket socket = connect(p1)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+            // 挂时刻的三种入口各留一枚：EXPIRE（五型各一枚）、SETEX、SET 带 EX。
+            String[][] alive = {{"a_str", "STRLEN"}, {"a_list", "LLEN"}, {"a_hash", "HLEN"},
+                    {"a_set", "SCARD"}, {"a_zset", "ZCARD"}};
+            send(socket, "SET", "a_str", "v");
+            assertEquals("+OK", readReply(in));
+            send(socket, "LPUSH", "a_list", "e");
+            assertEquals(":1", readReply(in), "前置条件: list 真有 1 个成员");
+            send(socket, "HSET", "a_hash", "f", "v");
+            assertEquals(":1", readReply(in), "前置条件: hash 真有 1 个域");
+            send(socket, "SADD", "a_set", "m");
+            assertEquals(":1", readReply(in), "前置条件: set 真有 1 个成员");
+            send(socket, "ZADD", "a_zset", "1", "m");
+            assertEquals(":1", readReply(in), "前置条件: zset 真有 1 个成员");
+            for (String[] cell : alive) {
+                send(socket, "EXPIRE", cell[0], "3600");
+                assertEquals(":1", readReply(in), "前置条件: " + cell[0] + " 挂得上时刻");
+            }
+            send(socket, "SETEX", "a_setex", "3600", "v");
+            assertEquals("+OK", readReply(in));
+            // 第六个入口：SET 带 EX —— 上游同样要拆成 SET + PEXPIREAT（aof.c:607-622），
+            // 少了这一支，"EX/PX 那一枚没被摘掉"就只有这一格会红。
+            send(socket, "SET", "a_setopt", "v", "EX", "3600");
+            assertEquals("+OK", readReply(in));
+            // 一条失败的 SETEX：键身上那一行时刻是上一次成功挂的。换写若只看时刻、不看回话，
+            // 就会把"从来没写进去的那个值"连同旧时刻一起记进日志 —— 重放之后 a_setbad 的内容被改掉。
+            send(socket, "SETEX", "a_setbad", "3600", "good");
+            assertEquals("+OK", readReply(in));
+            send(socket, "SETEX", "a_setbad", "0", "poison");
+            assertEquals("-ERR invalid expire time in setex", readReply(in),
+                    "前置条件: 第二次 SETEX 当场失败（值没写，k 仍带着上一次挂上的时刻）");
+            send(socket, "GET", "a_setbad");
+            assertEquals("good", readReply(in), "前置条件: 关服之前 a_setbad 读到的还是 good");
+            // 两枚"停机期间会到点"的：一枚走 SETEX 那一支，一枚走 EXPIRE 那一支
+            send(socket, "SETEX", "g_setex", "1", "x");
+            assertEquals("+OK", readReply(in));
+            send(socket, "HSET", "g_hash", "f", "v");
+            assertEquals(":1", readReply(in), "前置条件: g_hash 写得进去");
+            send(socket, "EXPIRE", "g_hash", "1");
+            assertEquals(":1", readReply(in), "前置条件: g_hash 挂得上时刻");
+            // 一枚"这一问根本没改库"的 EXPIRE：键不在，时刻挂不上，日志里也就不该留下它
+            // （换写做不到时宁可一个字都不记 —— 退回原样记 argv 就是把相对时间留在日志里）。
+            send(socket, "EXPIRE", "never_armed", "100");
+            assertEquals(":0", readReply(in), "前置条件: 键不在，EXPIRE 回 0");
+            send(socket, "TTL", "g_hash");
+            assertEquals(":1", readReply(in), "前置条件: 关服之前 g_hash 还活着（否则下面那两格是空跑）");
+        } finally {
+            gen1.stop();
+            t1.join(DEADLINE_MS);
+        }
+        // 只留 AOF：停机快照会顺手写一份 dump.rdb，两份都在就分不清是谁恢复的了
+        java.nio.file.Files.deleteIfExists(dir.resolve("dump.rdb"));
+        long downtimeStart = System.currentTimeMillis();
+        Thread.sleep(1_500);   // g_setex / g_hash 在这一段里就已经死了
+
+        int p2 = freePort();
+        RedisServer gen2 = new RedisServer("127.0.0.1", p2, 0);
+        gen2.setDataDir(dir.toString());
+        Thread t2 = startAndWait(gen2, p2);
+        try (Socket socket = connect(p2)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+            Map<String, String> seen = new LinkedHashMap<>();
+            Map<String, String> wrong = new LinkedHashMap<>();
+            long downtimeMillis = System.currentTimeMillis() - downtimeStart;
+            // 上界 = 3600 秒减去真实停机时长（留 1 秒余量防整数舍入），下界 = 还活着。
+            // 记相对时间的话这里恒等于 3600 —— 每一枚键都被免费续期了停机那一段。
+            long ceiling = 3_600L - Math.max(1L, downtimeMillis / 1000L);
+            String[][] cells = new String[][]{
+                    {"a_str", "STRLEN", ":1"}, {"a_list", "LLEN", ":1"}, {"a_hash", "HLEN", ":1"},
+                    {"a_set", "SCARD", ":1"}, {"a_zset", "ZCARD", ":1"}, {"a_setex", "STRLEN", ":1"},
+                    {"a_setopt", "STRLEN", ":1"}, {"a_setbad", "GET", "good"}};
+            for (String[] cell : cells) {
+                send(socket, "EXISTS", cell[0]);
+                String exists = readReply(in);
+                send(socket, cell[1], cell[0]);
+                String content = readReply(in);
+                send(socket, "TTL", cell[0]);
+                String ttlText = readReply(in);
+                long remaining = Long.parseLong(ttlText.substring(1));
+                seen.put(cell[0], "EXISTS " + exists + ", " + cell[1] + " " + content + ", TTL " + ttlText);
+                if (!":1".equals(exists) || !cell[2].equals(content)
+                        || remaining <= 3_000L || remaining > ceiling) {
+                    wrong.put(cell[0], seen.get(cell[0]));
+                }
+            }
+            String[] dead = {"g_setex", "g_hash"};
+            for (String key : dead) {
+                send(socket, "EXISTS", key);
+                String exists = readReply(in);
+                send(socket, "TTL", key);
+                String ttlText = readReply(in);
+                seen.put(key, "EXISTS " + exists + ", TTL " + ttlText);
+                if (!":0".equals(exists) || !":-2".equals(ttlText)) {
+                    wrong.put(key, seen.get(key));
+                }
+            }
+            seen.put("停机时长", downtimeMillis + "ms");
+            assertTrue(wrong.isEmpty(), "AOF 重放之后：活着的每一格要带着值和已经扣掉停机时长的剩余时间回来"
+                    + "（TTL 恰好 3600 = 日志里记的还是相对时间，重放时重新起算；"
+                    + "a_setbad 读到 poison = 一条失败的 SETEX 也被换写进了日志），"
+                    + "死了的两格就是死了（EXISTS :1 = 停机期间到点被当成\"重放后又活一个周期\"），逐格: " + seen);
+
+            // 结构守卫：日志里每条过期记录都必须是绝对时刻的那一个动词。
+            // 上面那一问是行为尺（"键还在不在、剩余多少"），摘掉某一支换写、但把相对量写对的行为
+            // 仍可能全绿；这里直接读回记录的动词，逐字判"日志里不再有相对时间"。
+            java.util.List<String> verbs = new java.util.ArrayList<>();
+            new com.zifang.z.cache.core.persistence.AofPersistence()
+                    .loadAof(aof.toString(), command -> verbs.add(command[0]));
+            assertTrue(verbs.contains("PEXPIREAT"), "换写后的记录里必须真有 PEXPIREAT，实际动词: " + verbs);
+            java.util.List<String> relative = new java.util.ArrayList<>();
+            for (String verb : verbs) {
+                if (verb.equals("EXPIRE") || verb.equals("PEXPIRE")
+                        || verb.equals("EXPIREAT") || verb.equals("SETEX") || verb.equals("PSETEX")) {
+                    relative.add(verb);
+                }
+            }
+            assertTrue(relative.isEmpty(), "AOF 里不许留下任何相对时间的过期命令，实际: " + relative
+                    + "（全部动词: " + verbs + "）");
+        } finally {
+            gen2.stop();
+            t2.join(DEADLINE_MS);
+        }
+    }
+
+    /**
      * 没配 dataDir 时 SAVE 不能装作成功。
      * <p>
      * 旧实现里 SAVE / BGSAVE 都直接返回一个写死的 OK，LASTSAVE 返回当前时间 —— 三个命令

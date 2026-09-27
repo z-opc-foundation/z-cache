@@ -1530,8 +1530,14 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   ② 服务器侧没有 active expire cycle（不变，本格 S2 那条又给它添了一条旁证：字符串那半靠的是"没人问就不回收"）；
   ③ `INFO keyspace` 的行形状（不变）；④ AOF 单独那一辈：`EXPIRE` 一族五支都在 `WRITE_COMMANDS` 名单里
   （`CommandHandler.java:3308-3311`，本轮现读），所以重放会经过 13b-ii 之后那套类型无关的命令层；
-  但"删掉 `dump.rdb`、只让 AOF 把带过期的四种集合键重放回来"这一格**还没有判据** —— 现在删 rdb 的三处
-  （`RedisServerLifecycleTest:602 / :629 / :767`）量的是 SETBIT，而本格那条判据方向相反，在 `:451` 删的是 aof；
+  但"删掉 `dump.rdb`、只让 AOF 把带过期的集合键重放回来"这一格当时**还没有判据** —— **这一格已由下面的 13d 闭合**
+  （`aofReplayCarriesAbsoluteExpiryAcrossDowntime`，`RedisServerLifecycleTest:541`，删 rdb 在 `:601`，
+  五种类型各一枚 + SETEX + SET 带 EX 三个入口）。
+  ⚠ 那句话里的行号是当时现读的（`:602 / :629 / :767`），13d 插进一条 `@Test`（+147 行）后移到
+  `:749 / :776 / :914`（本轮 `grep -n 'deleteIfExists(dir.resolve("dump.rdb"))'` 现读）；
+  顺带纠正同句里的一处归因：那三处并不都"量的是 SETBIT" —— 只有 `:914` 所在的 `bitWritesAreJournaledAndReplayed`
+  是 SETBIT，`:749 / :776` 所在的 `aofReplayRestoresDataAcrossThreeGenerations` 量的是 SET/LPUSH/BLPOP 的跨三代重放。
+  本格那条判据方向相反、在 `:451` 删的是 aof（未受位移影响）。
   ⑤ 端口抢占（不变，已登记）。
 
 #### DEBUG SLEEP 那一问换成单调钟：一条归因不下来的红，先把"下一次出现有没有意义"做出来
@@ -1568,6 +1574,56 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   ⚠ 顺带纠正一处我自己用错的常识：全量 reactor 在这台机器上是 **32 秒**级，不是我此前反复据此排程序的
   "5—6 分钟"级（那一估来自把 08:48 那轮链 9.4 分钟整个记到全量那一跑头上，实际那是 19 次 mvn 的总和）。
   以后"要不要跑全量"不该按 5 分钟的成本来权衡。
+
+#### AOF 里记的是相对时间：重启会救活已经死掉的键，还给所有键免费续期（13d）
+- 现象（改动前的形状是量出来的，不是推断）：把 `CommandHandler.java` 整份换回 HEAD 的字节
+  （`git show HEAD:…` 重定向进文件，**不动** `checkout`；还原只从本次运行开头存的副本 `cp`，
+  收尾 md5 `6ecc59190be6a2296a290e1bb7a2f045` 对账 `match=True`），只跑本格新加的那条判据
+  （`logs/aof_ttl_headshape.log`，rc=1），逐格表交回：八格活着的 `TTL :3600`（真实停机 1568ms 一秒没扣）、
+  `g_setex=EXISTS :1, TTL :1`、`g_hash=EXISTS :1, TTL :1` ⇒ 两枚"停机期间就该死掉"的键重放之后又活一个完整周期。
+- 上游那一处在落盘<em>之前</em>就换写：`feedAppendOnlyFile`（`aof.c:594-606`）把 EXPIRE / PEXPIRE / EXPIREAT
+  换成 PEXPIREAT，SETEX / PSETEX（`:598-606`）与带 EX/PX 的 SET（`:607-622`）拆成 SET + PEXPIREAT；
+  换算体 `catAppendOnlyExpireAtCommand`（`:550-577`）里那句 `when += mstime()`（`:566`）就是
+  "日志里不留相对时间"的地方，注释（`:543-549`）写得很直白：<i>the time is always absolute and not relative</i>。
+  重写那一辈同理（`rewriteAppendOnlyFileRio` `:1299`，逐键在值之后补一条 `*3\r\n$9\r\nPEXPIREAT\r\n`，`:1352-1356`）。
+- 改动：`CommandHandler.aofRecordsFor(args, result)`（`:3399`）＋ `writeAofRecords`（`:3465`，一条命令可以
+  换写出多条，`SELECT` 前缀只打一次）。记录只有两种结局 —— **换成绝对时刻，或者一个字都不记**，
+  不承认"退回原样记 argv"这第三种。时刻取自 `MemoryStore.expireAtDb`（命令刚执行完，表里那一行就是它
+  真正挂上的值），不再重算 argv：重算要跟着 EXPIRE/EXPIREAT/溢出饱和的文法走第二遍，而那一行是命令层
+  已经裁定的唯一结果。`result` 是 `RespError` 就不记 —— 这一判是写完之后被自己的判据逼出来的：
+  一条失败的 `SETEX k 0 bad` 之后 k 身上那行时刻是<em>上一次</em>成功挂的（`> 0`），只看时刻就会把
+  "从来没写进去的那个值"连旧时刻一起记进日志，重放之后 k 的内容被一条从来没成功过的命令改掉（M6 量的就是它）。
+  `SET k v NX` 的 NX/XX 原样保留、只摘 EX/PX 那一枚连同它的数值（`setWithoutExpireOption` `:3441`），
+  因为我们不像上游那样"只记真改过库的命令"，削成三条参数会把 NX 那一判在重放时演丢。
+- 判据 `RedisServerLifecycleTest.aofReplayCarriesAbsoluteExpiryAcrossDowntime`（`:541`）：AOF-only 重启
+  （删掉 `dump.rdb`）＋ 真实停机 1.5 秒，十格收一张表（八格活的：值/内容 + `TTL ∈ (3000, 3600 − 停机秒数]`；
+  两格死的：`EXISTS :0` / `TTL :-2`），行为断言在 `:647`。表里五种类型各一枚（str/list/hash/set/zset）
+  —— 上一节 ④ 那条待办（"删掉 `dump.rdb`、只让 AOF 把带过期的集合键重放回来"从来没有判据）到此关闭。
+  另加一层结构守卫（`:658` / `:666`）：直接 `loadAof` 读回每条记录的动词，必须有 `PEXPIREAT`、
+  且不得出现任何相对时间的过期动词。它与行为层不重叠：M5、M7 两支行为十格全绿，只有这一层红。
+- 牙（第七份量具 `~/.cache/zcache_gauges/aof_ttl_mut/aof_ttl_teeth.py`；被量字节
+  `CommandHandler.java 6ecc59190be6a2296a290e1bb7a2f045`，每支还原后 md5 对账 `match=True`；
+  日志 `logs/aof_ttl_*.log`，链文件 `logs/aof_ttl_chain_final.out`）：
+  M1 整块换写摘掉 → 点名 `g_hash, g_setex`；M2 SETEX/PSETEX 那一支摘掉 → `a_setex`；
+  M3 SET 带 EX/PX 那一支摘掉 → `a_setopt`；M4 只记时刻、把值那一半摘掉 → `a_setex`；
+  M5 换写成 EXPIREAT（秒精度）→ 结构守卫；M6 摘掉"回的是错就不记"那一判 → `a_setbad=EXISTS :1, GET poison`；
+  M7 挂不上时刻时退回原样记 argv → 结构守卫。`SUMMARY mutants=7 bad=0`。
+  过程中修掉两处量具自己的毛病，记下来免得重犯：
+  ① M4 第一版写成 `Arrays.asList(expireRecord)`（单元素数组被推成 `List<String>`）编译不过，
+  `rc=1` 而红行 0 条 —— 这种"崩红"不是判据赢，脚本现在见 `COMPILATION ERROR` 直接 FATAL 退出；
+  ② M6 的 hint 我凭形状写成 `a_setbad=GET poison`，真红行是 `a_setbad=EXISTS :1, GET poison, TTL :3599`，
+  于是被自己判成 RED-WRONG；改成从断言消息复制之后 TEETH-OK。
+- 基线 `900`（`358 + 405 + 135 + 2`，全量 `mvn -o -B clean test` rc=0 / BUILD SUCCESS / Total time 34.0s，
+  日志 `logs/full_aof_ttl_final.log` 连同 `.rc` / `.tally`，36 份 surefire XML 全部晚于本轮起点）：
+  core 404 → 405，本格新增 1 个 `@Test`。
+- 顺手扫到的下一格（不在本格修）：`AofPersistence.rewriteAof()`（`:319`）写的是**空**命令集
+  （注释自陈"实际实现需要依赖 StoreAccessor 来获取当前数据库状态"），然后把真 `appendonly.aof` 删掉并
+  `truncateAndReopen()`。它今天零调用方（全仓 `grep -rn rewriteAof` 只有定义那一行），但方法是 `public`：
+  谁把它接上 `BGREWRITEAOF` 或体积自动重写，谁就在抹整个数据集。要么按上游那一遍补全
+  （逐键导出 + 每键一条绝对时刻 `PEXPIREAT`），要么连 `rewriting` / `rewriteExecutor` 一起删掉。
+  对照记录：`appendCommand` 的调用点只有两处（`CommandHandler:3470 / :3473`），都在 `writeAofRecords` 里，
+  所以这一格的换写没有被绕过的第二条写入路径。
+- 250 那一侧仍然没有实测：它还是拒绝 ssh（`kex_exchange_identification` 直接 reset），本轮全部读数单机。
 
 ### Added
 - `RedisServer.serverScope()`：只读拿到本台那一份，测试与嵌入式据此判断作用域边界。
