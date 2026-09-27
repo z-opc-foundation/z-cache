@@ -318,6 +318,7 @@ public class CommandHandler {
             switch (cmd) {
                 case "PING":     result = handlePing(args);       break;
                 case "ECHO":     result = handleEcho(args);       break;
+                case "TIME":     result = handleTime(args);       break;
                 case "QUIT":     result = RespSimpleString.of("OK"); break;
                 case "SELECT":   result = handleSelect(args);     break;
                 case "DBSIZE":   result = handleDbsize();         break;
@@ -536,6 +537,25 @@ public class CommandHandler {
     private Object handleEcho(String[] args) {
         if (args.length != 2) return RespError.wrongNumberOfArguments("ECHO");
         return RespBulkString.of(args[1]);
+    }
+
+    /**
+     * TIME —— 表上那一行是 {@code server.c:295} 的 {@code {"time",timeCommand,1,"RF",…}}，
+     * 三个可判定的后果都在 {@code RedisTimeCommandTest} 里钉着：arity 是<b>正</b> 1（恰好一个词，
+     * 所以 {@code TIME ""} 也是 arity 错）、回的是两条 bulk 而不是两条整数、两个标都不是写标
+     * （不进 AOF）。文案里的命令名是小写的 {@code 'time'}：上游打的是 {@code c->cmd->name}
+     * （{@code server.c:2613-2614}），{@link RespError#wrongNumberOfArguments} 在出口统一收小写。
+     * <p>
+     * 值经 {@code ll2string}（{@code networking.c:596}）打成<b>十进制原样、不补零</b>：微秒 1234
+     * 是 {@code $4=1234} 而不是 {@code $6=001234}。这一位是"看着无害、客户端会踩"的形状 ——
+     * 定长读 6 位的写法在这里会读错，而除了逐拍比对"线上那一串 == 按十进制重打的那一串"，
+     * 没有别的判据看得见它，所以下面每一拍都在算那一次重打。
+     */
+    private Object handleTime(String[] args) {
+        if (args.length != 1) return RespError.wrongNumberOfArguments("TIME");
+        long ms = System.currentTimeMillis();
+        return RespArray.of(RespBulkString.of(String.valueOf(ms / 1000L)),
+                RespBulkString.of(String.valueOf((ms % 1000L) * 1000L)));
     }
 
     private Object handleSelect(String[] args) {
