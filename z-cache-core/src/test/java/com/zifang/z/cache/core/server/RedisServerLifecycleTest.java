@@ -2080,10 +2080,11 @@ class RedisServerLifecycleTest {
      * </p>
      * <p>
      * 窗口是<em>卡</em>出来的，不是睡出来的：导出逐库取字符串表必经
-     * {@code MemoryStoreAccessor.getAllStringEntries}（现读 {@code AofPersistence.java:709} 是
-     * 导出侧唯一读它的一行），在这里挂一道闸就能钉住"快照已取完、文件还没换"那一段。放行用的是
-     * <em>有界</em>等待：修好之后这道闸是在那把锁里跑的，主线程的 {@code SET} 进不来、也就轮不到
-     * 它去放行，只有超时能让两种设计都不互卡 —— 所以时间到而没有红，本身就是"写侧被堵住了"的读数。
+     * {@code MemoryStoreAccessor.getAllStringEntries}（现读：那个文件里
+     * {@code grep -n getAllStringEntries} 只命中导出侧那一处；行号随注释漂，认的是这一问而不是那个数），
+     * 在这里挂一道闸就能钉住"快照已取完、文件还没换"那一段。放行用的是<em>有界</em>等待，
+     * 这一条不是省事而是判据成立的前提：修好之后这道闸跑在那把锁里，写侧进不来、也就轮不到它去放行，
+     * 无限等会让两种设计互卡成一次挂死 —— 有界之后，"那一笔等了多久才回 +OK"本身就是一个读数。
      * </p>
      */
     @Test

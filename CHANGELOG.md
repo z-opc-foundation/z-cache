@@ -2288,8 +2288,10 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   现读旁证：`appendRawLocked` 里 `if (rewriting.get())` 那一只腿只 `LOGGER.fine("AOF rewrite in
   progress, buffering command")`，一个字节都没有缓冲（`grep -n 'buffering command' -A 3 <该文件>`），
   而上游正是靠重写期间的 `aof_rewrite_buf` 补这个洞。
-  T1 的预期集因此只留"每遍都红"的交集，剔除的那一格连同这段来历写在 `teeth.py` 那条注释里，
-  等 13m 的判据落地后按实测改写。
+  T1 的预期集因此只留"每遍都红"的交集，剔除的那一格连同这段来历写在 `teeth.py` 那条注释里。
+  （下一节就是那一节：13m 的缺陷是真的、已按判定性量具证实并修掉，但它**不是**这一格跳的原因 ——
+  修完之后同一支重量的率一字未动，见下节末条。这一格今天的身份也不是"删掉的判据"，而是量具里
+  一条带台账的 `OPTIONAL`：红率由 `optional_rate` 现读 `flaky_probe` 的日志，`0 < 红 < 总` 才允许放宽。）
 - **一条必须写下来的盘面事实：origin/main 上那一笔带着一个变异体**。另一会话的 `chore(sync)`
   在 15:37:30 把当时在途的字节入库成 `4039de0`，而那个时刻 `AofPersistence` 正被 m2 那一轮的
   **T12 变异**改着（条件里少了 `rdbSaving`）⇒ **已推送的 `4039de0` 里，13l① 那一项条件是不在的**
@@ -2309,6 +2311,96 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   一个新实例能不能读回那一笔**，只比文件长度不算；② 13n = `CONFIG GET` / `CONFIG SET` 把那两条旋钮
   接到命令层（仓库里 `case "CONFIG"` 一个都没有，同一条管道的阳性对照 `case "BGREWRITEAOF"` 命中一处，
   行号一律现读）。
+
+#### 快照与换文件得取同一把锁：窗口里那句 `+OK` 后来兑现了（13m）
+
+- **来账**：13l 结尾"下一格 ①"，加上上一节那条会跳的读数。13l 把机制写成"待证假设"，并明确要求
+  13m 用**判定性**的量具去证或去否、"不许照抄本节" —— 所以这一轮第一步是写判据，
+  生产代码一个字没动，先让它红。
+- **窗口是卡出来的，不是睡出来的**：导出逐库取字符串表必经 `MemoryStoreAccessor.getAllStringEntries`
+  （现读：`grep -n 'getAllStringEntries' z-cache-core/src/main/java/com/zifang/z/cache/core/persistence/AofPersistence.java`
+  → 本轮字节下唯一命中一处，`:717`；行号会随注释漂移，认那一行认的是这条命令而不是这个数）。
+  判据把它换成一个子类：先 `super` 取快照，再放一道闸（`snapshotTaken.countDown()` → `resume.await(300ms)`），
+  于是"快照已取完、文件还没换"那一段时间被钉死，主线程在这段里写一笔并读回它的答复。
+  **放行必须是有界等待**，这一条不是省事而是判据成立的前提：修好之后这道闸跑在那把锁里，
+  写侧进不来、也就轮不到它去 `countDown`，无限等会让两种设计互卡成一次挂死而不是一个读数。
+- **修之前的实测**（`mvn -o -B -pl z-cache-core test -Dtest='RedisServerLifecycleTest#writeAcknowledgedDuringRewriteSurvivesIt'`，
+  `Tests run: 1, Failures: 1`，两格红）：`窗口里那一笔回的是 +OK` 绿（客户端当场被告知成功）、
+  `换过手 ⇒ 三笔同键在日志里塌成一条` 绿（实测 = 1，证明真的换过一份，下一格当得了数）、
+  `窗口里确认过的那一笔，日志里必须还有一条` 红（期望 1，实际 **0**）、
+  `重启之后 GET late（确认过的写不许失踪）` 红（期望 v2，实际 **$-1**）。
+  也就是**一次已确认的写整笔失踪**。判据问的是"整份日志重放进一个新实例读不读得回来"与
+  "日志里还有没有那一条记录"，两项都不读我们自己的记账（13j 立的那条：等待信号不许是被审的字段，
+  这里同理：结论不许来自 `aof_current_size`）；文件长度一个字都没用上。
+- **修法是把一行挪进锁里**，不是新增机制：`rewriteInternal` 的 `exportMinimalCommandSet(accessor)`
+  从 `synchronized (this)` 之外挪进同一把锁。追加那一步本来就持这把锁，于是一笔写只剩两种落点 ——
+  排在快照之前（命令层先写内存再记日志，它的值必然已在表里）或排在 rename 之后（它进的是新日志），
+  没有"已确认却没落到新日志"这第三种。上游 fork 不出这一段，走的是另一条路：重写期间每一笔另记进
+  `aofRewriteBuffer`（现读 `aof.c:636-641`，注释原文 "accumulate the differences between the child DB
+  and the current one in a buffer"），收尾时在 rename **之前**并进新日志（`aof.c:1680-1681` 那句
+  "Flush the differences accumulated by the parent to the rewritten AOF"，调用点 `:1692`）；
+  它还有第二条现读的规矩在同一个函数里：`aof.c:629-631` "flushed on disk just before the client will
+  get a positive reply" —— 先落盘再答复。我们不 fork，靠这把锁，代价就是类注释里写明的那一句
+  "重写期间写侧被堵住"。**这一句从 `4549559`（导出当前状态那一轮）起就在类注释里写着"期间的写命令
+  排队，不会被夹在中间丢掉"，README 从 13i 起写着"重写期间写侧被堵住"** ⇒ 宣传与兑现差了一层，
+  本轮让代码追上它自己广告过的那句话，而不是给一句错了的话补一句新话。
+- **顺手证伪了自己上一轮的一条归因**：13l 把 T1 下那格会跳的读数（`那八笔确实落到了盘上（长度比换完那一刻大）`，
+  4/8）当成指向 13m 机制的旁证。13m 修完之后重量同一支（`TEETH_PASS=probe13m python3 flaky_probe.py 8`，
+  日志 `logs/probe_13m.txt`）：未变异的真代码 8/8 全绿，T1 下该格仍然 **4/8** —— 率一字未动
+  ⇒ **那一格的跳与 13m 无关**，13l 那句"待证"今天只证到了"不是它"。它为什么跳仍未归因；
+  把它剔出验收线的理由也从来不是"它指向某个已修缺陷"，而是"会跳的读数不当验收线"，这一条不变。
+- **量具按新判据重量了一遍，并且添了三样机械**（`~/.cache/zcache_gauges/auto_rewrite_mut/`）：
+  ① 变异 16 支 → **18** 支。T17 把导出挪回锁外（正是 13m 修掉的那个坏法，两处锚点：声明处带初值 +
+  删掉锁内那一次调用），T18 把 `synchronized (this)` 换成 `synchronized (rewriting)` —— "看着像修了"：
+  加了一道锁，但不是 `appendCommand` 用的那一把，写侧照旧进得来。**两支的量到红集逐字相同**（各 2 格），
+  也就是这把尺分不开"锁没加"与"锁加错了地方"，按 13j 立的规矩记为**覆盖面缺口**而不是记分。
+  ② 控制组 5 → **6** 支（分母写死在 `CONTROL_TESTS`），18 组预期集整体出自一轮测量（标签 m4，
+  `TEETH_MEASURE=1`）并由 `backfill.py` 机械回填；这一句现在有一条可复核的证法：`python3 backfill.py m4`
+  再跑一遍报 `量到 18 支 改写 0 行 警告 0 支`（存档 `logs/m4_backfill_recheck.txt`）⇒ 表里那 18 组
+  与 m4 量到的红集逐字相同。而新判据没有悄悄改写旧那 16 支的账：m4 的读数里含 13m 那两格的
+  只有 T17/T18 两支（现读 `grep -c 'MEASURED T.*窗口里确认过的那一笔' logs/m4_teeth.txt` → **2**）。
+  ③ 那条会跳的读数从"口头剔除"变成一条带台账的 `OPTIONAL`：`optional_rate()` 现取 `flaky_probe.py`
+  的 stdout 台账（认首行 `PROBE pass=probe13m`，核 `0 < 红 < 总`，一条读数都没有就 preflight 判 BAD、
+  rc=1）、`verdict_of()` 让可红格只挡"多红"那一侧（漏红、以及两列之外的多红照旧判错）、
+  `selftest()` 五臂冒烟（`TEETH_SELFTEST=1` → `cases=5 bad=0`）。放宽这一类最先写瞎的通常是量具自己，
+  所以每一层都配反向证据：往 `OPTIONAL` 里塞一格常绿的（拿 T2 试）⇒ 当场
+  `PREFLIGHT-BAD T2 的可红格 正好等于地板 ⇒ 不重写 没有任何 flaky_probe 读数支撑`、rc=1，
+  撤回归 rc=0（整份 stdout 存档 `logs/negative_control_optional.txt`；这一臂本轮重跑过一遍，
+  `teeth.py` 事后 md5 与注入前逐字相同 = `bf9e434262e28d1b7c4a8643c7d321a9`）。
+  反过来那一头也有真跑里的证据：m5 那一轮 T1 **恰好真的红了这一格**
+  （`判红 4 格（可红 1 格: 那八笔确实落到了盘上…）`）而裁决仍是 `RED-OK` —— 同一次读数落在旧那副
+  "只留交集"的预期集上会被打成 `RED-WRONG`，也就是 m2 那条 bad=1 原样复发；
+  这一格因此是"真放宽里放过一次、假放宽里拦下一次"的两头证据。
+- **验收轮（最终字节）**：`TEETH_PASS=m5 python3 teeth.py` → `SUMMARY mutants=18 bad=0 control=OK`、
+  `CONTROL 未变异: Tests run 6 Failures 0 Errors 0`，18 行 `MUTANT` 全是 `RED-OK`（现读
+  `grep -o 'RED-OK\|RED-WRONG\|SURVIVED\|COMPILE-BROKEN' logs/m5_teeth.txt | sort | uniq -c` → `18 RED-OK`）。
+  耗时是量出来的：16:30:57 → 16:34:47 = 3 分 50 秒。
+- **本轮的"绿"量的是哪一副字节**：`logs/m5_teeth.txt` 第一行 `SNAPSHOT` 记着 TRACKED 五份的 md5
+  （`AofPersistence.java=1281f434a1a84e5eed9e56dece3b4205` —— 就是本仓 13m 那一行挪锁的字节，
+  `RedisServerLifecycleTest.java=18b5252f5aca04ece6b09993d923afad`）。**引的不是 m4 那一跑**：m4 之后
+  我又动了该测试文件 javadoc 里一处过期引用（`AofPersistence.java:709` 那一行被本轮新加的注释推到了
+  `:717`，所以把它改成"认这一问不认那个数"的写法：`grep -n getAllStringEntries` 在该文件只命中导出侧
+  一处）。按 13j 那条"纯注释改动同样作废已引的裁决"，m4 只当"测量轮出处 + 回填幂等"的凭据用，
+  凡引"绿"一律引 m5。
+- **基线与复跑命令**：`mvn -o -B clean test` BUILD SUCCESS（`Total time: 45.709 s`），
+  `python3 ~/.cache/zcache_gauges/tally_log.py ~/.cache/zcache_gauges/logs/full_13m_run2.txt` 报
+  `MODULES=4 run=915 failures=0 errors=0 skipped=0`（`358 + 420 + 135 + 2`；core 419 → 420 正是 13m
+  那支新 @Test），基线 914 → **915**。这一轮 run1（改 javadoc 之前）也是 915/0，`run2` 才是最终字节的数。
+  **只有本机**，250 自 13k 起一格都没复算（至今 ssh 不通，见仓内惯例：恢复后补跑）。
+  另有一笔副作用要交代：本轮为编译 client 顺手跑过一次 `mvn -o -B -pl z-cache-core -am -DskipTests install`，
+  于是 `~/.m2/repository/io/github/yuku123/z-cache-core/1.3.6/` 里多了一份本机装的 jar（16:07:23）；
+  基线命令仍是 `clean test`（不 install），这轮的数不受它影响，但**别拿 `~/.m2` 里那份当发布件**。
+  ⚠ 本轮动过 `AofPersistence` 与 `RedisServerLifecycleTest` ⇒ 兄弟族（`aof_rw_mut` / `bgrewriteaof_mut` /
+  `fsync_mut` / `info_aof_sizes_mut` / `stream_rw_mut`）里 TRACKED 含这两份之一的，13k／13l 时段的读数
+  对这副字节作废：要么复跑，要么引用时注明量的是哪一副。`auto_rewrite_mut` 本身已按 m5 重量。
+- **下一格（13n）**：`CONFIG GET` / `CONFIG SET` 把那两条旋钮接到命令层。两侧都是现读的：
+  仓库侧 `grep -rn 'case "CONFIG"'` **零命中**，同一条管道的阳性对照 `case "BGREWRITEAOF"` 命中一处
+  （`CommandHandler.java:432`，2026-09-27 现读）；上游侧 `grep -n auto-aof-rewrite config.c`
+  （`~/.cache/zcache_gauges/full5x/redis-5.0.14/src`）→ `:498` / `:506` 读 redis.conf，
+  `:1161`（percentage，`0..INT_MAX`）与 `:1262`（min-size，`config_set_memory_field(…, 0, LONG_MAX)`）
+  是 SET 侧那两道界，`:1361` / `:1363` 是 GET 侧，`:1286` 是 `Invalid argument '%s' for CONFIG SET '%s'`
+  那句文案，`:2186-2187` 归 `CONFIG REWRITE`。判据形状照老规矩：先红再修，越界拒不拒、拒的是谁家的文案，
+  各成具名格；尺本身要挂变异验牙；行号一律现读。
 
 ### Added
 - `RedisServer.serverScope()`：只读拿到本台那一份，测试与嵌入式据此判断作用域边界。
