@@ -133,8 +133,13 @@ public class AofPersistence {
      * （{@code aof.c:466}、{@code :480}），而<em>换过一份日志之后按 stat 重取</em>而不是接着加
      * （{@code aofUpdateCurrentSize}，{@code aof.c:1653-1665}；调用点在载入收尾 {@code :865} 与
      * 重写收尾 {@code :1772}）。接着加会怎样：旧日志里那些"同一个键写三笔"的流水已经不在新文件里了，
-     * 于是这个数比真实文件大一截 —— 而它是自动重写算增幅的分子（{@code server.c:1305-1310}），
+     * 于是这个数比真实文件大一截 —— 而它是自动重写算增幅的分子（{@code server.c:1302-1311}），
      * 大一截就等于<em>提前重写</em>，小一截就等于<em>永不重写</em>。
+     * </p>
+     */
+    private volatile long appendedBytes;
+
+    /**
      * 重写算增幅时的那块底座 —— 对应上游的 {@code server.aof_rewrite_base_size}
      * （{@code server.h:1079}，注释原文 "AOF size on latest startup or rewrite"）。
      * <p>
