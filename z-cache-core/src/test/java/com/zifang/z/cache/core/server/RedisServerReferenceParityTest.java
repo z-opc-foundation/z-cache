@@ -930,11 +930,15 @@ class RedisServerReferenceParityTest {
                 assertEquals("+OK", readReply(in), "battery33:52");
                 send(s, "DEBUG", "SLEEP", "-1");
                 assertEquals("+OK", readReply(in), "battery37:69 —— 旧实现这里是 internal error");
-                long t0 = System.currentTimeMillis();
+                long t0 = System.nanoTime();
                 send(s, "DEBUG", "SLEEP", "0.3");
                 assertEquals("+OK", readReply(in), "battery36:4 —— 旧实现把秒当毫秒，直接判整数错");
-                long slept = System.currentTimeMillis() - t0;
-                assertTrue(slept >= 250, "0.3 秒必须真睡够，实测只等了 " + slept + "ms");
+                long slept = (System.nanoTime() - t0) / 1_000_000L;
+                // 这一问量的是"睡了多久"，只能用单调钟：墙钟在那 0.3 秒里被 NTP 往回拨一下就
+                // 会读出一个偏小的数（09-27 凌晨真见过一条 `实测只等了 199ms`，全树里没有任何
+                // 路径能让 300ms 的 sleep 睡短，单独复跑那一个类 8 遍 8 绿，机制始终没归因下来）。
+                // 换成 nanoTime 之后，下一次再出现这个红才有意义。
+                assertTrue(slept >= 250, "0.3 秒必须真睡够，实测只等了 " + slept + "ms（nanoTime，不受墙钟影响）");
 
                 // ERROR 原样回，不添 ERR 前缀
                 send(s, "DEBUG", "ERROR", "hello");

@@ -1418,6 +1418,9 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   单独把这一个类复跑 8 遍 8 绿、八份日志 `grep -c 只等了` 全 0；而"睡短了"朝负载噪声的方向也不该出现
   （客户端拿墙钟量的是下界，机器越忙只会读得更大），所以更像是墙钟被 slew 或回话错位一格，
   机制没定下来 ⇒ 已登记待办：那一条判据改用 `nanoTime`，好让下一次出现有意义。
+  **这一条待办由下面那格（13c）关闭**：判据现在走 `System.nanoTime()`，红消息长成
+  `实测只等了 155ms（nanoTime，不受墙钟影响）`（引用的是 13c 那一轮 T1 变异交回的那一行，
+  行号也从 `:937` 挪到了 `:941`）。199ms 那一条读数仍按"未归因"记在这里，不追改。
   08:48—08:57 那一轮整链重跑（19 次 mvn，含同样的 Q4 那一跑 `reds=1`）**没有再出现**这一条，
   所以它仍是"未归因、本轮未复现"，不写成"已排除"。
   ⚠ 这 8 遍最初报的是"每遍 13 条失败"，那是**我的量具坏了**：命令漏了 `-am`，core 链接到 `~/.m2` 里
@@ -1530,6 +1533,41 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   但"删掉 `dump.rdb`、只让 AOF 把带过期的四种集合键重放回来"这一格**还没有判据** —— 现在删 rdb 的三处
   （`RedisServerLifecycleTest:602 / :629 / :767`）量的是 SETBIT，而本格那条判据方向相反，在 `:451` 删的是 aof；
   ⑤ 端口抢占（不变，已登记）。
+
+#### DEBUG SLEEP 那一问换成单调钟：一条归因不下来的红，先把"下一次出现有没有意义"做出来
+
+- **来账**：上上一格留了一条**未归因**的红 —— `0.3 秒必须真睡够，实测只等了 199ms`，单独复跑那一个类
+  8 遍 8 绿、八份日志 `grep -c 只等了` 全 0，机制定不到任何一条路径上。当时登记的待办就是这一格：
+  那条判据拿 `System.currentTimeMillis()` 量 elapsed，于是墙钟在那 0.3 秒里被往回拨一下就能读出一个偏小的数
+  —— **这条红从此不可能有意义**（出现了也分不清是睡短了还是钟动了）。
+- **改动**（只动测试，生产代码一行没改）：`RedisServerReferenceParityTest:933-941` 的 elapsed 换成
+  `System.nanoTime()`（除以 `1_000_000L` 取毫秒），红消息里明写"（nanoTime，不受墙钟影响）"。
+  阈值 `>= 250` 不动 —— 那是 300ms 那一问的调度余量，与用哪个钟无关。
+- 牙（第五支量具 `sleep_teeth.py`；基线先在同一份字节上绿、每支还原后 `match=True`；被量字节
+  `CommandHandler.java 96a31e63ef13b0bec1db3d57bb55716d`（HEAD，未改）＋
+  `RedisServerReferenceParityTest.java c7d8b2bc86a46ab180770305c9edb72f`，日志 `logs/sleep_*.log`）：
+  - T1 把服务端 `seconds * 1000.0` 改成 `* 500.0`（只睡一半）→ 1 红，
+    `debugSubcommandGrammarMatchesTheReference:907->run:1398->lambda$…:941 0.3 秒必须真睡够，
+    实测只等了 155ms（nanoTime，不受墙钟影响）`；
+  - T2 整条 `if (ms > 0) Thread.sleep(ms)` 摘掉（完全不睡）→ 同一行红，读数 `0ms`。
+    两支读数各自与注入量成比例（155 ≈ 300 的一半、0 ＝ 不睡），也就是这条判据报出来的数就是它名字里那个量；
+    `SUMMARY mutants=2 bad=0`。
+- 顺手把同型扫了一遍（判据不是"我以为只有这一处"；命令是在 `z-cache/` 下
+  `grep -rn "System.currentTimeMillis() - " --include='*.java' . | grep '/src/test/'`，命中三处、全在测试树）：
+  `RedisServerLifecycleTest:117`（`assertTrue(System.currentTimeMillis() - begin < DEADLINE_MS, "stop() 不能阻塞等锁")`，
+  `DEADLINE_MS = 5_000L` 定义在同一个类的 `:30`）、`ZCacheConnectionTest:68`（用它的断言在 `:69`，`elapsed < 5000`）、
+  `ZCachePoolTest:432`（断言在 `:436`，`elapsed < 1000`）。**三处都是上界**，和本格那一问（下界 `>= 250`、
+  而且真要有 300ms 的睡）方向相反：墙钟往回拨只让上界读得更小（顶多掩盖缺陷，不会凭空报红），要误报红得先有
+  一次比整个余量（1—5 秒）还大的正向跳变 ⇒ 本格不动这三处。
+  同一个类里剩下的两处 `currentTimeMillis()`（`RedisServerReferenceParityTest:1459-1460`）是
+  **等待上限的 deadline**（`deadline = now + DEADLINE_MS` 再 `while (now < deadline)`），也不量时长。
+  两条对照，防"没扫到"其实是尺看不见：测试树里 `System.currentTimeMillis()` 共 22 处命中（远不止那三处减法，
+  说明这个符号在尺眼里不是隐身的），而 `nanoTime` 在测试树里只有本格新写的那两行（`:933` 取起点、`:936` 求差）。
+- 基线 `899`（`358 + 404 + 135 + 2`，全量 `mvn -o -B clean test` rc=0 / BUILD SUCCESS / Total time 32.4s，
+  日志 `logs/full_13c.log`，36 份 surefire XML 全部晚于本轮起点）：本格没有新增 `@Test`，方法数不变。
+  ⚠ 顺带纠正一处我自己用错的常识：全量 reactor 在这台机器上是 **32 秒**级，不是我此前反复据此排程序的
+  "5—6 分钟"级（那一估来自把 08:48 那轮链 9.4 分钟整个记到全量那一跑头上，实际那是 19 次 mvn 的总和）。
+  以后"要不要跑全量"不该按 5 分钟的成本来权衡。
 
 ### Added
 - `RedisServer.serverScope()`：只读拿到本台那一份，测试与嵌入式据此判断作用域边界。
