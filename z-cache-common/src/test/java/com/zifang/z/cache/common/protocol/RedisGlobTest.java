@@ -68,6 +68,20 @@ class RedisGlobTest {
         r.add(new Row("*a", "ba", false, true));
         r.add(new Row("*a", "ab", false, false));
 
+        // ---- 全 * 图案 × 空串键名：版本差那三格，钉的是"照 5.0.14"这一档 ----
+        // 两档读数各自在案：提取自 5.0.14 util.c 的 C 量具（~/.cache/zcache_gauges
+        // /sml_extract.inc，md5=a8dc715f60c13ce1979faf211d510a7a）这三格回 0，
+        // 而那台活的 4.0.9 在 battery_ref.tsv（md5=fc4e54245739d6b57573927f40f484d4）
+        // 的第 53/101/149 行同三格回 True —— 差的就是 5.0.14 循环头多挡的那半个
+        // stringLen。13t 拿变异（把那个条件摘掉＝B7 臂）问过这两张表：全仓只这三格会红，
+        // 也就是补上这六行之前，<em>matcher 级没有任何一行盯得住它</em>。
+        r.add(new Row("*", "", false, false));                                                   // 空串是"要 false"，
+        r.add(new Row("**", "", false, false));                                                  // 旁边三行 `a` 是同形状的
+        r.add(new Row("***", "", false, false));                                                  // "要 true"对照，不是补充
+        r.add(new Row("*", "a", false, true));
+        r.add(new Row("**", "a", false, true));
+        r.add(new Row("***", "a", false, true));
+
         // ---- ? ----
         r.add(new Row("?", "a", false, true));
         r.add(new Row("?", "", false, false));

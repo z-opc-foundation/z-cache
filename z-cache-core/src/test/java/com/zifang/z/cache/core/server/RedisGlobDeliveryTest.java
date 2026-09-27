@@ -25,7 +25,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * 13s —— {@code KEYS} 与 {@code SCAN MATCH} 交付的是哪一门 glob 语言。
+ * 13s / 13t —— {@code KEYS} 与 {@code SCAN MATCH} 交付的是哪一门 glob 语言。
  *
  * <h2>这一支量的不是匹配器，是"接没接上"</h2>
  * 匹配器自己那张表在 {@code RedisGlobTest}（62 行，13r 已拿一台活的参照逐行问过，问得到的
@@ -42,6 +42,29 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *       本类照 5.0.14），30 格是 C 按字节走、这里按 {@code char} 走（卡 #36）。</li>
  * </ul>
  *
+ * <h2>13t —— 卡 #36 关上：那 30 格是"按字节"与"按码元"的差</h2>
+ * 上游 {@code util.c:stringmatchlen()}（5.0.14 第 48—168 行）逐<em>字节</em>走：{@code ?} 与
+ * {@code [..]} 各吃掉一个字节，字面量比对的也是字节。这边此前逐 UTF-16 {@code char} 走，
+ * 于是一枚非 ASCII 键名两边消耗的量不同 —— 上面那 30 格就是这么来的。13t 把匹配器改成
+ * 按字节走，并把"改对了"这件事交给三条<em>互不依赖</em>的读数，而不是我自己的眼睛
+ * （量具 {@code ~/.cache/zcache_gauges/glob_bytes_report.py}，读数
+ * {@code logs/glob_bytes_report_13t.log}）：
+ * <ul>
+ *   <li>把那段函数从权威 5.0.14 源里<em>按行摘出</em>编成可执行件（{@code sml_extract.inc}
+ *       md5 {@code a8dc715f60c13ce1979faf211d510a7a}），拿一把新电池（164 图案 × 27 键名
+ *       × 两面 = 8856 对）问它、问改后的 Java：<b>8856 格里 0 格不同答</b>；</li>
+ *   <li>同一个字节数组按<em>带符号</em>与<em>无符号</em> {@code char} 各编一份：带符号那一档
+ *       在活的 4.0.9 那 4428 个交付格上<b>0 格不同答</b>，无符号那一档<b>差 836 格</b>。
+ *       所以 {@code RedisGlob.at()} 不做 {@code & 0xFF} 是被量出来的，不是抄来的。
+ *       顺带一句：旧那 2928 对里<b> 0 格</b>能分辨符号性（{@code glob_c_vs_battery.py} 里
+ *       两支读数逐字节相同），这就是必须重打一把电池的理由；</li>
+ *   <li>键枚举那把老电池重问一遍：交付分歧 32 → <b>2</b>，本轮关上 30 格、<em>新引入 0 格</em>。
+ *       剩下那 2 格仍是版本差（空串键名遇上 {@code **}／{@code ***}），与粒度无关。</li>
+ * </ul>
+ * 下面那张表因此是 13t 重跑的产物：第一列（"接上匹配器与快路之后该收下的"）里，凡是键名
+ * 字节数 ≠ 码元数的那几行，两串下标现在<em>逐格相同</em> —— 这正是第二支 @Test 里
+ * {@code UNATTRIBUTED} 那一格从"放过"改成"报红"的依据。
+ *
  * <h2>为什么"抄上游快路"不是顺手优化</h2>
  * 空串键名在 {@code KEYS *} 底下必须收得出来，那是那句快路给的；而匹配器按 5.0.14 判它不匹配。
  * 所以只接线不抄快路，会把"我们现在碰巧对的那一格"改错 —— 13r 的 C 桶（11 格）里就有这一格。
@@ -49,19 +72,30 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *
  * <h2>表是机器产的</h2>
  * 下面 {@link #names()} 与 {@link #patterns()} 里那两段（48 个键名 + 61 行图案，每行两串下标）
- * 由 {@code ~/.cache/zcache_gauges/gen_glob_delivery_table.py} 从 13r 落盘的两份电池读数生成
- * （{@code battery_ref.tsv} md5 {@code fc4e54245739d6b57573927f40f484d4}、
- * {@code battery_ours.tsv} md5 {@code eead3f6803711e7d50d4f74c0c3de9c1}）。人手敲一格期望值
- * 就等于撒谎 —— 同一轮里我真把那两个文件传反过一次，产出一张看着合理的错表，那道拦现在写在
- * {@code glob_battery_diff.py} 的表头判据里。
+ * 由 {@code ~/.cache/zcache_gauges/gen_glob_delivery_table.py} 从两份电池读数生成
+ * （{@code battery_ref.tsv} md5 {@code fc4e54245739d6b57573927f40f484d4} 是 13r 那台 4.0.9 的
+ * 读数、{@code battery_ours_13t_post.tsv} md5 {@code b2001b127189dcd7ab22a9ab8607f9c7} 是
+ * 13t 改后本机这一侧的读数；生成时它现算的桶数与分歧格数也对得上，见文件头那两行 md5 注释）。
+ * 人手敲一格期望值就等于撒谎 —— 同一轮里我真把那两个文件传反过一次，产出一张看着合理的错表，
+ * 那道拦现在写在 {@code glob_battery_diff.py} 的表头判据里。
  * 两串下标：第一列是"接上 {@code RedisGlob} 与那句快路之后该收下的"，第二列是"参照那一台
- * 实际收下的"。哪天 {@code RedisGlob} 自己改了（比如把 #36 修了），第一列会整列作废 ——
- * 那一格红了就该重跑生成器，不许手改下标。
+ * 实际收下的"。哪天 {@code RedisGlob} 自己改了，第一列会整列作废 —— 那一格红了就该重跑生成器，
+ * 不许手改下标。13t 就是这句话的兑现：匹配器改成按字节走之后这张表是重跑出来的，不是手改的 ——
+ * 与 13s 那一版逐行比过（{@code gen_13s_recheck.txt} ⇄ {@code gen_13t.txt}）：48 行键名一格没动、
+ * 61 行图案的<em>第二列</em>（参照那一台）一格没动，只有<em>第一列</em>（我们该收下的）在
+ * 11 行上变了，而那 11 行恰好全是 {@code ?}／{@code [..]} 遇上非 ASCII 键名的图案。
  *
  * <h2>与上游仍不同处，逐条写明</h2>
  * <ol>
- *   <li>字节 vs 码元：上面那 30 格，卡 #36；</li>
- *   <li>{@code **} / {@code ***} 对空串键名：照 5.0.14，不照 4.0.9（参照那台是 4.0.9）；</li>
+ *   <li>字节 vs 码元那 30 格：13t <em>已关上</em>（见上一节）。但"按字节"这件事还剩一条<em>没量过</em>
+ *       的尾巴 —— 键名在<em>进匹配器之前</em>就被 {@code new String(bytes, UTF_8)} 解过一次
+ *       （入站那一层：{@code RedisServerHandler.java:124} → {@code RespArray.java:105} →
+ *       {@code RespBulkString.java:57}），非法 UTF-8 的字节序列在那一步就已经换了字节
+ *       （一枚 {@code 0xFF} 变三字节 U+FFFD），匹配器再按字节走也回不去。
+ *       这一条不在 13t 的电池里（两把电池的键名全是合法 UTF-8，包括那 10 枚字节数 ≠ 码元数的），
+ *       所以只记名、不动手，也不许被"0 格不同答"那句话顺带盖掉；</li>
+ *   <li>{@code **} / {@code ***} 对空串键名：照 5.0.14，不照 4.0.9（参照那台是 4.0.9）。
+ *       这就是 {@link #onlyTheBookedRowsStillDifferFromTheReference()} 里剩下的那 2 格；</li>
  *   <li>我们这一台 {@code SCAN} 的游标是排序表上的下标，上游是反向二进制游标 —— 游标<em>值</em>
  *       本来就不要求相同（上游只保证"回 0 即扫完"），所以这里钉的是<em>全集</em>与两面一致性，
  *       不钉游标怎么变；</li>
@@ -105,7 +139,7 @@ class RedisGlobDeliveryTest {
     }
 
     // =================================================================================
-    // 二、交付 vs 参照：只剩记过账的那 32 格，而且每一格都归得因
+    // 二、交付 vs 参照：只剩记过账的那 2 格（版本差），而且归不了 #36 那一种因
     // =================================================================================
 
     @Test
@@ -113,6 +147,7 @@ class RedisGlobDeliveryTest {
         List<String> seen = new ArrayList<>();
         List<String> wrong = new ArrayList<>();
         int booked = 0;
+        int byteAxisLeft = 0;
         for (int i = 0; i < PATS.size(); i++) {
             Pat pat = PATS.get(i);
             for (String name : symmetric(pat.ours(), pat.ref())) {
@@ -120,15 +155,24 @@ class RedisGlobDeliveryTest {
                 boolean versionDrift = "".equals(name)
                         && ("**".equals(pat.pattern) || "***".equals(pat.pattern));
                 boolean byteAxis = name.getBytes(StandardCharsets.UTF_8).length != name.length();
+                if (byteAxis) {
+                    // 13t 之前这一支是"放过"的（那 30 格就归在这里）；现在 #36 已关上，
+                    // 一枚字节数 ≠ 码元数的键名再分歧就不是粒度问题，是一笔没归因的坏。
+                    byteAxisLeft++;
+                    wrong.add("BYTE_AXIS REOPENED #" + i + " pattern=" + ascii(pat.pattern)
+                            + " text=" + ascii(name));
+                }
                 if (!versionDrift && !byteAxis) {
-                    // 一枚纯 ASCII 键名如果也分歧，那就不是 #36 那一笔，是一笔没归因的坏。
                     wrong.add("UNATTRIBUTED #" + i + " pattern=" + ascii(pat.pattern)
                             + " text=" + ascii(name));
                 }
                 seen.add("D" + i);
             }
         }
-        cell(seen, wrong, "BOOKED_TOTAL", String.valueOf(booked), "32");
+        cell(seen, wrong, "BOOKED_TOTAL", String.valueOf(booked), "2");
+        cell(seen, wrong, "BYTE_AXIS_LEFT", String.valueOf(byteAxisLeft), "0");
+        cell(seen, wrong, "VERSION_DRIFT_LEFT",
+                String.valueOf(booked - byteAxisLeft), "2");
         cell(seen, wrong, "BYTE_AXIS_NAMES", String.valueOf(BYTE_NE_CHAR.size()), "10");
         finish("onlyTheBookedRowsStillDifferFromTheReference", seen, wrong);
     }
@@ -234,9 +278,11 @@ class RedisGlobDeliveryTest {
 
     private static List<String> names() {
         List<String> out = new ArrayList<>();
-        // 生成：~/.cache/zcache_gauges/gen_glob_delivery_table.py 从 13r 两份电池读数产出
-        //（现算桶数 A=2843 B=52 C=11 D=22、接线+快路后与参照仍差 32 格，都对得上）。
-        // 人手改下面任何一格期望值就等于撒谎；要改请重跑那把尺。
+        // 以下三段由 ~/.cache/zcache_gauges/gen_glob_delivery_table.py 从
+        // battery_ref.tsv + battery_ours_13t_post.tsv 生成，人手改一格就等于撒谎。
+        // 输入 battery_ref.tsv md5=fc4e54245739d6b57573927f40f484d4
+        // 输入 battery_ours_13t_post.tsv md5=b2001b127189dcd7ab22a9ab8607f9c7
+        // 键名：非 ASCII 一律走 Java 的 unicode 转义（源文件纯 ASCII，绕开编辑器的 NFC/NFD 归一化）。
         out.add("auto-aof-rewrite-percentage");
         out.add("auto-aof-rewrite-perc");
         out.add("");
@@ -290,16 +336,15 @@ class RedisGlobDeliveryTest {
 
     private static List<Pat> patterns() {
         List<Pat> out = new ArrayList<>();
-        // 生成：~/.cache/zcache_gauges/gen_glob_delivery_table.py 从 13r 两份电池读数产出
-        //（现算桶数 A=2843 B=52 C=11 D=22、接线+快路后与参照仍差 32 格，都对得上）。
-        // 人手改下面任何一格期望值就等于撒谎；要改请重跑那把尺。
+        // 图案 + 两串下标：ours = 接上 RedisGlob 与 `*` 快路之后该收下的；
+        //                ref  = 参照那一台 4.0.9 实际收下的（分歧格就是这两串的差）。
         out.add(pat("", of(2), of(2)));
         out.add(pat("*", all(), all()));
         out.add(pat("**", allBut(2), all()));
         out.add(pat("***", allBut(2), all()));
-        out.add(pat("?", of(3, 12, 13, 16, 17, 19, 20, 21, 22, 27, 31, 32, 38, 41, 43), of(3, 12, 13, 16, 17, 19, 20, 21, 22, 27, 31, 32)));
-        out.add(pat("??", of(8, 9, 11, 28, 34, 37, 39, 40, 42, 44, 45, 46, 47), of(8, 9, 11, 28, 34, 37, 41, 43)));
-        out.add(pat("???", of(10, 14, 15, 18, 23, 24, 25, 26, 29, 30, 33, 35, 36), of(10, 14, 15, 18, 23, 24, 25, 26, 29, 30, 33, 35, 36, 38, 42)));
+        out.add(pat("?", of(3, 12, 13, 16, 17, 19, 20, 21, 22, 27, 31, 32), of(3, 12, 13, 16, 17, 19, 20, 21, 22, 27, 31, 32)));
+        out.add(pat("??", of(8, 9, 11, 28, 34, 37, 41, 43), of(8, 9, 11, 28, 34, 37, 41, 43)));
+        out.add(pat("???", of(10, 14, 15, 18, 23, 24, 25, 26, 29, 30, 33, 35, 36, 38, 42), of(10, 14, 15, 18, 23, 24, 25, 26, 29, 30, 33, 35, 36, 38, 42)));
         out.add(pat("a*", of(0, 1, 4, 5, 7, 8, 10, 11, 12, 14, 18, 23, 24, 25, 28, 29, 33, 34, 36, 46), of(0, 1, 4, 5, 7, 8, 10, 11, 12, 14, 18, 23, 24, 25, 28, 29, 33, 34, 36, 46)));
         out.add(pat("*b", of(7, 8, 16, 23, 24, 25, 29, 30), of(7, 8, 16, 23, 24, 25, 29, 30)));
         out.add(pat("*c", of(1, 10, 14, 18, 22), of(1, 10, 14, 18, 22)));
@@ -310,7 +355,7 @@ class RedisGlobDeliveryTest {
         out.add(pat("a?c", of(10, 14, 18), of(10, 14, 18)));
         out.add(pat("a*c", of(1, 10, 14, 18), of(1, 10, 14, 18)));
         out.add(pat("[abc]", of(12, 16, 22), of(12, 16, 22)));
-        out.add(pat("[^abc]", of(3, 13, 17, 19, 20, 21, 27, 31, 32, 38, 41, 43), of(3, 13, 17, 19, 20, 21, 27, 31, 32)));
+        out.add(pat("[^abc]", of(3, 13, 17, 19, 20, 21, 27, 31, 32), of(3, 13, 17, 19, 20, 21, 27, 31, 32)));
         out.add(pat("[a-c]", of(12, 16, 22), of(12, 16, 22)));
         out.add(pat("[c-a]", of(12, 16, 22), of(12, 16, 22)));
         out.add(pat("[a-]", of(12, 19), of(12, 19)));
@@ -318,9 +363,9 @@ class RedisGlobDeliveryTest {
         out.add(pat("[]", of(), of()));
         out.add(pat("[\\]]", of(19), of(19)));
         out.add(pat("[\\\\]", of(20), of(20)));
-        out.add(pat("[\u4E2D]", of(38), of()));
-        out.add(pat("[^\u4E2D]", of(3, 12, 13, 16, 17, 19, 20, 21, 22, 27, 31, 32, 41, 43), of(3, 12, 13, 16, 17, 19, 20, 21, 22, 27, 31, 32)));
-        out.add(pat("[\u4E00-\u9FA5]", of(38), of()));
+        out.add(pat("[\u4E2D]", of(), of()));
+        out.add(pat("[^\u4E2D]", of(3, 12, 13, 16, 17, 19, 20, 21, 22, 27, 31, 32), of(3, 12, 13, 16, 17, 19, 20, 21, 22, 27, 31, 32)));
+        out.add(pat("[\u4E00-\u9FA5]", of(), of()));
         out.add(pat("[abc-]", of(12, 16, 19, 22), of(12, 16, 19, 22)));
         out.add(pat("a\\*b", of(23), of(23)));
         out.add(pat("\\?", of(32), of(32)));
@@ -337,12 +382,12 @@ class RedisGlobDeliveryTest {
         out.add(pat("[A-Z]", of(13), of(13)));
         out.add(pat("[a-z]", of(3, 12, 16, 17, 22, 27), of(3, 12, 16, 17, 22, 27)));
         out.add(pat("\u4E2D", of(38), of(38)));
-        out.add(pat("\u4E2D?", of(39, 45, 47), of(45)));
-        out.add(pat("?\u4E2D", of(46, 47), of(46)));
+        out.add(pat("\u4E2D?", of(45), of(45)));
+        out.add(pat("?\u4E2D", of(46), of(46)));
         out.add(pat("\u4E2D\u6587", of(39), of(39)));
         out.add(pat("*\u4E2D*", of(38, 39, 45, 46, 47), of(38, 39, 45, 46, 47)));
-        out.add(pat("????", of(7), of(7, 44, 45, 46)));
-        out.add(pat("??????", of(), of(39, 40, 47)));
+        out.add(pat("????", of(7, 44, 45, 46), of(7, 44, 45, 46)));
+        out.add(pat("??????", of(39, 40, 47), of(39, 40, 47)));
         out.add(pat("\u4E2D*", of(38, 39, 45, 47), of(38, 39, 45, 47)));
         out.add(pat("*\u4E2D", of(38, 46, 47), of(38, 46, 47)));
         out.add(pat("\uD83D\uDE00", of(44), of(44)));
