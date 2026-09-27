@@ -63,16 +63,24 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *       那一张表有 99 项，我们只接了这两条，于是 {@code CONFIG GET maxmemory} 在这里回 {@code *0}、
  *       {@code CONFIG SET maxmemory 100mb} 回 {@code Unsupported CONFIG parameter} ——
  *       走的是上游"认不出的名字"那一档文案，没有自造句子。</li>
- *   <li><b>没配 dataDir 的那一台拒 SET，但照常答 GET</b>。上游这两个字段挂在 {@code server}
- *       上、永远存在，AOF 关着也能 {@code +OK}（只是没人读）。我们的旋钮挂在
- *       {@code AofPersistence} 上，而那个对象只在带 dataDir 启动时才有 —— 所以 SET 若回
- *       {@code +OK} 就是"当场收下、下一刻没有落点"。这一条与 {@code BGREWRITEAOF}
- *       在同一个位置上的取舍一致（{@code handleBgrewriteaof} 那句"宁可如实报错"）。
- *       真正的修法是让配置持有者永远存在，那是下一格的事，记在 CHANGELOG 里。</li>
  *   <li><b>{@code RESETSTAT} / {@code REWRITE} 不接</b>，回的是上游那句 subcommand 语法错。
  *       这与 {@code CONFIG HELP} 只列 GET/SET 是同一套说法，两处必须一起对得上，
  *       所以也各自成了一格。</li>
  * </ol>
+ *
+ * <h2>这一支自己改过的一次判据（不是"以后再说"）</h2>
+ * 13n 那一版在这里记的是<b>三条</b>差距，第二条写的是"没配 dataDir 的那一台拒 SET，但照常答 GET"，
+ * 理由是旋钮挂在 {@code AofPersistence} 上、那个对象只在带 dataDir 启动时才有，回 {@code +OK}
+ * 等于"当场收下、下一刻没有落点"。那句话当时是真的，也是一句<em>承认结构不够</em>的话：
+ * 上游那两个字段挂在 {@code server} 上、永远存在，AOF 关着也 {@code +OK}（只是没人读），
+ * 差别只在我们的服务器<em>没有</em>那个永远存在的持有者。补上持有者之后（旋钮从
+ * {@code AofPersistence} 搬进 {@code AofTuning}，每台服务器一份、与日志在不在无关，
+ * 而 {@code AofPersistence} 拿的是<em>同一个对象</em>而不是抄本），那条差距不成立了，
+ * 于是 {@link #aServerWithoutALogHoldsTheKnobsToo} 里"SET 不许回 +OK"那一格<em>故意翻面</em>。
+ * 翻面必须和搬动在同一次提交里发生 —— 判据悄悄重定义比判据严会把缺陷读成通过。
+ * "同一个对象而不是抄本"这一条不靠注释担保，{@link #configSetMovesTheGateThatDecidesTheSwap}
+ * 里那两格量的是引用相等与 {@code AofPersistence} 自己读回来的数。
+ * <p>
  * 期望值出自上面那些行号的逐臂推演；250 通了之后要拿参考实例逐格复跑（本轮不通，
  * 见 {@code RedisMemoryFormatTest} 里同一句交代）。
  */
@@ -234,11 +242,11 @@ class RedisConfigCommandTest {
     }
 
     // =================================================================================
-    // 二、没配 dataDir 的那一台：GET 照答默认值，SET 如实报错
+    // 二、没配 dataDir 的那一台：旋钮照样在这台上，SET 收、GET 读得回
     // =================================================================================
 
     @Test
-    void aServerWithoutALogAnswersGetButRefusesSet() throws Exception {
+    void aServerWithoutALogHoldsTheKnobsToo() throws Exception {
         int port = freePort();
         RedisServer server = new RedisServer("127.0.0.1", port, 0);      // 故意不 setDataDir
         Thread thread = startAndWait(server, port);
@@ -248,13 +256,23 @@ class RedisConfigCommandTest {
             DataInputStream in = new DataInputStream(socket.getInputStream());
             expectTyped(seen, wrong, socket, in, "没有日志也答得上默认值（与上游同形）",
                     "*2|$27=" + PERC + "|" + PERC_DEFAULT, "CONFIG", "GET", PERC);
-            expectTyped(seen, wrong, socket, in, "SET 不许回 +OK（那等于收下而没有落点）",
-                    "-ERR CONFIG SET '" + PERC + "' is not supported: no data directory configured",
-                    "CONFIG", "SET", PERC, "10");
-            expectTyped(seen, wrong, socket, in, "拒过一轮之后默认值还是那个默认值",
-                    "*2|$27=" + PERC + "|" + PERC_DEFAULT, "CONFIG", "GET", PERC);
+            // ↓↓ 这两格就是翻面的那一处：13n 那一版在这里期望的是
+            //    "-ERR CONFIG SET '...' is not supported: no data directory configured"。
+            expectTyped(seen, wrong, socket, in, "SET 有落点：没有日志的这台也当场收下（照上游）",
+                    "+OK", "CONFIG", "SET", PERC, "10");
+            expectTyped(seen, wrong, socket, in, "收下之后 GET 读回新值，不是那个默认值",
+                    "*2|$27=" + PERC + "|$2=10", "CONFIG", "GET", PERC);
+            expectTyped(seen, wrong, socket, in, "地板那一条同样有落点（带单位的写法在这台也认）",
+                    "+OK", "CONFIG", "SET", MIN_SIZE, "1kb");
+            expectTyped(seen, wrong, socket, in, "地板读回的是字节数",
+                    "*2|$25=" + MIN_SIZE + "|$4=1024", "CONFIG", "GET", MIN_SIZE);
+            expectTyped(seen, wrong, socket, in, "有落点不许把越界放进门（还是那句 badfmt）",
+                    "-ERR Invalid argument '-1' for CONFIG SET '" + PERC + "'",
+                    "CONFIG", "SET", PERC, "-1");
             expectTyped(seen, wrong, socket, in, "认不出的名字在那一台上也还是那句（先认名字再谈落点）",
                     "-ERR Unsupported CONFIG parameter: maxmemory", "CONFIG", "SET", "maxmemory", "1");
+            expectTyped(seen, wrong, socket, in, "拒过两轮之后先前那个值还在（拒不许顺手改）",
+                    "*2|$25=" + MIN_SIZE + "|$4=1024", "CONFIG", "GET", MIN_SIZE);
         } finally {
             server.stop();
             thread.join(DEADLINE_MS);
@@ -310,6 +328,20 @@ class RedisConfigCommandTest {
                     "*2|$25=" + MIN_SIZE + "|$1=0", "CONFIG", "GET", MIN_SIZE);
             expectTyped(seen, wrong, socket, in, "读回百分比",
                     "*2|$27=" + PERC + "|$1=1", "CONFIG", "GET", PERC);
+            // 这两格问的是"线上那一份与日志那一份是不是同一个东西"：只要 SET 落的是抄本、
+            // 或者读的是另一处，这两格当场红 —— 而下面那格"自动挡真的换了日志"照样会红，
+            // 所以少了这两格，"改了就生效"与"改在别处、恰好也生效"分不开。
+            expectTextCell(seen, wrong, "日志那一侧自己读回来的百分比也是这个数（不是两份）",
+                    String.valueOf(a.getAutoAofRewritePercentage()), "1",
+                    "问的是 aofPersistence 那一份的读数，不是命令层的记账");
+            expectTextCell(seen, wrong, "地板也一样：那一侧读回来的是 0",
+                    String.valueOf(a.getAutoAofRewriteMinSize()), "0",
+                    "两把尺各问一次，只有一把接上了不算数");
+            // 上面两格量"值到了"，这一格量"是同一个东西"：接线若是开场抄一份而不是交引用，
+            // 值这一趟照样对（抄在 SET 之后），下一趟就漂了 —— 那是只有引用相等拦得住的形状。
+            expectTextCell(seen, wrong, "命令层那一份与日志那一份引用相等（不是抄本）",
+                    String.valueOf(a.tuning() == server.serverScope().aofTuning()), "true",
+                    "结构守卫：AofPersistence 拿的必须就是本台 scope 里那一个 AofTuning");
 
             int collapsed = awaitRecordCount(aof, key, 1);
             expectTextCell(seen, wrong, "线上改了旋钮之后，自动挡真的把日志换了（四笔塌成一笔）",

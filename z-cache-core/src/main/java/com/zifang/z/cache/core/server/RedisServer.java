@@ -230,6 +230,9 @@ public class RedisServer {
 
         String aofPath = dataDir + "/appendonly.aof";
         aofPersistence = new AofPersistence();
+        // 旋钮交给这一拍读的是<em>本台那一份</em>，不是开场抄的副本：CONFIG SET 改的与
+        // shouldAutoRewrite 量的必须是同一个对象，否则"改了不生效"这种缺陷在盘面上读不出来。
+        aofPersistence.setTuning(scope.aofTuning());
         // 重写要导出的就是快照导的同一份状态。不接它，rewriteAof 只能导出<em>空</em>命令集，
         // 而它接下来会把有内容的 appendonly.aof 换成那份空的。
         aofPersistence.setStoreAccessor(accessor);

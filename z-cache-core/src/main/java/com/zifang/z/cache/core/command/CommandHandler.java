@@ -3,6 +3,7 @@ package com.zifang.z.cache.core.command;
 import com.zifang.z.cache.common.protocol.*;
 import com.zifang.z.cache.core.logging.SlowLog;
 import com.zifang.z.cache.core.persistence.AofPersistence;
+import com.zifang.z.cache.core.persistence.AofTuning;
 import com.zifang.z.cache.core.persistence.RdbPersistence;
 import com.zifang.z.cache.core.pubsub.PubSubManager;
 import com.zifang.z.cache.core.storage.*;
@@ -73,6 +74,9 @@ public class CommandHandler {
     private static volatile SlowLog defaultSlowLog;
     private static volatile AofPersistence defaultAofPersistence;
     private static volatile RdbPersistence defaultRdbPersistence;
+
+    /** 没有 scope 的那一支用的旋钮兜底（有 scope 时读的是本台那一份，见 {@link #aofTuning()}）。 */
+    private static final AofTuning unscopedAofTuning = new AofTuning();
     private static volatile StreamStore defaultStreamStore;
     private static volatile boolean defaultLoading;
 
@@ -160,6 +164,19 @@ public class CommandHandler {
     private AofPersistence aof() {
         ServerScope s = this.scope;
         return s != null ? s.aofPersistence() : defaultAofPersistence;
+    }
+
+    /**
+     * 本台那份自动挡旋钮。与 {@link #aof()} 的<em>关键</em>差别是它不会返回 {@code null}：
+     * "这一台有没有日志"不该决定"这两条旋钮够不够得着"，那正是 {@code CONFIG SET} 从前
+     * 只能在无 dataDir 的那一台报错的原因。没有 scope 的那一支（嵌入式 / 直接 new 的 handler）
+     * 沿用静态那一份，与这一类里其余静态兜底同一个形状。
+     */
+    private AofTuning aofTuning() {
+        ServerScope s = this.scope;
+        if (s != null) return s.aofTuning();
+        AofPersistence a = defaultAofPersistence;
+        return a != null ? a.tuning() : unscopedAofTuning;
     }
 
     private boolean isLoading() {
@@ -2009,16 +2026,16 @@ public class CommandHandler {
      * 打回十进制，<b>不</b>带单位。
      * </p>
      * <p>
-     * <b>三处与上游不等价，都是明写的</b>（判据在 {@code RedisConfigCommandTest} 的类注释里同一份）：
+     * <b>两处与上游不等价，都是明写的</b>（判据在 {@code RedisConfigCommandTest} 的类注释里同一份）：
      * <ol>
      *   <li>只接这两条名字，{@code CONFIG GET *} 因此只有四个元素，上游是三千多个。</li>
-     *   <li>没配 dataDir 的那一台：{@code GET} 照答编译期默认值，{@code SET} 却如实报错。
-     *       上游那两个字段是 {@code server} 结构里的裸变量，不存在"落点没有"这一说，收下就一定生效；
-     *       我们的旋钮住在 {@link AofPersistence} 里，而它只在有 dataDir 时才存在。回一句
-     *       {@code +OK} 等于"收下而没人管"，比报错更坏。真正的修法是让配置持有者总是存在（已记待办）。</li>
      *   <li>{@code RESETSTAT} / {@code REWRITE} 没接，落回上游那句子命令语法错 —— 与
      *       {@code CONFIG HELP} 只列 GET/SET 互相咬合：HELP 里不许有做不到的子命令。</li>
      * </ol>
+     * 这里<em>曾经</em>有第三条："没配 dataDir 的那一台 {@code SET} 只能如实报错"，理由是旋钮住在
+     * {@link AofPersistence} 里、而它只在有 dataDir 时才存在。那一条已经随旋钮搬进
+     * {@link AofTuning}（一台服务器一份、与日志在不在无关）而消失：现在 {@code SET} 永远有落点，
+     * 与上游那句"收下就一定生效"同形。搬之前的判据与搬之后翻面的那两格记在 CHANGELOG 的 13o。
      */
     private Object handleConfig(String[] args) {
         if (args.length < 2) return RespError.wrongNumberOfArguments("config");
@@ -2034,32 +2051,27 @@ public class CommandHandler {
 
     /** {@code configGetCommand}：延迟数组 + 每条命中塞两个 bulk，一条不命中就是 {@code *0}。 */
     private Object configGet(String pattern) {
-        AofPersistence a = aof();
-        int percentage = a == null ? AofPersistence.AUTO_AOF_REWRITE_PERCENTAGE
-                : a.getAutoAofRewritePercentage();
-        long minSize = a == null ? AofPersistence.AUTO_AOF_REWRITE_MIN_SIZE
-                : a.getAutoAofRewriteMinSize();
+        AofTuning t = aofTuning();
         List<Object> out = new ArrayList<>(4);
         if (RedisGlob.matches(pattern, AUTO_AOF_REWRITE_PERCENTAGE, true)) {
             out.add(RespBulkString.of(AUTO_AOF_REWRITE_PERCENTAGE));
-            out.add(RespBulkString.of(String.valueOf(percentage)));
+            out.add(RespBulkString.of(String.valueOf(t.getAutoAofRewritePercentage())));
         }
         if (RedisGlob.matches(pattern, AUTO_AOF_REWRITE_MIN_SIZE, true)) {
             out.add(RespBulkString.of(AUTO_AOF_REWRITE_MIN_SIZE));
-            out.add(RespBulkString.of(String.valueOf(minSize)));
+            out.add(RespBulkString.of(String.valueOf(t.getAutoAofRewriteMinSize())));
         }
         return RespArray.of(out);
     }
 
     private Object configSet(String name, String value) {
+        AofTuning t = aofTuning();
         if (AUTO_AOF_REWRITE_PERCENTAGE.equalsIgnoreCase(name)) {
             Long v = RedisIntegerFormat.parse(value);
             if (v == null || v.longValue() < 0L || v.longValue() > Integer.MAX_VALUE) {
                 return configBadfmt(name, value);
             }
-            AofPersistence a = aof();
-            if (a == null) return noLandingSpot(name);
-            a.setAutoAofRewritePercentage(v.intValue());
+            t.setAutoAofRewritePercentage(v.intValue());
             return RespSimpleString.of("OK");
         }
         if (AUTO_AOF_REWRITE_MIN_SIZE.equalsIgnoreCase(name)) {
@@ -2067,9 +2079,7 @@ public class CommandHandler {
             if (v == null || v.longValue() < 0L) {
                 return configBadfmt(name, value);
             }
-            AofPersistence a = aof();
-            if (a == null) return noLandingSpot(name);
-            a.setAutoAofRewriteMinSize(v.longValue());
+            t.setAutoAofRewriteMinSize(v.longValue());
             return RespSimpleString.of("OK");
         }
         return RespError.of("ERR", "Unsupported CONFIG parameter: " + name);
@@ -2078,12 +2088,6 @@ public class CommandHandler {
     /** {@code config.c:1285-1287}：先值后名，两个占位都是打进来的那一串原样。 */
     private static RespError configBadfmt(String name, String value) {
         return RespError.of("ERR", "Invalid argument '" + value + "' for CONFIG SET '" + name + "'");
-    }
-
-    /** 上游没有这一句：见 {@link #handleConfig} 注释里的第 2 条差距。 */
-    private static RespError noLandingSpot(String name) {
-        return RespError.of("ERR", "CONFIG SET '" + name
-                + "' is not supported: no data directory configured");
     }
 
     /** 上游表里的名字原文（{@code config.c:1161}、{@code :1262}）；{@code GET} 打回的就是这一串。 */

@@ -2,6 +2,7 @@ package com.zifang.z.cache.core.command;
 
 import com.zifang.z.cache.core.logging.SlowLog;
 import com.zifang.z.cache.core.persistence.AofPersistence;
+import com.zifang.z.cache.core.persistence.AofTuning;
 import com.zifang.z.cache.core.persistence.RdbPersistence;
 import com.zifang.z.cache.core.pubsub.PubSubManager;
 import com.zifang.z.cache.core.stream.StreamStore;
@@ -32,6 +33,12 @@ public final class ServerScope {
     private final StreamStore streamStore;
     private final SlowLog slowLog;
 
+    /**
+     * 本台的自动挡旋钮。与上面三样<em>不同</em>：它是 final，因为"这一台有没有日志"
+     * 不该决定"这两条旋钮够不够得着" —— 上游那两项挂在 {@code server} 上、永远存在，
+     * AOF 关着也 {@code +OK}。{@code AofPersistence} 起来时拿的就是这一个对象。
+     */
+    private final AofTuning aofTuning = new AofTuning();
     private volatile RdbPersistence rdbPersistence;
     private volatile AofPersistence aofPersistence;
     private volatile boolean loading;
@@ -72,6 +79,11 @@ public final class ServerScope {
 
     public void setRdbPersistence(RdbPersistence rdbPersistence) {
         this.rdbPersistence = rdbPersistence;
+    }
+
+    /** 本台的自动挡旋钮：{@code CONFIG SET} 落在这里，{@code AofPersistence} 读的是同一个对象。 */
+    public AofTuning aofTuning() {
+        return aofTuning;
     }
 
     public AofPersistence aofPersistence() {

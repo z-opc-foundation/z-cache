@@ -81,16 +81,17 @@ public class AofPersistence {
     public static final int FSYNC_NO = 2;
 
     /**
-     * 自动重写的默认百分比门槛 —— 上游 {@code server.h:98}：
-     * {@code #define AOF_REWRITE_PERC 100}（长到比底座大一倍才重写）。
+     * 自动重写的默认百分比门槛 —— 上游 {@code server.h:98} 的 {@code AOF_REWRITE_PERC}。
+     * 值本身住在 {@link AofTuning}（旋钮的唯一持有者），这里留一个名字给按默认值断言的调用方，
+     * 两处不许各写一个数。
      */
-    public static final int AUTO_AOF_REWRITE_PERCENTAGE = 100;
+    public static final int AUTO_AOF_REWRITE_PERCENTAGE = AofTuning.DEFAULT_PERCENTAGE;
 
     /**
-     * 自动重写的默认体积地板 —— 上游 {@code server.h:99}：
-     * {@code #define AOF_REWRITE_MIN_SIZE (64*1024*1024)}。
+     * 自动重写的默认体积地板 —— 上游 {@code server.h:99} 的 {@code AOF_REWRITE_MIN_SIZE}
+     * （{@code 64*1024*1024}）。同上：值只写在 {@link AofTuning} 一处。
      */
-    public static final long AUTO_AOF_REWRITE_MIN_SIZE = 64L * 1024 * 1024;
+    public static final long AUTO_AOF_REWRITE_MIN_SIZE = AofTuning.DEFAULT_MIN_SIZE;
 
     /**
      * 自动挡多久量一次体积 —— 上游没有独立的定时器：{@code serverCron} 每轮自己回一个周期，
@@ -153,32 +154,28 @@ public class AofPersistence {
     private volatile long rewriteBaseBytes;
 
     /**
-     * 自动重写的百分比门槛 —— 对应上游的 {@code server.aof_rewrite_perc}（{@code server.h:1077}，
-     * 注释原文 "Rewrite AOF if % growth is > M and..."）。默认 {@value #AUTO_AOF_REWRITE_PERCENTAGE}
-     * （上游 {@code server.h:98} 的 {@code AOF_REWRITE_PERC}），<b>0 表示整个自动挡关掉</b> ——
-     * {@code server.c:1305} 那一项就是把整数当真假用，0 直接短路。
+     * 自动挡那两条旋钮 —— 对应上游的 {@code server.aof_rewrite_perc}（{@code server.h:1077}，
+     * 注释原文 "Rewrite AOF if % growth is > M and..."）与 {@code server.aof_rewrite_min_size}
+     * （{@code server.h:1078}，"the AOF file is at least N bytes"）。
      * <p>
-     * 允许的范围是 {@code 0..INT_MAX}（{@code config.c:1160-1161} 那个
-     * {@code config_set_numerical_field} 的第四、五个实参），负数在配置文件那条路上也被拒
-     * （{@code config.c:501-503}，原文 "Invalid negative percentage for AOF auto rewrite"）。
-     * 这一点值得注意：负数在上游是<em>过不了配置解析</em>，而不是"过得了但行为像 0"，
-     * 所以下面那个判据用 {@code == 0} 翻译 {@code :1305}，不给负数留通道。
+     * <b>这两个数不再是本类的字段</b>：它们住在 {@link AofTuning} 里，一台服务器一份，
+     * 而 {@code RedisServer.initPersistence()} 把本台那一份交给这里（{@link #setTuning}）。
+     * 于是 {@code CONFIG SET} 改的与这一拍量的是同一个对象，抄本那种"两边各自读得到自己、
+     * 而那一拍永远用不上新值"的缺陷在这里结构上不可能出现。默认那一支（{@code new AofTuning()}）
+     * 留给没有 scope 的用法（单元测试直接 {@code new AofPersistence()}）。
+     * </p>
+     * <p>
+     * 两条各自的语义仍然落在这一拍上（{@link #shouldAutoRewrite}）：百分比 {@code == 0} 就是
+     * <em>整个自动挡关掉</em>（{@code server.c:1305} 那一项把整数当真假用，0 直接短路），而负数
+     * 在上游是<em>过不了配置解析</em>（{@code config.c:501-503}，原文 "Invalid negative percentage
+     * for AOF auto rewrite"）而不是"过得了但行为像 0"，所以这里用 {@code == 0} 翻译 {@code :1305}、
+     * 不给负数留通道（范围闸在 {@link AofTuning} 的两个 setter 上）。地板存在的理由不是"再省一点"：
+     * 几十个字节的日志重写一次，收益是零、开销是把整份状态重导一遍（本版重写不 fork，见
+     * {@link #rewriteAsync()}，所以这笔开销是同步落在写侧的）；{@code server.c:1306} 用的是
+     * 严格大于 —— 正好等于地板时<em>不</em>重写。
      * </p>
      */
-    private volatile int autoRewritePercentage = AUTO_AOF_REWRITE_PERCENTAGE;
-
-    /**
-     * 自动重写的体积地板 —— 对应上游的 {@code server.aof_rewrite_min_size}
-     * （{@code server.h:1078}，"the AOF file is at least N bytes"）。默认 64mb
-     * （{@code server.h:99} 的 {@code AOF_REWRITE_MIN_SIZE}，即 {@code 64*1024*1024}）。
-     * <p>
-     * 它存在的理由不是"再省一点"：几十个字节的日志重写一次，收益是零、开销是把整份状态重导一遍
-     * （本版重写不 fork，见 {@link #rewriteAsync()}，所以这笔开销是同步落在写侧的）。
-     * {@code server.c:1306} 用的是严格大于 —— 正好等于地板时<em>不</em>重写。
-     * 运行时口 {@code config.c:1262-1263} 收 {@code 0..LONG_MAX}。
-     * </p>
-     */
-    private volatile long autoRewriteMinSize = AUTO_AOF_REWRITE_MIN_SIZE;
+    private volatile AofTuning tuning = new AofTuning();
 
     /**
      * 自动挡那一拍的任务句柄。挂／撤的判据是 {@link #applyAutoRewriteScheduler()}，
@@ -1214,11 +1211,14 @@ arg2\r
      * @return 是否发起了这一趟重写
      */
     boolean checkAutoRewrite() {
+        AofTuning t = tuning;
         if (!shouldAutoRewrite(started.get(), rdbBusy.getAsBoolean(), rewriting.get(),
-                appendedBytes, rewriteBaseBytes, autoRewritePercentage, autoRewriteMinSize)) {
+                appendedBytes, rewriteBaseBytes, t.getAutoAofRewritePercentage(),
+                t.getAutoAofRewriteMinSize())) {
             return false;
         }
-        LOGGER.info("Starting automatic rewriting of AOF on growth over " + autoRewritePercentage + "%");
+        LOGGER.info("Starting automatic rewriting of AOF on growth over "
+                + t.getAutoAofRewritePercentage() + "%");
         return rewriteAsync();
     }
 
@@ -1241,40 +1241,53 @@ arg2\r
         return rdbBusy;
     }
 
-    /** 自动挡的百分比门槛（{@code server.aof_rewrite_perc}）。 */
-    public int getAutoAofRewritePercentage() {
-        return autoRewritePercentage;
+    /**
+     * 本类读的那份旋钮。默认是一支自造的 {@link AofTuning}（给没有 scope 的用法），
+     * 服务器起来时由 {@code RedisServer.initPersistence()} 换成<b>本台那一份</b>。
+     */
+    public AofTuning tuning() {
+        return tuning;
     }
 
     /**
-     * 设自动挡的百分比门槛。范围照 {@code config.c:1160-1161}：{@code 0..INT_MAX}，
-     * 其中 0 表示关掉（{@code server.c:1305}）。
+     * 交过来这台服务器的旋钮。传 {@code null} 等于"这一拍退回自己那份、与命令层脱钩" ——
+     * 那正是本格要消灭的形状，所以不收。
+     */
+    public void setTuning(AofTuning tuning) {
+        if (tuning == null) {
+            throw new IllegalArgumentException("AofTuning must not be null");
+        }
+        this.tuning = tuning;
+    }
+
+    /** 自动挡的百分比门槛（{@code server.aof_rewrite_perc}），读的是 {@link #tuning}。 */
+    public int getAutoAofRewritePercentage() {
+        return tuning.getAutoAofRewritePercentage();
+    }
+
+    /**
+     * 设自动挡的百分比门槛，写进 {@link #tuning}。范围照 {@code config.c:1160-1161}：
+     * {@code 0..INT_MAX}，其中 0 表示关掉（{@code server.c:1305}）。
      *
      * @param percentage 新门槛
      */
     public void setAutoAofRewritePercentage(int percentage) {
-        if (percentage < 0) {
-            throw new IllegalArgumentException(
-                    "Invalid negative percentage for AOF auto rewrite: " + percentage);
-        }
-        this.autoRewritePercentage = percentage;
+        tuning.setAutoAofRewritePercentage(percentage);
     }
 
-    /** 自动挡的体积地板（{@code server.aof_rewrite_min_size}）。 */
+    /** 自动挡的体积地板（{@code server.aof_rewrite_min_size}），读的是 {@link #tuning}。 */
     public long getAutoAofRewriteMinSize() {
-        return autoRewriteMinSize;
+        return tuning.getAutoAofRewriteMinSize();
     }
 
     /**
-     * 设自动挡的体积地板。范围照 {@code config.c:1262-1263}：{@code 0..LONG_MAX}。
+     * 设自动挡的体积地板，写进 {@link #tuning}。范围照 {@code config.c:1262-1263}：
+     * {@code 0..LONG_MAX}。
      *
      * @param bytes 新地板
      */
     public void setAutoAofRewriteMinSize(long bytes) {
-        if (bytes < 0) {
-            throw new IllegalArgumentException("Invalid negative size for AOF auto rewrite: " + bytes);
-        }
-        this.autoRewriteMinSize = bytes;
+        tuning.setAutoAofRewriteMinSize(bytes);
     }
 
     /**
