@@ -1,5 +1,7 @@
 package com.zifang.z.cache.core.persistence;
 
+import com.zifang.z.cache.core.stream.Stream;
+
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -74,6 +76,25 @@ public interface StoreAccessor {
      * @return Sorted Set 键值对映射，key 为键名，value 为 Map&lt;byte[], Double&gt; 类型的成员-分值映射
      */
     Map<String, Object> getAllSortedSetEntries(int db);
+
+    /**
+     * 获取指定库中所有 Stream 类型的键。
+     * <p>
+     * 与其它五家不同，这一家交回的是<em>带行为的对象</em>（{@link Stream}）而不是一个扁平的
+     * 容器：一条流要导出的不只有成员，还有"表顶在哪"（{@code last_id}）和每一组读到哪儿了，
+     * 这三样在 {@link Stream} 上各有一个读取口，摊成 Map 就会丢掉后两样。
+     * {@code Stream} 的成员表是 {@code CopyOnWriteArrayList}、组表是 {@code ConcurrentHashMap}，
+     * 所以导出期间并发写入只会看到"那一刻的快照"，不会抛 {@code ConcurrentModificationException}。
+     * </p>
+     * <p>
+     * <b>已过点的键不筛</b> —— 与另外五家同一条尺：时刻走 {@link #getAllExpirationEntries}，
+     * 加载那一步才判死。一边筛一边不筛才是雷（见 {@link #getAllExpirationEntries} 的注释）。
+     * </p>
+     *
+     * @param db 数据库编号
+     * @return 键名到流对象的映射；本库没有 stream 键（或这台服务器没接 stream 存储）时是空 Map
+     */
+    Map<String, Stream> getAllStreamEntries(int db);
 
     /**
      * 获取指定库中所有键的过期时间信息。

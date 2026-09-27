@@ -110,7 +110,10 @@ z-cache 是一个基于 Java 实现的高性能内存键值存储系统，设计
   ⚠ **本实现现状（1.3.6）**：不 fork，`AofPersistence.rewriteAof()` 在 `appendCommand` 那把锁里同步完成
   "导出 + 换文件 + 重开追加句柄"（代价是重写期间写侧被堵住）。导出侧 1.3.6 起才是真的当前状态
   （此前是一份空命令集换掉真日志）；**但触发它的命令一个都没有**：没有 `BGREWRITEAOF`，也没有下面
-  那条"重写触发条件"。含 Stream 键的库过一遍重写会丢掉那一族键。
+  那条"重写触发条件"。含 Stream 键的库从 13g 起不再被这一手丢掉：`exportMinimalCommandSet` 为那一族
+  单独走一支（逐条带显式 ID 的 `XADD`、空流的 `MAXLEN 0`、无条件 `XSETID`、逐组 `XGROUP CREATE`）。
+  仍缺的是 `rewriteStreamObject` 末尾那串 `XCLAIM … JUSTID FORCE`（`aof.c:1150-1167/:1235-1260`）——
+  我们没实现 `XCLAIM`，所以消费组的 pending list 与消费者状态导不出去。
 - **重写触发条件**: 文件大小增长比例、最小重写大小
   ⚠ **本实现现状（1.3.6）**：这两项配置都没有实现（`CONFIG` 里查不到，也没有后台调度方在量体积）。
 

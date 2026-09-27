@@ -330,6 +330,11 @@ public class MemoryStore {
         this.streams = streamStore;
     }
 
+    /** 本台那一份 stream 存储；没绑过时为 {@code null}，调用方按"这一族一个键都没有"处理。 */
+    public com.zifang.z.cache.core.stream.StreamStore streamStore() {
+        return streams;
+    }
+
     private boolean hasStreams(int db, String key) {
         com.zifang.z.cache.core.stream.StreamStore s = streams;
         return s != null && s.exists(db, key);

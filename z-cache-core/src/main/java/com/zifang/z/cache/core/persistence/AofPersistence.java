@@ -579,6 +579,16 @@ arg2\r
                 addChunked(dbCommands, "ZADD", entry.getKey(), pairs, 2);
                 addExpiryRecord(dbCommands, expirations, entry.getKey());
             }
+            // 第六家：stream 一族在上游那里是一支专门的函数
+            // （{@code rewriteStreamObject}，{@code aof.c:1172-1266}），形状与前五家都不同 ——
+            // 一条记录一条 {@code XADD}（带<em>显式 ID</em>，arity = 3 + 2×字段数，{@code :1186-1196}，
+            // 不按 64 个一批），逐组 {@code XGROUP CREATE}（{@code :1227-1233}），最后无条件补一条
+            // {@code XSETID}（{@code :1212-1217}，注释原文 "in case of XDEL lastid"）。
+            for (Map.Entry<String, com.zifang.z.cache.core.stream.Stream> entry
+                    : storeAccessor.getAllStreamEntries(db).entrySet()) {
+                addStreamRecords(dbCommands, entry.getKey(), entry.getValue());
+                addExpiryRecord(dbCommands, expirations, entry.getKey());
+            }
 
             if (!dbCommands.isEmpty()) {
                 commands.add(new String[]{"SELECT", Integer.toString(db)});
@@ -617,6 +627,65 @@ arg2\r
         if (expireAt != null && expireAt > 0) {
             out.add(new String[]{"PEXPIREAT", key, Long.toString(expireAt)});
         }
+    }
+
+    /**
+     * 一条流的导出形状，逐句照 {@code rewriteStreamObject}（{@code aof.c:1172-1266}）：
+     * <ol>
+     *   <li>有成员就<em>逐条</em> {@code XADD key <id> f v …}（{@code :1181-1197}）。这一家不套
+     *       {@code REWRITE_ITEMS_PER_CMD} 那一批量：上游同一支函数里是一条记录一条命令，
+     *       批量会把"每条记录一个显式 ID"这件事拆坏；</li>
+     *   <li>成员为空也要留下这个键 —— 上游用的是 {@code XADD key MAXLEN 0 <last_id> x y}
+     *       这一手（{@code :1198-1210}，注释原文 "Use the XADD MAXLEN 0 trick to generate an empty
+     *       stream"）：先真加一条再当场裁到 0，于是"这条流存在、表顶在 {@code last_id}、长度为 0"
+     *       三件事一起被演出来。少这一步，一个被 {@code XDEL} 空的流键会在重写之后<em>连键一起消失</em>；</li>
+     *   <li>之后<em>无条件</em>补一条 {@code XSETID key <last_id>}（{@code :1212-1217}，注释原文
+     *       "in case of XDEL lastid"）。表顶与"还活着的最大学 ID"是两件事：中间那条被删掉之后，
+     *       光靠 {@code XADD} 演不出前者；</li>
+     *   <li>最后逐组 {@code XGROUP CREATE key <组名> <组读数位置>}（{@code :1220-1233}）。</li>
+     * </ol>
+     * 上游在组之后还会替每个"手里有未确认条目"的消费者逐条
+     * {@code XCLAIM … TIME … RETRYCOUNT … JUSTID FORCE}（{@code :1235-1260}，函数体 {@code :1150-1167}）。
+     * 这一侧没有 {@code XCLAIM}（{@code src/main} 里零处理），所以<em>消费组的读数位置能过重写，
+     * pending 表不能</em> —— 这是记账的未覆盖面，不是可以默默吞掉的差别。
+     */
+    private static void addStreamRecords(List<String[]> out, String key,
+                                         com.zifang.z.cache.core.stream.Stream stream) {
+        java.util.List<com.zifang.z.cache.core.stream.StreamEntry> entries = stream.getEntries();
+        long[] lastId = stream.lastId();
+        if (entries.isEmpty()) {
+            out.add(new String[]{"XADD", key, "MAXLEN", "0", streamId(lastId), "x", "y"});
+        } else {
+            for (com.zifang.z.cache.core.stream.StreamEntry entry : entries) {
+                Map<String, String> fields = entry.getFields();
+                String[] record = new String[3 + fields.size() * 2];
+                record[0] = "XADD";
+                record[1] = key;
+                record[2] = entry.getId();
+                int at = 3;
+                for (Map.Entry<String, String> field : fields.entrySet()) {
+                    record[at++] = field.getKey();
+                    record[at++] = field.getValue();
+                }
+                out.add(record);
+            }
+        }
+        out.add(new String[]{"XSETID", key, streamId(lastId)});
+        for (String groupName : stream.groupNames()) {
+            com.zifang.z.cache.core.stream.ConsumerGroup group = stream.getGroup(groupName);
+            if (group != null) {
+                out.add(new String[]{"XGROUP", "CREATE", key, groupName,
+                        streamId(group.getLastDeliveredId(), group.getLastDeliveredSeq())});
+            }
+        }
+    }
+
+    private static String streamId(long[] id) {
+        return streamId(id[0], id[1]);
+    }
+
+    private static String streamId(long ms, long seq) {
+        return ms + "-" + seq;
     }
 
     private static List<String> texts(java.util.Collection<byte[]> values) {

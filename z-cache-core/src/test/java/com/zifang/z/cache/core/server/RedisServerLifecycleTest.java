@@ -871,6 +871,310 @@ class RedisServerLifecycleTest {
     }
 
     /**
+     * 流键过一遍 AOF 重写必须整套活着 —— 这一格收的是 13e ③ 登记的那条待办：{@code StoreAccessor}
+     * 当年没有 stream 的枚举口，于是 {@code rewriteAof()} 导出的那份"当前状态"<em>唯独少了这一族</em>。
+     * 当时零调用方所以没坏过东西，坏东西的是"下一版接上它"：{@code BGREWRITEAOF} 一补、
+     * 或按体积自动重写一触发，第一条就是抹掉所有流键。
+     * <p>
+     * 结构层读重写之后那份日志的字节，钉上游 {@code rewriteStreamObject}（{@code aof.c:1172-1266}）
+     * 的四件事：一条记录一条带<em>显式 ID</em> 的 {@code XADD}（{@code :1181-1197}，这一家不套
+     * "64 个成员一批"）、空流用 {@code XADD key MAXLEN 0 <last_id> x y} 那一手（{@code :1198-1210}）、
+     * 无条件补一条 {@code XSETID}（{@code :1212-1217}，注释原文 "in case of XDEL lastid"）、
+     * 逐组 {@code XGROUP CREATE}（{@code :1220-1233}），以及 {@code :1351-1356} 那条排在类型记录
+     * 之后的 {@code PEXPIREAT}。
+     * <p>
+     * 行为层跨进程：删掉快照只留 AOF 重启，逐格读回。比的是<em>改动前那一份读数</em>而不是写死的
+     * 字符串 —— 一条记录里字段的先后由存储侧那张 Map 决定，没有语义，钉死它只是给自己埋一次假红。
+     * <p>
+     * 消费组的 pending 表不在判据里，也不是忘了：上游靠逐条 {@code XCLAIM … JUSTID FORCE}
+     * （{@code :1235-1260}，函数体 {@code :1150-1167}）重建它，而这一侧 {@code XCLAIM} 零处理。
+     * 那一格记在 CHANGELOG 的未覆盖面，不算通过。
+     */
+    @Test
+    void aofRewriteCarriesStreamKeysAcrossTheSwap() throws Exception {
+        java.nio.file.Path dir = java.nio.file.Files.createTempDirectory("zcache-aof-rewrite-stream");
+        java.nio.file.Path aof = dir.resolve("appendonly.aof");
+
+        int p1 = freePort();
+        RedisServer gen1 = new RedisServer("127.0.0.1", p1, 0);
+        gen1.setDataDir(dir.toString());
+        Thread t1 = startAndWait(gen1, p1);
+        Map<String, String> shape = new LinkedHashMap<>();
+        // 结构层（日志字节里的形状）与行为层（只留 AOF 重启后读回）合进同一张表、一次判红：
+        // 分两次 assertTrue 会让 fail-fast 吞掉后面那一层的读数 —— 摘掉 XGROUP 那一支的变异，
+        // 就只报得到"组要重建"，报不到"组重建之后还喂得动"。
+        Map<String, String> shapeWrong = new LinkedHashMap<>();
+        Map<String, String> seen = new LinkedHashMap<>();
+        Map<String, String> wrong = new LinkedHashMap<>();
+        String rangeBefore;
+        String in3Before;
+        try (Socket socket = connect(p1)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+            send(socket, "XADD", "s_orders", "1-1", "item", "a", "qty", "2");
+            assertEquals("1-1", readReply(in), "前置条件: 显式 ID 写得进");
+            send(socket, "XADD", "s_orders", "2-5", "item", "b", "qty", "3");
+            assertEquals("2-5", readReply(in));
+            send(socket, "XADD", "s_orders", "3-9", "item", "c", "qty", "4");
+            assertEquals("3-9", readReply(in));
+            send(socket, "XGROUP", "CREATE", "s_orders", "g1", "0-0");
+            assertEquals("+OK", readReply(in), "前置条件: 组建得起来");
+            send(socket, "XREADGROUP", "GROUP", "g1", "c1", "COUNT", "10", "STREAMS", "s_orders", ">");
+            // c1 那一问要的是"组的位置被推到 3-9"这件事，不是读数本身：XREADGROUP 交回的是
+            // [[key, [[id, [f, v]]]]]，XRANGE 交回的是 [[id, [f, v]]]，两者不同形，所以
+            // 下面那份"改动前的读数"要另问一次 XRANGE，才能和重启后的同一问逐字对得上。
+            String c1Reply = readReplyDeep(in);
+            assertTrue(c1Reply.contains("3-9"), "前置条件: c1 要把三条都领走，实际 " + c1Reply);
+            send(socket, "XADD", "s_orders", "4-1", "item", "d", "qty", "5");
+            assertEquals("4-1", readReply(in));
+            send(socket, "XREADGROUP", "GROUP", "g1", "c2", "COUNT", "10", "STREAMS", "s_orders", ">");
+            // 前置条件要的是"只领得到 4-1"：领走 3-9 说明位置没推进，一条都领不到说明组坏了。
+            // 形状本身（上游那层 [[key, [[id, [field, value]]]]] 的嵌套）交给下面行为层那一问去钉。
+            String c2Reply = readReplyDeep(in);
+            assertTrue(c2Reply.contains("4-1") && !c2Reply.contains("3-9"),
+                    "前置条件: c2 只领得到 4-1，实际 " + c2Reply);
+            // 组的读数位置现在停在 4-1，而下面那条 XDEL 会把它顶出的那条记录删掉：于是"位置"与
+            // "还活着的最大学 ID"从这一刻起是两件事，正是上游补一条无条件 XSETID 要防的那种排布。
+            send(socket, "XDEL", "s_orders", "4-1");
+            assertEquals(":1", readReply(in));
+            send(socket, "EXPIRE", "s_orders", "3600");
+            assertEquals(":1", readReply(in), "前置条件: 流键挂得上时刻");
+
+            // 一条被掏空、但键还在的流：上游专门为其写了 MAXLEN 0 那一手
+            send(socket, "XADD", "s_events", "5-1", "k", "v");
+            assertEquals("5-1", readReply(in));
+            send(socket, "XDEL", "s_events", "5-1");
+            assertEquals(":1", readReply(in));
+            send(socket, "XLEN", "s_events");
+            assertEquals(":0", readReply(in), "前置条件: s_events 现在是一条空流");
+            send(socket, "EXISTS", "s_events");
+            assertEquals(":1", readReply(in), "前置条件: 空流仍然是键");
+
+            // 整个键都不该再出现
+            send(socket, "XADD", "s_gone", "1-1", "f", "v");
+            assertEquals("1-1", readReply(in));
+            send(socket, "DEL", "s_gone");
+            assertEquals(":1", readReply(in));
+
+            send(socket, "SELECT", "3");
+            assertEquals("+OK", readReply(in));
+            send(socket, "XADD", "s_in3", "1-1", "f", "v3");
+            assertEquals("1-1", readReply(in));
+            send(socket, "XRANGE", "s_in3", "-", "+");
+            in3Before = readReplyDeep(in);
+            send(socket, "SELECT", "0");
+            assertEquals("+OK", readReply(in));
+            // 重写之前日志的最后一次落盘要在 DB 0（13e 那一格立的猎物，这里同形复用）
+            send(socket, "SET", "s_tail", "t");
+            assertEquals("+OK", readReply(in));
+            // 改动前那一份读数：与重启后同一问、同一条命令（XRANGE），内容要逐字对得上。
+            send(socket, "XRANGE", "s_orders", "-", "+");
+            rangeBefore = readReplyDeep(in);
+            assertTrue(rangeBefore.contains("3-9") && !rangeBefore.contains("4-1"),
+                    "前置条件: 重写之前 s_orders 里活着的是 1-1/2-5/3-9，实际 " + rangeBefore);
+
+            gen1.getAofPersistence().rewriteAof(aof.toString());
+
+            java.util.List<String[]> records = new java.util.ArrayList<>();
+            new AofPersistence().loadAof(aof.toString(), records::add);
+            java.util.List<String> orderXadds = new java.util.ArrayList<>();
+            java.util.List<String> noExplicitId = new java.util.ArrayList<>();
+            java.util.List<String> selectDbs = new java.util.ArrayList<>();
+            int xsetidOrders = 0, pexpireatOrders = 0, groupCreates = 0, emptyTrick = 0, mentionsGone = 0;
+            int xsetIdAt = -1, lastOrderXaddAt = -1, lastOrdersRecordAt = -1, pexpireatAt = -1;
+            int firstIn3At = -1, select3At = -1;
+            for (int i = 0; i < records.size(); i++) {
+                String[] record = records.get(i);
+                String verb = record[0];
+                String key = record.length > 1 ? record[1] : "";
+                if ("SELECT".equals(verb) && record.length > 1) {
+                    selectDbs.add(record[1]);
+                    if ("3".equals(record[1])) {
+                        select3At = i;
+                    }
+                }
+                if ("s_gone".equals(key)) {
+                    mentionsGone++;
+                }
+                if ("XADD".equals(verb)) {
+                    if ("s_orders".equals(key)) {
+                        orderXadds.add(java.util.Arrays.toString(record));
+                        lastOrderXaddAt = i;
+                        lastOrdersRecordAt = i;
+                    }
+                    if ("s_events".equals(key)) {
+                        if (record.length == 7 && "MAXLEN".equals(record[2]) && "0".equals(record[3])
+                                && "5-1".equals(record[4])) {
+                            emptyTrick++;
+                        }
+                    }
+                    if ("s_in3".equals(key) && firstIn3At < 0) {
+                        firstIn3At = i;
+                    }
+                    if (record.length >= 3 && !"MAXLEN".equals(record[2])
+                            && !record[2].matches("\\d+-\\d+")) {
+                        noExplicitId.add(java.util.Arrays.toString(record));
+                    }
+                } else if ("XSETID".equals(verb) && "s_orders".equals(key)) {
+                    xsetidOrders++;
+                    xsetIdAt = i;
+                    lastOrdersRecordAt = i;
+                } else if ("XGROUP".equals(verb) && record.length == 5 && "CREATE".equals(record[1])
+                        && "s_orders".equals(record[2]) && "g1".equals(record[3])) {
+                    groupCreates++;
+                    lastOrdersRecordAt = i;
+                } else if ("PEXPIREAT".equals(verb) && "s_orders".equals(key)) {
+                    pexpireatOrders++;
+                    pexpireatAt = i;
+                }
+            }
+            shape.put("XADD s_orders", orderXadds.size() + " 条: " + orderXadds);
+            shape.put("没有显式 ID 的 XADD", noExplicitId.toString());
+            shape.put("s_events 的空流那一手", String.valueOf(emptyTrick));
+            shape.put("XSETID s_orders", xsetidOrders + " 条（位置 " + xsetIdAt + "，最后一条 XADD 在 "
+                    + lastOrderXaddAt + "）");
+            shape.put("XGROUP CREATE s_orders g1", String.valueOf(groupCreates));
+            shape.put("PEXPIREAT s_orders", pexpireatOrders + " 条（位置 " + pexpireatAt
+                    + "，本键最后一条 stream 记录在 " + lastOrdersRecordAt + "）");
+            shape.put("提到 s_gone 的记录", String.valueOf(mentionsGone));
+            shape.put("SELECT 库号", selectDbs.toString());
+            shape.put("s_in3 的位置", firstIn3At + "（SELECT 3 在 " + select3At + "）");
+            if (orderXadds.size() != 3) {
+                shapeWrong.put("逐条 XADD", "3 条活着的记录该导出 3 条 XADD（上游一家一条命令，不套 64 一批），"
+                        + "实际 " + orderXadds);
+            }
+            if (!noExplicitId.isEmpty()) {
+                shapeWrong.put("显式 ID", "导出的每一条 XADD 都要带上原来的那个 ID，否则重放会按当前钟点重排表顶: "
+                        + noExplicitId);
+            }
+            if (emptyTrick != 1) {
+                shapeWrong.put("空流那一手", "被 XDEL 掏空的 s_events 仍是一个键，上游用 "
+                        + "XADD key MAXLEN 0 <last_id> x y 演这个状态（aof.c:1198-1210），实际命中 "
+                        + emptyTrick + " 条");
+            }
+            if (xsetidOrders != 1 || xsetIdAt <= lastOrderXaddAt) {
+                shapeWrong.put("表顶要补 XSETID", "s_orders 的表顶停在 4-1 而活着的最大学 ID 是 3-9，"
+                        + "最后一条 XADD 之后必须无条件补一条 XSETID（aof.c:1212-1217），实际 "
+                        + shape.get("XSETID s_orders"));
+            }
+            if (groupCreates != 1) {
+                shapeWrong.put("组要重建", "每组一条 XGROUP CREATE key g <读数位置>（aof.c:1227-1233），实际 "
+                        + groupCreates + " 条");
+            }
+            if (pexpireatOrders != 1 || pexpireatAt <= lastOrdersRecordAt) {
+                shapeWrong.put("时刻排在类型记录之后", "流键的 PEXPIREAT 恰一条，且要排在它自己的"
+                        + " XADD / XSETID / XGROUP 之后（aof.c:1351-1356），实际 "
+                        + shape.get("PEXPIREAT s_orders"));
+            }
+            if (mentionsGone != 0) {
+                shapeWrong.put("删掉的键", "s_gone 已经 DEL，重写之后日志里不该再提它，实际 " + mentionsGone + " 条");
+            }
+            if (!selectDbs.equals(java.util.Arrays.asList("0", "3"))) {
+                shapeWrong.put("逐库 SELECT", "只该给非空的库补 SELECT，实际 " + selectDbs);
+            }
+            if (firstIn3At < 0 || select3At < 0 || firstIn3At < select3At) {
+                shapeWrong.put("流键排在所属 SELECT 之后", "DB 3 里只有流键时，那条 XADD 必须排在 SELECT 3 之后，"
+                        + "实际 " + shape.get("s_in3 的位置"));
+            }
+            for (Map.Entry<String, String> cell : shapeWrong.entrySet()) {
+                wrong.put("结构层 " + cell.getKey(), cell.getValue());
+            }
+
+            send(socket, "SET", "s_after", "v");
+            assertEquals("+OK", readReply(in));
+        } finally {
+            gen1.stop();
+            t1.join(DEADLINE_MS);
+        }
+        // 只留 AOF，别拿快照当恢复的功劳
+        java.nio.file.Files.deleteIfExists(dir.resolve("dump.rdb"));
+
+        int p2 = freePort();
+        RedisServer gen2 = new RedisServer("127.0.0.1", p2, 0);
+        gen2.setDataDir(dir.toString());
+        Thread t2 = startAndWait(gen2, p2);
+        try (Socket socket = connect(p2)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+            send(socket, "XRANGE", "s_orders", "-", "+");
+            String rangeAfter = readReplyDeep(in);
+            seen.put("XRANGE s_orders", rangeAfter);
+            if (!rangeBefore.equals(rangeAfter)) {
+                wrong.put("XRANGE s_orders", "重写前 " + rangeBefore + " → 重启后 " + rangeAfter);
+            }
+            // TYPE 交回的是状态行（上游 db.c:838 用的就是 addReplyStatus，文档里那句"Bulk string
+            // reply"不是 5.0.14 的线上形状），所以这里带 "+"。
+            expectCell(seen, wrong, socket, in, "TYPE s_orders", "+stream", "TYPE", "s_orders");
+            expectTtlCell(seen, wrong, socket, in, "s_orders", 3_600);
+            // 表顶：4-1 那条已经 XDEL 掉，只有 XSETID 把表顶留在 4-1 时，4-0 才被单调性闸挡下
+            send(socket, "XADD", "s_orders", "4-0", "item", "x", "qty", "9");
+            String rejected = readReply(in);
+            seen.put("XADD s_orders 4-0", rejected);
+            if (!rejected.startsWith("-ERR")) {
+                wrong.put("表顶活过重写", "4-1 已被 XDEL，但表顶该停在 4-1，比它小的 4-0 该被单调性闸挡下；"
+                        + "实际 " + rejected);
+            }
+            // 组的读数位置：c3 从这里起只该领到 4-1 之后的条目，而 4-1 已被删 → 空。
+            // 这一问必须排在下面那条 XADD 4-2 <em>之前</em>：4-2 一进去，"空"就成了改动后的形状，
+            // 而"什么都读不到"本身也是一条会被"组压根没重建"复现的答 —— 所以它下面还压着一问猎物。
+            send(socket, "XREADGROUP", "GROUP", "g1", "c3", "COUNT", "10", "STREAMS", "s_orders", ">");
+            String afterGroup = readReplyDeep(in);
+            seen.put("XREADGROUP c3 >", afterGroup);
+            if (java.util.regex.Pattern.compile("\\d+-\\d+").matcher(afterGroup).find()) {
+                wrong.put("组的读数位置", "组该重建在 4-1（1-1/2-5/3-9 早已投过、4-1 已删），"
+                        + "新消费者 c3 一条都不该领到，实际 " + afterGroup);
+            }
+            expectCell(seen, wrong, socket, in, "XADD s_orders 4-2（上面那一问的阳性对照）", "4-2",
+                    "XADD", "s_orders", "4-2", "item", "e", "qty", "6");
+            send(socket, "XREADGROUP", "GROUP", "g1", "c3", "COUNT", "10", "STREAMS", "s_orders", ">");
+            String groupFeeds = readReplyDeep(in);
+            seen.put("XREADGROUP c3 >（再问）", groupFeeds);
+            if (!groupFeeds.contains("4-2")) {
+                wrong.put("组重建之后还喂得动", "上一问的『一条都不领到』需要一个猎物：4-2 一进流，同一个 c3 再问一次 > "
+                        + "就该领到它，否则『领不到』是组压根没重建，而不是位置卡在 4-1，实际 " + groupFeeds);
+            }
+            expectCell(seen, wrong, socket, in, "EXISTS s_events", ":1", "EXISTS", "s_events");
+            expectCell(seen, wrong, socket, in, "TYPE s_events", "+stream", "TYPE", "s_events");
+            expectCell(seen, wrong, socket, in, "XLEN s_events", ":0", "XLEN", "s_events");
+            send(socket, "XADD", "s_events", "5-0", "k", "v");
+            String eventsRejected = readReply(in);
+            seen.put("XADD s_events 5-0", eventsRejected);
+            if (!eventsRejected.startsWith("-ERR")) {
+                wrong.put("空流的表顶", "空流也要把表顶留在 5-1，否则 5-0 还能塞进去（重放时 4-1 那一幕会重来一遍），实际 "
+                        + eventsRejected);
+            }
+            expectCell(seen, wrong, socket, in, "XADD s_events 6-0（阳性对照）", "6-0",
+                    "XADD", "s_events", "6-0", "k", "v2");
+            expectCell(seen, wrong, socket, in, "EXISTS s_gone", ":0", "EXISTS", "s_gone");
+            expectCell(seen, wrong, socket, in, "GET s_tail", "t", "GET", "s_tail");
+            expectCell(seen, wrong, socket, in, "GET s_after", "v", "GET", "s_after");
+            send(socket, "SELECT", "3");
+            String select3 = readReply(in);
+            seen.put("SELECT 3", select3);
+            if (!"+OK".equals(select3)) {
+                wrong.put("SELECT 3", "切库要答 +OK（读不到它就说明上面的字节没吃干净），实际 " + select3);
+            }
+            send(socket, "XRANGE", "s_in3", "-", "+");
+            String in3After = readReplyDeep(in);
+            seen.put("XRANGE s_in3 在 3 库", in3After);
+            if (!in3Before.equals(in3After)) {
+                wrong.put("XRANGE s_in3 在 3 库", "重写前 " + in3Before + " → 重启后 " + in3After);
+            }
+            send(socket, "SELECT", "0");
+            String backTo0 = readReply(in);
+            seen.put("SELECT 0", backTo0);
+            if (!"+OK".equals(backTo0)) {
+                wrong.put("SELECT 0", "切回 0 库要答 +OK，实际 " + backTo0);
+            }
+            expectCell(seen, wrong, socket, in, "EXISTS s_in3 回到 0 库", ":0", "EXISTS", "s_in3");
+        } finally {
+            gen2.stop();
+            t2.join(DEADLINE_MS);
+        }
+        assertTrue(wrong.isEmpty(), "流键过一遍 AOF 重写：结构层（重写后那份日志里的形状）与行为层（只留 AOF"
+                + " 重启之后逐格读回）要一起合格。日志形状 " + shape + "；读回的格子 " + seen
+                + "；不合格: " + wrong + " [RED_CELLS=" + String.join("|", wrong.keySet()) + "]");
+    }
+
+    /**
      * 没接 {@code StoreAccessor} 的实例导不出任何东西 —— 那一支 rewriteAof 必须拒绝，
      * 而不是写一份<em>空</em>日志再把真的有内容的那份换掉（这一格改动前的实际形状：
      * 注释自陈"实际实现需要依赖 StoreAccessor"，然后把 {@code appendonly.aof} 删了）。
@@ -1812,6 +2116,44 @@ class RedisServerLifecycleTest {
             out.add(readReply(in));
         }
         return out;
+    }
+
+    /**
+     * 递归读一个 RESP 值并压平成可读文本：数组 {@code [a, b, [c]]}，bulk 取字符串，
+     * {@code *-1} / {@code $-1} 原样带出。XRANGE / XREADGROUP 是嵌套形状，只吃 {@code *} 头
+     * 会把 payload 留在流上，下一问读到的就是上一问的字节。
+     */
+    private static String readReplyDeep(DataInputStream in) throws IOException {
+        String line = readLine(in);
+        if (line.startsWith("*")) {
+            int n = Integer.parseInt(line.substring(1));
+            if (n < 0) {
+                return line;
+            }
+            StringBuilder sb = new StringBuilder("[");
+            for (int i = 0; i < n; i++) {
+                if (i > 0) {
+                    sb.append(", ");
+                }
+                sb.append(readReplyDeep(in));
+            }
+            return sb.append(']').toString();
+        }
+        return readBody(in, line);
+    }
+
+    private static String readBody(DataInputStream in, String line) throws IOException {
+        if (line.isEmpty() || line.charAt(0) != '$') {
+            return line;
+        }
+        int length = Integer.parseInt(line.substring(1));
+        if (length < 0) {
+            return line;
+        }
+        byte[] payload = new byte[length];
+        in.readFully(payload);
+        in.readFully(new byte[2]);
+        return new String(payload, StandardCharsets.UTF_8);
     }
 
     private static String readLine(DataInputStream in) throws IOException {

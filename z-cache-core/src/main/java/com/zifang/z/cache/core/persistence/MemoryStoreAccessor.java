@@ -6,6 +6,7 @@ import com.zifang.z.cache.core.storage.ListStore;
 import com.zifang.z.cache.core.storage.MemoryStore;
 import com.zifang.z.cache.core.storage.SetStore;
 import com.zifang.z.cache.core.storage.SortedSetStore;
+import com.zifang.z.cache.core.stream.Stream;
 
 import java.nio.charset.StandardCharsets;
 import java.util.*;
@@ -97,6 +98,26 @@ public class MemoryStoreAccessor implements StoreAccessor {
                 memberScores.put(member, score);
             }
             result.put(key, memberScores);
+        }
+        return result;
+    }
+
+    /**
+     * 第六家。键名集合由 {@code StreamStore.keySet} 交回（没绑 stream 存储时 {@code MemoryStore}
+     * 那一侧一律回答"没有这个键"，这里就交回空 Map），流对象本身按键名逐个取。
+     */
+    @Override
+    public Map<String, Stream> getAllStreamEntries(int db) {
+        Map<String, Stream> result = new LinkedHashMap<>();
+        com.zifang.z.cache.core.stream.StreamStore streams = store.streamStore();
+        if (streams == null) {
+            return result;
+        }
+        for (String key : streams.keySet(db)) {
+            Stream stream = streams.getStream(db, key);
+            if (stream != null) {
+                result.put(key, stream);
+            }
         }
         return result;
     }

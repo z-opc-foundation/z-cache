@@ -1776,6 +1776,63 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   `logs/fsync_fullreactor.log`）：core 408 → 410，本格新增 2 个 `@Test`。
 - 250 那一侧仍然没有实测：本轮全部读数单机（判据、牙、基线都在这一台机器上）。
 
+#### Stream 一族第一次进得了重写后的日志：导出侧最后一族看不见的键（13g）
+
+- **来账**：13e 末尾登记的「③ Stream 既进不了快照也导不出」。**本格关的是导出的那一半**，快照那一半
+  仍然开着。后果不是丢几个字节而是丢整族键：`exportMinimalCommandSet` 只枚举五张表（String / list /
+  set / hash / zset），含 Stream 键的库过一遍 `rewriteAof`，那一族从日志里彻底消失，重启后 `EXISTS` 回 `:0`。
+- **改动前的形状**（`git archive HEAD`（`aed92e3`）解出的独立树 `head_tree/`，只覆写本轮那份测试，
+  工作区一个字不动；日志 `logs/prefix_judge_merged.log`）：`Tests run: 1, Failures: 1, Errors: 0`，
+  一张表点名 16 格 —— 结构层 `逐条 XADD` / `空流那一手` / `表顶要补 XSETID` / `组要重建` /
+  `时刻排在类型记录之后` / `逐库 SELECT` / `流键排在所属 SELECT 之后`，行为层 `XRANGE s_orders` /
+  `TYPE s_orders` / `TTL s_orders` / `表顶活过重写` / `组重建之后还喂得动` / `EXISTS s_events` /
+  `TYPE s_events` / `空流的表顶` / `XRANGE s_in3 在 3 库`。
+- **改动**：接口开第六个枚举口 `StoreAccessor.getAllStreamEntries(int db)`（`StoreAccessor.java:97`），
+  `MemoryStoreAccessor:110` 从新加的 `MemoryStore.streamStore()`（`storage/MemoryStore.java:334`）拿那份
+  台份。**它与另外五个口同一把尺：不过滤已到期的键**，到期由读侧的惰性删除兜住
+  （`getAllExpirationEntries` 也是这么量的）；在这里换掉判据，会让「到期未清」的流键在导出侧和 TTL 侧各说一套。
+  `AofPersistence:582-591` 补上第六家，`addStreamRecords`（`:652`）照上游 `rewriteStreamObject`
+  （`aof.c:1172-1266`）的四手写：① 一条记录一条 `XADD`、**带显式 ID**、arity = 3 + 2×字段数、
+  不套 64 一批（`:1181-1197`）；② 空流那一手 `XADD key MAXLEN 0 <表顶> x y`（`:1198-1210`），
+  它要同时立住「键在、表顶在、记录不在」这三件事；③ **无条件**补一条 `XSETID`（`:1212-1217`，
+  注释原文 『in case of XDEL lastid』）—— 删空/裁空的流靠它把表顶带过去，有记录的流也照样补，
+  因为它防的正是「最后一条被 XDEL 掉了」那种形状；④ 逐组 `XGROUP CREATE key <组名> <组自己的读数位置>`
+  （`:1220-1233`）。`PEXPIREAT` 排在四手之后（同上游 `:1351-1356` 的顺序）。
+- **判据** `RedisServerLifecycleTest.aofRewriteCarriesStreamKeysAcrossTheSwap`（`:894`）：一台真服务器上
+  铺五种形状（带组带消费者的 `s_orders`、被 XDEL 掏空的 `s_events`、整个 DEL 掉的 `s_gone`、落在 3 库的
+  `s_in3`、DB 0 里一支 `SET s_tail` 当跨库对照），`rewriteAof` 换日志后删掉 `dump.rdb` 重启，
+  **只留 AOF 那一侧**把格子读回来。结构层与行为层合成一次断言 —— 第一版分两次断言，结构层当场抛掉，
+  行为层那 9 格的证据全被 JUnit 的 fail-fast 吞了。否定式那一格配了阳性对照：`XREADGROUP … c3 >`
+  在补 `XADD 4-2` **之前**先问一次（重建出的组若游标倒回开头，这一问会读到旧条目），之后同形再问一次读到 `4-2`。
+- **牙**（第十份量具 `~/.cache/zcache_gauges/stream_rw_mut/teeth.py`；被量字节
+  `AofPersistence.java 848269ee461d6aaa5369caecabcee8ea` + `MemoryStoreAccessor.java 495cf4e2f41d0c1fe600c6a027588b17`
+  + 判据文件 `RedisServerLifecycleTest.java 57bd5a6ff274b95f1c4497b73a92502d`，三份由本次运行自己存 `.good`、
+  每支还原后按 md5 对账）：M1 枚举口交回空表 → 改前那 16 格整份；M2 摘掉 `XSETID` → `表顶要补 XSETID`
+  + `表顶活过重写`；M3 摘掉逐组循环 → `组要重建` + `组重建之后还喂得动`；M4 空流丢掉 `MAXLEN 0` →
+  `空流那一手` + `XLEN s_events`（那一手把空表演成有记录的流）；M5 显式 ID 换成 `*` → 6 格（`显式 ID`、
+  `XRANGE s_orders`、`XRANGE s_in3 在 3 库`，加上组的那三格 —— 三条 `XADD` 重放时按当前钟点重排表顶，
+  组的读数位置跟着漂）；M6 `PEXPIREAT` 排到四手之前 → `时刻排在类型记录之后` + `TTL s_orders`
+  （**所以那一格不只是排版**：重放到时刻记录时键还不存在，时刻整个丢掉）；M7 组的位置写成 `0-0` →
+  只有 `组的读数位置` 那一格，靠的就是上面那句阳性对照。`CONTROL 未变异 → OK`，`SUMMARY mutants=8 bad=0`，
+  七支全部「漏 无；多 无」。M5/M6 的预期集是第一次跑实测出来的而非预判 —— 首轮它们各多报了 3 格与 1 格。
+- **与上游的差别（记账）**：`rewriteStreamObject` 在组之后还要替每个手上有未确认条目的消费者逐条
+  `XCLAIM … TIME … RETRYCOUNT … JUSTID FORCE`（`aof.c:1235-1260`，函数体 `:1150-1167`）。
+  **这一侧没有 `XCLAIM`**（`src/main` 里零处理），所以组的读数位置过得重写，**pending 表与消费者状态过不去**。
+  这是导出口再开第八家也补不上的结构问题，不是排版能补的差别。
+- **未覆盖面（记账，不当分）**：① `结构层 显式 ID` 与 `结构层 删掉的键` 两格在 M1（枚举口交回空表）下
+  **空跑** —— 那条日志里一条 `XADD` 都没有，「每条都带显式 ID」自然成立，s_gone 也没被提及。
+  前者的猎物由 M5 给出（换成 `*` 它当场红）；后者**七支变异里没有一支能让它红**（M1 是「整族看不见」，
+  不是「看见了已删的」），所以它现在只是防回归的一格，不许当成牙记账。`EXISTS s_gone` 改前改后同为 `:0`，
+  它钉的是「补进这一族之后别把删掉的键带回来」，也不承担那两格的猎物；② 只钉了「同一条流内部」的相对顺序，
+  跨流之间的顺序没钉（上游也不保证，它按键空间迭代）；③ 重启后消费者名单（`XINFO CONSUMERS`）不在判据里，
+  因为它的来源正是上面那句 `XCLAIM`。
+- **宣传口径同步**：README 特性表持久化那一行与 `_doc/001_arch/01-module-structure.md` §2.3.1 那句
+  「含 Stream 键的库过一遍重写会丢掉那一族键」按本轮实测改写；两处同时把仍开着的两格写明
+  （触发命令仍一个都没有、Stream 仍进不了 RDB 快照）。
+- 基线 `906`（`358 + 411 + 135 + 2`，全量 `mvn -o -B clean test` rc=0 / BUILD SUCCESS，日志
+  `~/.cache/zcache_gauges/logs/full_13g_123455.log`）：core 410 → 411，本格新增 1 个 `@Test`。
+- 250 那一侧仍然没有实测：本轮全部读数单机（判据、牙、基线都在这一台机器上）。
+
 ### Added
 - `RedisServer.serverScope()`：只读拿到本台那一份，测试与嵌入式据此判断作用域边界。
 - `StreamIdFormat`（z-cache-common）：stream ID 的唯一文法（uint64 两段、`-` / `+` 两种位置、
