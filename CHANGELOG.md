@@ -2102,15 +2102,23 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   分模块读数由 `tally_log.py` 现算：`MODULES=4 run=909 failures=0 errors=0 skipped=0`）。
 - **第二台机器补跑（09-27 14:2x）—— 本 entry 上一版写的"本轮全部读数只有单机"到此作废**：
   250 已恢复 ssh，在 `13b8c6b` 的**干净 clone**（`~/zcache-250t/z-cache-13j`，
-  `git status --porcelain | wc -l` = 0）上跑完整套件：`BUILD SUCCESS`，`tally_log.py` 报
+  `git status --porcelain | wc -l` = 0）上跑完整套件（日志 `~/zcache-250t/logs/full_13j_250.txt`，
+  它自己写的 `Finished at: 2026-09-27T14:28:22+08:00`）：`BUILD SUCCESS`，`tally_log.py` 报
   `MODULES=4 run=909 failures=0 errors=0 skipped=0`（`358 + 414 + 135 + 2`），与本机的
   `logs/full_13j_run1.txt` **逐字节相同** —— 两份 tally 文本 `diff` 无差异、`md5` 同为
   `dbc023d1602e9b6e9f5fc49158ddb1ac`（原始日志分别是 `8538bdeb…` 本机 / `720b5877…` 250，
-  差异只有时刻）。所以本格装的那四个字段、17 格判据与三族牙**两台机器都成立**。
+  差异只有时刻）。两边用的是**同一把尺**：250 上那份 `tally_log.py` 是从本机 `scp` 过去的，
+  md5 同为 `3eabf408ad99f3edf2dcba1a635908fa`。
+  所以本格装的那四个字段、17 格判据与三族牙**两台机器都成立**。
 - **250 上"照着 PATH 跑"是跑不起来的，原因不在代码**：那台机器的默认 `mvn` 是 **3.6.0**
-  （`/usr/bin/mvn`），14:23 那一次 `mvn -B clean test` 61 行就死在 `PluginIncompatibleException`
-  （插件要求 Maven ≥ 3.6.3）。换 `~/maven3914/bin/mvn`（3.9.14；同机另有 3.9.6 也满足）一次跑通。
+  （`/usr/bin/mvn`）。当场证据（14:34 重跑并存盘，`~/zcache-250t/logs/full_13j_250_mvn360.txt`
+  64 行、md5 `f99da8c254c8f4f709c3211d69f240e6`、rc=1）：
+  `The plugin org.apache.maven.plugins:maven-compiler-plugin:3.13.0 requires Maven version 3.6.3`，
+  死在 `z-cache-common` 的 `default-compile`，收尾就是那句 `mvn <goals> -rf :z-cache-common`。
+  换 `~/maven3914/bin/mvn`（3.9.14；同机另有 3.9.6 也满足）后一次跑通。
   **往后在 250 一律显式写 `~/maven3914/bin/mvn`**，别再拿 `PATH` 上那个。
+  （14:23 的第一次失败日志被第二次运行按同一路径覆盖了，当时看到的是 61 行 —— 本条引的是
+  重跑那份存下来的，不是记忆里的那份。）
 - **行号校正（三处，都在本 entry 里，因为两行折行的宏只点了第二行）**：`CONFIG SET` 的
   `auto-aof-rewrite-percentage` 是 `config.c:1160-1161`（宏名在 1160，字段与区间 `0,INT_MAX` 在 1161），
   `auto-aof-rewrite-min-size` 是 `config.c:1262-1263`（赋值在 1263）；`CONFIG GET` 两项分别是
