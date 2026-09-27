@@ -9,10 +9,16 @@ import java.nio.charset.StandardCharsets;
  * 为什么要有这么个类：{@code CONFIG GET <pattern>} 收的是 glob，不是"前缀"也不是正则。
  * 手上现成的替代品有两个，两个都会错：{@code String.startsWith} 把 {@code auto-aof-*} 之外的
  * 写法全当字面量；{@code globToRegex} 那一族（把 {@code [} {@code ]} 转义成正则里的字面方括号，
- * {@code [ab]} 那一档在两边根本不是同一个语言）今天还剩四处私有副本 —— {@code HashStore:563}、
- * {@code SetStore:460}、{@code SortedSetStore:1117}、{@code PubSubManager:372}，
- * 键枚举那两处（{@code MemoryStore} 与 {@code CommandHandler} 各一份）13s 已删并把交付接回本类。
- * 判据得集中在一条，而且这条要能单独被变异验牙 —— 挂在命令层的格子做不到这一点。
+ * {@code [ab]} 那一档在两边根本不是同一个语言）在仓里曾有六份私有副本，如今<em>代码里一处不剩</em>：
+ * 键枚举那两处（{@code MemoryStore} 与 {@code CommandHandler} 各一份）13s 删的，成员枚举那四处
+ * （{@code HashStore.hscan}、{@code SetStore.sscan}、{@code SortedSetStore.zscan}，以及
+ * {@code PubSubManager} 的 {@code getChannels}＋{@code publish}＋那份递归 {@code matchPattern}）
+ * 13v 删的。今天 {@code src/main} 里还能 grep 到的命中全在注释里。
+ * 判据得集中在一条，而且这条要能单独被变异验牙：结构那一半由
+ * {@code RedisGlobDeliveryTest.memberFacesHaveNoPrivateDialectLeft} 逐文件数着（违禁字样 0 命中、
+ * 共享那把<em>各接恰好一次</em>、命令层不许把"没给 MATCH"折成一根 {@code *} 哨兵），交付那一半由
+ * {@code memberFacesDeliverTheReferenceSets} 真起一台从线上问（五张面的期望集出自 C 生成的表）。
+ * 只挂在命令层的格子做不到这一点：那两层各自都量到过"改了语义而格子全绿"。
  * </p>
  *
  * <p>
@@ -76,7 +82,12 @@ import java.nio.charset.StandardCharsets;
  * {@code stringLen}、空串直接判不匹配 —— 本类照 5.0.14（上面逐臂抄的就是这一版）。
  * 这一笔 13t 由 C 量具独立复现：同一份提取体（5.0.14）与那台 4.0.9 在旧电池的 2928 格里
  * 只差这三格。而 {@code KEYS *} 那一格由上面那句快路收回，所以线上只有 {@code KEYS **}
- * 这种写法看得见它。13t 又拿变异问过这两支判据：<em>把循环头那半个 {@code stringLen}
+ * 这种写法看得见它 —— 13v 把这一格的可见面摊开了：成员枚举那一族（{@code HSCAN}／
+ * {@code SSCAN}／{@code ZSCAN} 的 {@code MATCH}）与 {@code PUBSUB CHANNELS} 上游本来就
+ * <em>没有</em>那句快路（{@code db.c:748}、{@code pubsub.c:351}），所以 {@code MATCH *}
+ * 不交空成员、而"没给 MATCH"要交 —— 这一对方向相反的格子由
+ * {@code RedisGlobDeliveryTest} 的 {@code D1a}/{@code D1b}/{@code D1c} 与
+ * {@code D2s0}/{@code D2h0}/{@code D2z0} 钉住，期望集直接从 C 生成。13t 又拿变异问过这两支判据：<em>把循环头那半个 {@code stringLen}
  * 摘掉（＝退回 4.0.9 那一档），matcher 级两支判据一支都不红</em> —— 于是这三格本身被
  * 补进了 {@code RedisGlobTest}（连同三行同形状的 {@code true} 对照，两档读数各自在案），
  * 这一档从此在仓里有牙。

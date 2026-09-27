@@ -1,5 +1,7 @@
 package com.zifang.z.cache.core.storage;
 
+import com.zifang.z.cache.common.protocol.RedisGlob;
+
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -385,9 +387,11 @@ public class SetStore {
         if (set == null) {
             return new Object[]{"0", result};
         }
-        String regex = pattern == null ? null : globToRegex(pattern);
+        // 上游这一族没有"整表命中"的快路：db.c:748（scanGenericCommand 里过滤成员那一段，
+        // SCAN/HSCAN/SSCAN/ZSCAN 共用）直接问 stringmatchlen，而 db.c:545 那个 allkeys 只属于 KEYS。
+        // 所以这里也不给 `*` 开后门：空成员在 `MATCH *` 下<em>不</em>该出现，与键枚举那一族有意不同。
         for (String member : set) {
-            if (regex == null || member.matches(regex)) {
+            if (pattern == null || RedisGlob.matches(pattern, member, false)) {
                 result.add(member.getBytes(StandardCharsets.UTF_8));
             }
         }
@@ -455,17 +459,5 @@ public class SetStore {
      */
     public void flush() {
         store.clear();
-    }
-
-    private static String globToRegex(String pattern) {
-        StringBuilder regex = new StringBuilder("^");
-        for (int i = 0; i < pattern.length(); i++) {
-            char c = pattern.charAt(i);
-            if (c == '*') regex.append(".*");
-            else if (c == '?') regex.append('.');
-            else if ("\\.[]{}()+-^$|".indexOf(c) >= 0) regex.append('\\').append(c);
-            else regex.append(c);
-        }
-        return regex.append('$').toString();
     }
 }

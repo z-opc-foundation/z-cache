@@ -1,5 +1,6 @@
 package com.zifang.z.cache.core.pubsub;
 
+import com.zifang.z.cache.common.protocol.RedisGlob;
 import com.zifang.z.cache.common.protocol.RespArray;
 import com.zifang.z.cache.common.protocol.RespBulkString;
 import io.netty.channel.ChannelHandlerContext;
@@ -188,7 +189,9 @@ public class PubSubManager {
         // 向模式订阅者发送消息
         for (Map.Entry<String, Set<ChannelHandlerContext>> entry : patternSubscribers.entrySet()) {
             String pattern = entry.getKey();
-            if (matchPattern(pattern, channel)) {
+            // 上游 PUBLISH 派发 pmessage 用的就是同一把 glob、同一档 nocase=0（pubsub.c:256），
+            // 所以 PSUBSCRIBE 的图案语义与 KEYS／SCAN／PUBSUB CHANNELS 必须同源，不能各留一份副本。
+            if (RedisGlob.matches(pattern, channel, false)) {
                 Set<ChannelHandlerContext> patternSubs = entry.getValue();
                 // 构建 RESP 数组消息：["pmessage", pattern, channel, message]
                 Object[] pmessageArray = new Object[]{
@@ -212,17 +215,20 @@ public class PubSubManager {
     /**
      * 获取所有活跃频道（当前有订阅者的频道）。
      *
-     * @param pattern 模式字符串，null 或 "*" 表示所有频道
+     * @param pattern 模式字符串，null 表示所有频道（{@code "*"} <em>不</em>是快路，见方法体注释）
      * @return 匹配的活跃频道集合
      */
     public Set<String> getChannels(String pattern) {
-        if (pattern == null || "*".equals(pattern)) {
+        if (pattern == null) {
             return Collections.unmodifiableSet(channelSubscribers.keySet());
         }
+        // 上游 PUBSUB CHANNELS 没有"图案恰好一根 *"的快路：pubsub.c:351 那句是
+        // if (!pat || stringmatchlen(pat, sdslen(pat), channel, sdslen(channel), 0)，
+        // pat 只在"根本没给 MATCH 参数"时为 NULL（pubsub.c:340）。
+        // 所以 `PUBSUB CHANNELS *` 与键枚举那一族的 `KEYS *` 有意不同答：空频道名不出现。
         Set<String> matched = new HashSet<>();
-        String regex = globToRegex(pattern);
         for (String channel : channelSubscribers.keySet()) {
-            if (channel.matches(regex)) {
+            if (RedisGlob.matches(pattern, channel, false)) {
                 matched.add(channel);
             }
         }
@@ -311,78 +317,5 @@ public class PubSubManager {
             removeClient(ctx);
             return false;
         }
-    }
-
-    /**
-     * 简单通配符模式匹配。
-     * <ul>
-     *   <li>{@code *} 匹配任意字符序列（包括空序列）</li>
-     *   <li>{@code ?} 匹配单个字符</li>
-     * </ul>
-     *
-     * @param pattern 通配符模式
-     * @param text    要匹配的文本
-     * @return true 表示匹配成功
-     */
-    private static boolean matchPattern(String pattern, String text) {
-        return matchPattern(pattern, 0, text, 0);
-    }
-
-    /**
-     * 递归通配符匹配实现。
-     */
-    private static boolean matchPattern(String pattern, int pi, String text, int ti) {
-        while (pi < pattern.length()) {
-            char pc = pattern.charAt(pi);
-            if (pc == '*') {
-                // '*' 可以匹配零个或多个字符
-                pi++;
-                if (pi >= pattern.length()) {
-                    return true; // 模式以 '*' 结尾，匹配所有
-                }
-                // 尝试 text 中每个位置
-                for (int i = ti; i <= text.length(); i++) {
-                    if (matchPattern(pattern, pi, text, i)) {
-                        return true;
-                    }
-                }
-                return false;
-            } else if (pc == '?') {
-                // '?' 必须匹配一个字符
-                if (ti >= text.length()) {
-                    return false;
-                }
-                pi++;
-                ti++;
-            } else {
-                // 普通字符必须精确匹配
-                if (ti >= text.length() || pc != text.charAt(ti)) {
-                    return false;
-                }
-                pi++;
-                ti++;
-            }
-        }
-        return ti == text.length();
-    }
-
-    /**
-     * 将 glob 通配符模式转换为正则表达式。
-     */
-    private static String globToRegex(String pattern) {
-        StringBuilder regex = new StringBuilder("^");
-        for (int i = 0; i < pattern.length(); i++) {
-            char c = pattern.charAt(i);
-            if (c == '*') {
-                regex.append(".*");
-            } else if (c == '?') {
-                regex.append('.');
-            } else if (".\\[]{}()+-^$|".indexOf(c) >= 0) {
-                regex.append('\\').append(c);
-            } else {
-                regex.append(c);
-            }
-        }
-        return regex.append('$').toString();
     }
 }

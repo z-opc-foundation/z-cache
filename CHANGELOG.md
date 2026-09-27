@@ -2730,6 +2730,39 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
 - **与上游参考实现的关系，如实写明**：Redis 自己不带日志框架（C 实现的 `serverLog` 直接写 stderr / 文件），所以本轮这一族**不是**"向 5.0.14 对齐"的语义差，而是宿主侧的工程约束；它进这份 CHANGELOG 是因为它会改变消费者看到的东西（少一段日志、多一支实现、多一份写在别人目录里的文件）。
 - **下一格**：① server 那份 `log4j2.xml` 的 `filePattern` 按日翻卷只有一份配置撑着，跨日行为没量过（`logs/z-cache.2026-09-06.log` 那种 0 字节的历史文件就是它的产物，本轮没验它怎么产生）；② ⑥那条判据现在只送 INFO 一档，`warn` / `error` / `debug` 到不到 appender 未量 —— 想补"实现缺席"那一格，可行的路是从**行为**下手（配一份只放行 INFO 的 root 级别）而不是从类路径摘依赖（M5 已证那条量不成）；③ 沿用旧账：卡 #37 / #38 / #39 / #40、卡 #26、卡 #34、`COMMAND` / `ACL` / `SWAPDB` 三个标签现读仍 0 命中、欠参考实例的对拍还剩两支（`RedisMemoryFormatTest` / `RedisConfigCommandTest`）。
 
+#### 成员枚举那五张面接上同一把 glob：四份私有匹配器删干净，`MATCH *` 与"没给 MATCH"从此是两码事（13v，卡 #39）
+- 病灶：`HashStore.hscan`、`SetStore.sscan`、`SortedSetStore.zscan`、`PubSubManager`（`getChannels` 与 `publish` 两处 + 那份递归 `matchPattern`）各写各的 glob，键枚举那两处 13s 已经接到 `RedisGlob` 上、这一族一直没人管。它们从没被量过 —— `RedisGlobTest` 钉的是匹配器本身，命令层那五张面走的是另一套文法，绿得互不相干。
+- **先量再接**（尺 = `~/.cache/zcache_gauges/star_family_report.py`，读数 tee 进 `logs/star_family_13v.txt`；复算 = `python3 ~/.cache/zcache_gauges/star_family_report.py`。电池 = 10 支图案 × 6 枚名 × 2 档 `nocase` = **120 对**，图案专挑 `*` 家族：`*` `**` `***` `a*` `*a` `ab*` `*é` `a*b` `?` `a`）：
+  - `[0]` 那份 C 提取体逐字节等于 5.0.14 `util.c:stringmatchlen`（函数体 3675 字节）—— 真值不是抄来的；
+  - `[2]` `RedisGlob` vs C：**0 格不同答**；
+  - `[3]` 三份私有实现 vs C 各 **4 格**不同答，且方向全是"私有放宽"：`*`／`**`／`***` 打在空名上（`stores`／`pubsub`／`recursive` 三家同一形状）+ `?` 打在 `中` 上（正则的 `.` 吃一个 **char**，C 的 `?` 吃一个**字节**）；`[1]` 那 6 格空格子（3 支图案 × 2 档 `nocase`）是阳性对照，`[4]` `nocase=1` 档另有 4 格、这四家没有那个入口，只记账。
+  - 结论是两条病同在一处：`*` 快路把空成员放行，`?` 的粒度错一档。这两条都不是"读代码读出来的印象"，是 120 对问出来的。
+- **接上之后形状要跟着改，这一格是上游给的**：`SSCAN k 0` 把空成员交回来，`SSCAN k 0 MATCH *` **不**交回来。上游 `db.c:748`（`scanGenericCommand` 里过滤成员那一段，SCAN/HSCAN/SSCAN/ZSCAN 共用）直接问 `stringmatchlen(..., 0)`，而"图案恰好一根 `*`"那句 `allkeys` 快路（`db.c:545`）**只属于 `KEYS`**；`PUBSUB CHANNELS` 同样没有快路（`pubsub.c:351` 的 `pat` 只在"根本没给参数"时才是 NULL，`pubsub.c:340`）。所以命令层那个"没给 MATCH 就填 `"*"`"的哨兵必须撤 —— 三家 `handleXscan` 现读都是 `String pattern = null;`，存储层判 `pattern == null || RedisGlob.matches(...)`。`PUBLISH` 派发 `pmessage` 那一档也是同一把 glob、同一档 `nocase=0`（`pubsub.c:256`）。
+- **新判据两支 @Test**（`RedisGlobDeliveryTest` 从 5 支长成 7 支，两层各管一件事）：
+  - `memberFacesHaveNoPrivateDialectLeft`（结构）：先拿 `W0a`–`W0e` 五串**必然命中**的样本喂同一个计数函数（"数出 0"与"根本没在数"在界面上长一个样），再逐文件钉 `globToRegex`／`matchPattern`／`java.util.regex`／`Pattern.compile(` 各 0 命中、`RedisGlob.matches(` **各接恰好一次**（`WIRE_SHARED = {1,1,1,2}`，`PubSubManager` 那一家是两处）、`.matches(` 总数减共享那把的总数 = 0、`W4star` 钉 `"*".equals(` 归零，`W5`/`W6` 钉命令层三家 handler 体内不许出现 `"*"` 字样。
+  - `memberFacesDeliverTheReferenceSets`（交付）：真起一台，期望集**全部来自 C 生成的表**（10 支唯一图案 × 8 枚成员名 = **80 对**；表头记着两行 `输入 80 对 md5=9f6696707b551528782e6f01666ebc0a` / `读数 md5=b4b1d291a7d68b0f4d9e4815aa84af98`，人手没往表里敲过一格"我觉得该返回哪些"）。`D0a`–`D0d` 是播种自证（`SMEMBERS`/`HKEYS`/`ZRANGE`/无图案 `PUBSUB CHANNELS` 都得真装着那 8 枚，含空名），`D1a`–`D1c` 钉"没给 MATCH 要交空成员"，`D2s/h/z{i}` 是三家 × 9 图案对着同一张 C 表，`D3{i}` 是 `PUBSUB CHANNELS`，`D4{i}` 是 `pmessage` 的实际投递集，`D5`/`D6` 把 `PUBLISH` 回的整数与两条 socket 上收到的条数对账 —— 少了 `D6`，"整数"与"pmessage 集"可以互相圆场。
+- **验牙的尺：`~/.cache/zcache_gauges/glob_wire_mut/teeth.py`**（新，形状照 `logging_mut/` 那支兄弟）。八支 = 6 真变异 + 2 等价 rails，**在终版字节上重跑的那一轮**是 `logs/glob_wire_13v_verify_finalbytes.txt` → `SUMMARY arms=8 bad=0 gaps=1`（六支 `TEETH-OK` + 两支 `EQUIVALENT-OK`，六件 TRACKED 收尾 md5 逐字还原）；同一批红集前后被**三次独立**问出来（measure 轮 `logs/glob_wire_13v_measure_round2.txt`、javadoc 改写前的 verify、终版字节的 verify），**逐格同名**：
+  - `A1` `HashStore` 整段退回私有 `globToRegex` ⇒ 结构 `W1delta/W1regex/W1shared` + 交付 `D2h0`…`D2h6` 七格；
+  - `A2` `SetStore` 加回 `MATCH *` 快路 ⇒ **只有** `D2s0` 一格 —— 私有名字一个不多，结构那一半结构上看不见这根快路，全靠交付那半；
+  - `A3` `getChannels` 加回 `"*".equals` 快路 ⇒ `W4star` + `D30`；
+  - `A4` `publish` 派发退回"整串相等或 `*`" ⇒ `D41/D42/D43/D5` + `W4shared`（这一支故意不写任何违禁字样，结构那半能看见它的唯一一条就是"共享那把各接恰好一次"——语义漂移只有交付量得到）；
+  - `A5` 命令层把"没给 MATCH"折成 `"*"` 哨兵 ⇒ `W6sscan(` + `D1a`；
+  - `A6` `PubSubManager` 三处一起退回改前 ⇒ 结构 `W4delta/W4recur/W4regex/W4shared/W4star` 五格 + 交付 `D30`–`D33`、`D41`–`D43`、`D5` 八格；
+  - `E1`／`E2` 两条等价形状**必须保持绿**：`RedisGlob.matches(p, m, false)` 换成两参重载（它就是 `nocase=false`）、以及把 `globToRegex`／`matchPattern`／`"*".equals(` 三串字样**只写进块注释**。`E2` 是结构那一半的地基 —— 它一红就说明以后谁想在源码里写一句历史说明都会被判据挡下来；
+  - 一处记名覆盖面缺口（`gaps=1`，不进"有牙"的分母）：`SortedSetStore` 没单列一支 —— 它与 `SetStore` 是同一份形状的拷贝，A2 的锚点形状逐字相同，本轮由 `D2z*` 那九格覆盖同一判据。
+- **三处尺自伤，全部当场抓到当场改**（这是 [[feedback-mutation-harness-is-a-guard]] 的又一窝形态，都值得记名）：
+  - `apply_arm` 每处编辑都从 `originals` 重新起稿再整文件写回 ⇒ **同文件的第二处编辑把第一处覆盖掉**，`A1`／`A4`／`A6` 会退化成"什么都没改"却读出 `SURVIVED`。修法是同支的编辑按顺序叠在一份 running text 上、改完一次写盘，锚点自检也照同一顺序模拟（`锚点自检：8 支全部按顺序唯一命中`）。
+  - "注入后字节没变＝这一支什么都没量"那条 NO-OP 判据排在 `restore()` **之后** ⇒ 六支全被判 NO-OP、`expect` 表空着写出盘，`SUMMARY bad=6` 看着像"尺很严"，实际那轮的 verify 会全部读成 NO-EXPECT。修法：把 `unchanged` 在注入后、跑测试前算出来；再加一道 measure 轮收尾断言（该记 6 支却缺任何一支 ⇒ `FATAL`、不许写盘）。
+  - verify 轮在外层按支名取期望红集，而表的形状是 `{"base_total":…, "arms":{…}}` ⇒ 六支对着**一张满表**报 NO-EXPECT（"表没查到"被读成"measure 轮没记"）。修法：读 `table["arms"]`，并在**跑第一次 maven 之前**就校验表齐不齐（缺 ⇒ `rc=8`，一次构建都不跑）。
+  - 三条改完各配一支冒烟（`smoke_guard.py` / `smoke_verify.py`，maven 全程桩掉，秒级）：空表必须拦在写盘之前；拿记着的红集回放必须逐支 `TEETH-OK`、**全部回零红必须逐支 `RED-WRONG`**（这一条证明它真的在比，不是橡皮章）；表不在必须 `FATAL` 且零 maven。
+- **两处锚点是我凭印象写的，被自检当场否掉**：`PubSubManager` 里那句 `if (RedisGlob.matches(pattern, channel, false)) {` **裸锚命中 2 次**（`:194` 派发臂、`:231` `getChannels` 臂 ⇒ 必须带下一行才分得开）；而我以为存在的 `private Set<String> channelsWithSubscribers` 在盘上 **0 命中**，真实落点是 `:310` 的 `private boolean sendToClient(...)`。与 [[feedback-handwritten-registry-rows-fabricate]] 同族：进尺的每个符号名都要现读，`A1` 请回来的那段私有实现也是从 `git show HEAD:` 逐字节抄的，不是回忆的。
+- **全量基线 972 ⇒ 974**：`mvn -o -B -ntp clean test` → `MODULES=4  run=974 failures=0 errors=0 skipped=0  sum=397 + 440 + 135 + 2 = 974`、`BUILD SUCCESS`（复算 = `python3 ~/.cache/zcache_gauges/tally_log.py ~/.cache/zcache_gauges/logs/glob_wire_13v_full_clean_test.log`；单类那一跑 `logs/glob_wire_13v_only3.log` → `Tests run: 7, Failures: 0, Errors: 0`）。新增 2 条全在 core（438 ⇒ 440）＝ `RedisGlobDeliveryTest` 那两支新 @Test；common/client/starter 一条没动。这一跑量的是**终版字节**：`RedisGlob.java` 顶部那段 javadoc 是本轮最后落的字节，而它在 `grammar_mut/teeth.py` 的 TRACKED 清单里 ⇒ 先前几跑的 verdict 按纪律作废、只引这一跑（`HashStore 86a67173…`、`SetStore 0ab80d26…`、`SortedSetStore df933d2c…`、`PubSubManager 9d44654d…`、`CommandHandler af352484…`、`RedisGlobDeliveryTest 09128397…` 六件在验牙轮开跑与收尾各读一次、逐字相同）。
+- **顺手量到两件"形状"差异，各自有名、另开卡不混进本轮**：
+  - 卡 #42：`SUBSCRIBE`／`UNSUBSCRIBE`／`PSUBSCRIBE`／`PUNSUBSCRIBE` 四家多名字时把 N 条确认**套成一条嵌套数组**，单名字时却平铺（`CommandHandler.java:1894/1904/1914/1924` 四处同形 `length==1 ? r[0] : RespArray.of(r)`），而上游发的是 N 条独立回复。线上证迹就在本轮日志里：`确认帧不对：[[psubscribe, *, 1], [psubscribe, ?, 2], [psubscribe, ???, 3], [psubscribe, [!-Z], 4]]`（`logs/glob_wire_13v_only.log`）。本轮的绕法是"一张图案一次 `PSUBSCRIBE`"，那件事写在 `Members` 的注释里，不算修好。
+  - 卡 #43：`ZSCAN` 回的是平铺成员、**没有分数**（`handleZscan` `:4108-4119`，`SortedSetStore.zscan` 交回 `List<byte[]>`，分数在那一层就已经丢了），上游是 `member, score` 成对。交付判据按今天的形状解析它，所以 `D2z*` 那九格钉的是"哪些成员该出现"这一件事；那一家一旦补上分数，九格会先红在这里并叫人来读这段注释。
+- **`RedisGlob` 的自述跟着改**（注释也是要审的东西）：顶部那句"今天还剩四处私有副本 —— `HashStore:563`、`SetStore:460`、`SortedSetStore:1117`、`PubSubManager:372`"如今是假的 ⇒ 换成"曾有六份、代码里一处不剩"并把两批（13s 键枚举 / 13v 成员枚举）分开点名，同时把上面那两支判据写进去——判据集中在一条，还得**能被单独验牙**；账①那句"线上只有 `KEYS **` 这种写法看得见它"也随本轮作废：成员枚举那一族**没有**快路，`MATCH *` 不交空成员、"没给 MATCH"要交，这一对方向相反的格子如今在仓里有牙。这段改写是本轮**最后落的代码字节**（`RedisGlob.java` md5 `6f6ed4b7a7843f15cc8e80c75782a5ad`），所以全量 `clean test` 与验牙 verify 都在它之后重跑过、只引那两跑。
+- **下一格**：卡 #37 只剩"键枚举那一族的电池对 `*` 家族太薄"这半（成员那一族的 4 格已经进仓）；沿用旧账 #38 / #40 / #26 / #34 / #16 / #17 / #18 / #14 / #12 / #9 / #4；本轮新记 #42 / #43。
+
 ### Added
 - `CommandHandler.handleTime()` 与分派表里的 `"TIME"`：一支 `*2`，两支十进制 bulk（sec 与 usec
   同一次取值，微秒按 `ll2string` 那样<em>不补零</em>），arity 钉表上那一个 `1`（多一个词、哪怕那个词是
