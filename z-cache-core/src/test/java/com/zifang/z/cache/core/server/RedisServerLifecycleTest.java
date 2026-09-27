@@ -1804,6 +1804,192 @@ class RedisServerLifecycleTest {
                 + "；不合格: " + wrong + " [RED_CELLS=" + String.join("|", wrong.keySet()) + "]");
     }
 
+    /**
+     * 自动挡本身：<em>没人踩油门</em>，日志长够快就该自己换一份。
+     * <p>
+     * 上游那台机器住在 {@code serverCron}（{@code server.c:1301-1315}），周期是它自己回的
+     * {@code 1000/server.hz}（{@code server.c:1374}）而 {@code hz} 默认 10
+     * （{@code server.h:83}）—— 每 100ms 量一次体积。13j 供上了分子与分母，13i 供上了油门，
+     * 本格问的是中间那截：<b>那一拍到底有没有在问，问了到底会不会动手</b>。
+     * </p>
+     * <p>
+     * 等的信号刻意不取我们自己的任何记账：数的是<em>盘上那份日志里有几条 {@code SET} 记录</em>。
+     * 同一把键写五笔，追加路径留五条，而一次<em>真的重写</em>会把它们收成一条 —— 只有把整个文件
+     * 用 java.nio 读回来才看得见。反证那几臂（{@code perc=0}、地板抬高、{@code appendfsync no}）
+     * 也量同一个数，窗口长度由阳性那一臂<em>实测</em>的耗时推出来，不是拍的常数。
+     * </p>
+     */
+    @Test
+    void theScheduledTickStartsTheRewriteByItself() throws Exception {
+        java.nio.file.Path dir = java.nio.file.Files.createTempDirectory("zcache-aof-auto-rewrite");
+        java.nio.file.Path aof = dir.resolve("appendonly.aof");
+        int p = freePort();
+        RedisServer server = new RedisServer("127.0.0.1", p, 0);
+        server.setDataDir(dir.toString());
+        Thread th = startAndWait(server, p);
+        Map<String, String> seen = new LinkedHashMap<>();
+        Map<String, String> wrong = new LinkedHashMap<>();
+        AofPersistence aofHandle = server.getAofPersistence();
+        assertNotNull(aofHandle, "前置条件: 这一台得真的起了 AOF，才谈得上自动挡");
+        long firedAfterMs;
+        String notes = "";
+        try (Socket socket = connect(p)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+
+            // 还没碰旋钮之前先把默认值量了（server.h:98-99）。
+            expectTextCell(seen, wrong, "默认门槛 100（server.h:98）",
+                    String.valueOf(aofHandle.getAutoAofRewritePercentage()), "100",
+                    "上游 AOF_REWRITE_PERC 就是 100；这一格在旋钮之前读，免得自己把默认值盖掉");
+            expectTextCell(seen, wrong, "默认地板 64mb（server.h:99）",
+                    String.valueOf(aofHandle.getAutoAofRewriteMinSize()), String.valueOf(64L * 1024 * 1024),
+                    "AOF_REWRITE_MIN_SIZE 是 64*1024*1024，不是 0");
+
+            // 地板设 0、门槛留默认的 100：同一把键写五笔，第一拍就该够条件。
+            aofHandle.setAutoAofRewriteMinSize(0L);
+            aofHandle.setAutoAofRewritePercentage(100);
+            String big = padValue(400);
+            for (int i = 0; i < 5; i++) {
+                send(socket, "SET", "k", big);
+                assertEquals("+OK", readReply(in), "前置条件: 第 " + (i + 1) + " 笔要落得下去");
+            }
+            long[] fired = awaitSetCount(aof, 1, 10_000L);
+            firedAfterMs = fired[1];
+            expectTextCell(seen, wrong, "没人踩油门，日志自己换了一份（五条同键流水塌成一条）",
+                    String.valueOf(fired[0]), "1",
+                    "这一格只问 java.nio 读回来的条数，不问我们自己的记账。"
+                            + "实测过了 " + fired[1] + "ms（一拍 " + AofPersistence.AUTO_REWRITE_TICK_MS + "ms）");
+            awaitNotRewriting(aofHandle);
+
+            long sizeAfterAuto = java.nio.file.Files.size(aof);
+            String afterAuto = persistenceSection(socket, in);
+            expectTextCell(seen, wrong, "自动重写之后 current 等于盘上长度",
+                    infoField(afterAuto, "aof_current_size"), String.valueOf(sizeAfterAuto),
+                    "aof.c:1772 按 stat 重取；这一格把 13j 的渲染与自动挡这条新路径接起来");
+            expectTextCell(seen, wrong, "自动重写之后 base 挪到新日志大小",
+                    infoField(afterAuto, "aof_base_size"), String.valueOf(sizeAfterAuto),
+                    "aof.c:1773；底座不挪的话下一拍拿旧底座一算还是几百个百分点，等于重写风暴");
+            expectTextCell(seen, wrong, "自动重写之后 in_progress 归零",
+                    infoField(afterAuto, "aof_rewrite_in_progress"), "0",
+                    "标志还了而字段还在报 1 = 渲染没跟着状态走");
+            send(socket, "GET", "k");
+            String stillThere = readReply(in);
+            expectTextCell(seen, wrong, "自动重写不许吃掉数据",
+                    stillThere.length() == big.length() ? "长度还是 " + big.length() : "只回了 " + stillThere.length(),
+                    "长度还是 " + big.length(), "重写导出的是<em>活着的</em>那份状态，不是空日志");
+
+            // 反证 A：perc=0（server.c:1305 短路）。阳性对照就是上面那一趟 —— 同一台、同一个量法。
+            long window = Math.max(3 * firedAfterMs, 6 * AofPersistence.AUTO_REWRITE_TICK_MS);
+            aofHandle.setAutoAofRewritePercentage(0);
+            for (int i = 0; i < 4; i++) {
+                send(socket, "SET", "k", big);
+                assertEquals("+OK", readReply(in), "前置条件: perc=0 那一臂的写也要落下去");
+            }
+            int countWhileOff = countSetRecords(aof);
+            Thread.sleep(window);
+            expectTextCell(seen, wrong, "perc=0 ⇒ 这一拍不许换文件",
+                    String.valueOf(countSetRecords(aof)), String.valueOf(countWhileOff),
+                    "同一把键再写四笔：不换 = 条数停在 " + countWhileOff + "，换了会塌成 1。"
+                            + "窗口 " + window + "ms 由阳性那一臂实测的 " + firedAfterMs + "ms 推出来（下限 6 拍）");
+
+            // 反证 B：门槛回到 100，但地板抬到 1mb —— 体积远不到，:1306 那一项拦住。
+            aofHandle.setAutoAofRewritePercentage(100);
+            aofHandle.setAutoAofRewriteMinSize(1024L * 1024L);
+            for (int i = 0; i < 4; i++) {
+                send(socket, "SET", "k", big);
+                assertEquals("+OK", readReply(in), "前置条件: 地板那一臂的写也要落下去");
+            }
+            int countBelowFloor = countSetRecords(aof);
+            Thread.sleep(window);
+            expectTextCell(seen, wrong, "没到体积地板 ⇒ 增幅再大也不重写",
+                    String.valueOf(countSetRecords(aof)), String.valueOf(countBelowFloor),
+                    "日志现在只有一两 KB，地板 1mb 没过；这一格钉住\"地板先看、增幅后算\"那个次序。"
+                            + "同样 " + window + "ms 的窗口");
+            // 这一臂的<em>数据</em>侧对照：地板设回 0 之后，同一台、同一把键必须立刻又能换。
+            aofHandle.setAutoAofRewriteMinSize(0L);
+            long[] firedAgain = awaitSetCount(aof, 1, 10_000L);
+            expectTextCell(seen, wrong, "把地板放回 0 ⇒ 同一台马上又换得动（上一臂不是量具瞎）",
+                    String.valueOf(firedAgain[0]), "1",
+                    "否定式判据必须有这一格：否则\"没到地板\"与\"那一拍根本没在跑\"在盘面上是同一个样子。"
+                            + "实测过了 " + firedAgain[1] + "ms");
+            if (firedAgain[1] < 0) {
+                notes = "地板那一臂的反证超时，后面 fsync=NO 那一臂的读数也不可信；";
+            }
+            awaitNotRewriting(aofHandle);
+
+            // 反证 C：换到 appendfsync no 这一档，自动挡<em>照旧</em>要跑 ——
+            // 上游那两件事分别住在 aof.c:341-352（flush）与 server.c:1301-1315（cron 里的增幅判断），
+            // 把触发挂到 fsync 定时器上，等于让 `appendfsync always/no` 顺带关掉自动挡。
+            aofHandle.setFsyncPolicy(AofPersistence.FSYNC_NO);
+            for (int i = 0; i < 5; i++) {
+                send(socket, "SET", "k", big);
+                assertEquals("+OK", readReply(in), "前置条件: fsync=NO 那一臂的写也要落下去");
+            }
+            long[] firedNoFsync = awaitSetCount(aof, 1, 10_000L);
+            expectTextCell(seen, wrong, "appendfsync no 那一档 ⇒ 自动挡还在跑",
+                    String.valueOf(firedNoFsync[0]), "1",
+                    "触发与 fsync 档位无关；实测过了 " + firedNoFsync[1] + "ms");
+        } finally {
+            server.stop();
+            th.join(DEADLINE_MS);
+        }
+        assertTrue(wrong.isEmpty(), "自动挡（server.c:1301-1315 那一拍）逐格: " + seen
+                + "；不合格: " + wrong + "；" + notes
+                + " [RED_CELLS=" + String.join("|", wrong.keySet()) + "]");
+    }
+
+    /**
+     * 数一份 AOF 里有几条 {@code SET} 记录 —— 只按字节找 RESP 的定长头
+     * （{@code $3\r\nSET\r\n}），不读我们自己的任何记账。
+     */
+    private static int countSetRecords(java.nio.file.Path aof) throws IOException {
+        if (!java.nio.file.Files.exists(aof)) {
+            return 0;
+        }
+        String body = new String(java.nio.file.Files.readAllBytes(aof),
+                java.nio.charset.StandardCharsets.ISO_8859_1);
+        String needle = "$3\r\nSET\r\n";
+        int n = 0;
+        for (int i = body.indexOf(needle); i >= 0; i = body.indexOf(needle, i + 1)) {
+            n++;
+        }
+        return n;
+    }
+
+    /**
+     * 等盘上那份日志的 {@code SET} 条数变成 expected。
+     *
+     * @return {最后一次读到的条数, 过了多少毫秒}；超时则毫秒为 -1
+     */
+    private static long[] awaitSetCount(java.nio.file.Path aof, int expected, long timeoutMs)
+            throws Exception {
+        long begin = System.nanoTime();
+        int last = countSetRecords(aof);
+        while (last != expected) {
+            long elapsedMs = (System.nanoTime() - begin) / 1_000_000L;
+            if (elapsedMs >= timeoutMs) {
+                return new long[]{last, -1L};
+            }
+            Thread.sleep(20);
+            last = countSetRecords(aof);
+        }
+        return new long[]{last, (System.nanoTime() - begin) / 1_000_000L};
+    }
+
+    /** 等排在重写池里的那份跑完：换档／设旋钮之前要先排空，否则反证那一臂读到的是上一臂的余波。 */
+    private static void awaitNotRewriting(AofPersistence aofHandle) throws InterruptedException {
+        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(10);
+        while (aofHandle.isRewriting() && System.nanoTime() < deadline) {
+            Thread.sleep(5);
+        }
+    }
+
+    /** 一个足够长的值：让五笔追加就能把增幅顶过 100%，又不至于让单次读文件变慢。 */
+    private static String padValue(int n) {
+        char[] c = new char[n];
+        java.util.Arrays.fill(c, 'x');
+        return new String(c);
+    }
+
     /** 问一次 {@code INFO persistence}，整段原样交回（已经剥掉 RESP 头）。 */
     private static String persistenceSection(Socket socket, DataInputStream in) throws IOException {
         send(socket, "INFO", "persistence");

@@ -2128,6 +2128,88 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   `base = … ? : 1` 在 `:1308-1309`、`growth` 在 `:1310`、比较在 `:1311`、真的去重写是 `:1313`），
   上一版写的 `server.c:1305-1312` 两头都切在了句子中间。
 
+#### 那一拍终于挂上了：100ms 量一次增幅，两条旋钮各自有主（13k）
+
+- **来账**：13j 供上的是自动挡的**分子与分母**（`aof_current_size` / `aof_base_size`），
+  并在结尾明写"触发口只有 13i 那一脚人工油门，按体积自动重写仍然没有"。这一轮做那一格。
+- **上游那一拍的完整形状**（本轮在 `~/.cache/zcache_gauges/full5x/redis-5.0.14/src` 现读）：
+  整块是 `server.c:1301-1315`，注释 `/* Trigger an AOF rewrite if needed. */` 在 1301，
+  五个条件 `:1302-1306`（`aof_state == AOF_ON`、`rdb_child_pid == -1`、`aof_child_pid == -1`、
+  `aof_rewrite_perc` 非零、`aof_current_size > aof_rewrite_min_size` 严格大于），
+  `base = aof_rewrite_base_size ? : 1` 在 `:1308-1309`，`growth = (aof_current_size*100/base) - 100`
+  在 `:1310`，`if (growth >= server.aof_rewrite_perc)` 在 `:1311`，真的去
+  `rewriteAppendOnlyFileBackground()` 在 `:1313`。它待在 serverCron 的 `else` 分支里，
+  也就是"这一台当前没有后台保存 / 后台重写"那一支；节奏 = `return 1000/server.hz`（`server.c:1374`），
+  而 `CONFIG_DEFAULT_HZ 10` 在 `server.h:83` ⇒ **100ms 一拍**。默认值 `AOF_REWRITE_PERC 100`
+  与 `AOF_REWRITE_MIN_SIZE (64*1024*1024)` 是 `server.h:98` / `:99` 两行宏。
+- **做了什么**（全在 `AofPersistence`，命令层一个字没动）：
+  ① 两条常量 `AUTO_AOF_REWRITE_PERCENTAGE = 100`、`AUTO_AOF_REWRITE_MIN_SIZE = 64L*1024*1024`；
+  ② 两条 `volatile` 旋钮配 getter/setter，负数按上游的下界拒掉（`config.c:1160-1161` 那一项是
+  `0,INT_MAX`，`:1262-1263` 是 `ll,0,LONG_MAX`），消息用上游原文
+  `Invalid negative percentage for AOF auto rewrite`；
+  ③ `shouldAutoRewrite(aofOn, rewriteInProgress, current, base, percentage, minSize)` ——
+  把那五个条件加增幅原样写成一个纯函数，表判据直接打它，不需要真起服务器；
+  ④ `checkAutoRewrite()` 是走真实实例的那一份，够条件就交给 `rewriteAsync()`；
+  ⑤ `start()` 末尾挂 `AUTO_REWRITE_TICK_MS = 1000L / 10` 的 `scheduleAtFixedRate`，`stop()` 里撤。
+  这一拍**与 `fsyncFuture` 是两支**，不是把检查塞进每秒刷盘那一拍里：上游本来就是两件事 ——
+  写侧刷盘是 `aof.c:337 flushAppendOnlyFile()`（连缓冲为空都要问一次"是不是还欠着 fsync"，
+  `:342-352`），而体积增幅这一拍在 serverCron。塞成一支的坏法是 `appendfsync no` 会顺手把自动挡关掉。
+- **三条与上游的差别，说清楚不藏着**：
+  ① 节奏写死 100ms。上游随 `server.hz` 变（`server.c:1374`），而改 `hz` 要走 `CONFIG SET`，
+  这一版还没有 `CONFIG` 命令族 ⇒ 旋钮只有 Java 侧的 setter，运维口上够不着；
+  ② 上游这一拍读的是 `server.aof_current_size`，那个数由 `aofUpdateCurrentSize()` 按 `fstat` 重取
+  （调用点 `aof.c:1772`，紧挨着 `:1773` 把 `aof_rewrite_base_size` 一并挪过去）；这里读的是 13j
+  那两本账（写入侧累加 + 重写末尾按 `java.nio` 真实长度对账），**同样是盘上字节，取的路径不同**；
+  ③ 五个条件里只落了四个 —— 上游还要求 `rdb_child_pid == -1`（没有后台保存在跑，`server.c:1303`），
+  而本版 `shouldAutoRewrite` **没有这一项**。这不是"结构上不可能重叠"：`RdbPersistence` 有自己的
+  `bgSaving` 计数（`:171`，BGSAVE 据此拒绝并发快照）与 `saveAsync()`（`:351`），
+  后台保存是真的在另一条线程上跑，所以**自动挡可以在一次 BGSAVE 进行中去换日志**。
+  本轮把它记成缺陷而不是补进代码，因为补它要先把 `RdbPersistence` 那个计数露出一个读口
+  （现在类外无人读它），耦合方向得先定：记作下一格，见本节末"下一格"。
+- **判据：38 格，三张表，每格带反方向的邻居**：
+  `AofAutoRewriteTest#growthRuleMatchesTheUpstreamCronCondition` 17 格 —— 上游那五个条件里**落地的
+  四个**各有一格"关掉它"与一格"开着它才走"（第五个 `rdb_child_pid` 没有格子，因为它根本没进代码，
+  见上面差别 ③），边界各钉两侧（`current == minSize` 不重写 / 超过一寸才重写；
+  `growth == perc` 重写 / 差一个百分点不重写），`base = 0` 那一格钉的是"按 1 算而不是除零"，
+  两条默认常量各一格，两个负数旋钮各一格且钉的是"拒了而且原值没动"；
+  `theInstancePathUsesItsOwnTwoSizes` 10 格 —— 走真实实例与真实日志，其中
+  **"盘上那份真的换小了（同一把键四笔只留一笔）"这一格只问 `java.nio` 眼里的文件长度，
+  不读我们自己的任何记账**，另有一格反证"perc=0 那一臂不是因为没数据才不重写"（那八笔确实落到了盘上）；
+  `RedisServerLifecycleTest#theScheduledTickStartsTheRewriteByItself` 11 格 —— 真起一台服务器，
+  **等的是"日志里 `SET` 记录数从 5 塌成 1"这个盘上读数**（13j 立的那条：等待信号不许是被审的字段），
+  四个臂各自配阳性对照：`perc=0` 之后"把地板放回 0 ⇒ 同一台马上又换得动"（上一臂不是量具瞎）、
+  `appendfsync no` 那一臂证明这一拍不绑在刷盘档位上、没到地板那一臂证明"增幅再大也不谈"。
+- **有牙量具**：`~/.cache/zcache_gauges/auto_rewrite_mut/teeth.py`，11 支变异，
+  `logs/teeth_run2.txt` = `CONTROL 未变异: Tests run 3 Failures 0 Errors 0 -> OK` +
+  `SUMMARY mutants=11 bad=0 control=OK`，逐支判红 T1 4 / T2 1 / T3 3 / T4 10 / T5 1 / T6 1 /
+  T7 4 / T8 1 / T9 2 / T10 4 / T11 2。预期红集是从第一遍（`logs/teeth_run1.txt`，11 支全 RED-WRONG
+  因为预期刻意留空）的实测红行**由脚本回填**的，一格都不是我手敲；回填后又机械比对过
+  "脚本里的 11 组 == run1 里的 11 组"。这一遍顺手改掉量具自己两处坏：分母把控制组也算成一个变异
+  （实际产出 `mutants=12`，而本文件顶部写的验收行是 `mutants=11` ⇒ **那条绿线在这把尺下永远打不出来**），
+  改成"分母只数变异、控制组单列一列"；T9 第二枚锚点按多行写而那句 `throw` 实际在一行内，命中 0 处，
+  12 枚锚点逐枚 dry-check 到"恰好 1 处命中"才开跑。
+- **T7 这一支单独记，它量到的是判据的覆盖面而不是对错**：把 `start()` 里
+  `applyAutoRewriteScheduler();` 那一行删掉，前两张表 27 格**一格都不红**，红的只有 E2E 那 4 格
+  —— 也就是"到底有没有人挂这一拍"只有真起一台服务器才量得出来。反过来说：这 4 格的代价是秒级的
+  等待，不能靠它们当快速回归，所以"该不该重写"这个纯函数那 17 格是必须独立存在的一层。
+- **基线与复跑命令**：`mvn -o -B clean test` BUILD SUCCESS（46s），
+  `python3 ~/.cache/zcache_gauges/tally_log.py ~/.cache/zcache_gauges/logs/full_13k_run1.txt` 报
+  `MODULES=4 run=912 failures=0 errors=0 skipped=0`（`358 + 417 + 135 + 2`；core 414 → 417
+  正是这三张表的三支 @Test）。**这一轮只有本机**，250 上一格都没复算（13j 那条双机逐字节对账
+  是上一轮的事，别顺延到本轮）。本轮动过 `AofPersistence` 与 `RedisServerLifecycleTest`，
+  而 `aof_rw_mut` / `bgrewriteaof_mut` / `fsync_mut` / `info_aof_sizes_mut` / `stream_rw_mut`
+  五族的 TRACKED 集里都有这两份文件之一 ⇒ 它们 13j 时段的读数对这副字节**作废**，
+  复跑结果紧跟着记在下一条（未复跑完之前，那一格按"待主编复跑"读）。
+- **下一格（13l，两件事，先后由这一节的两条差别决定）**：
+  ① 把 `rdb_child_pid == -1` 那一项补进那一拍（差别 ③ 记的就是它，先要给 `RdbPersistence.bgSaving`
+  露一个读口并定耦合方向），补完在表里加一格"后台保存在跑 ⇒ 这一拍不许换文件"并给它一个反向邻居；
+  ② `CONFIG GET` / `CONFIG SET` 把这两条旋钮接到命令层 ——
+  本轮现读的负数下界（`config.c:1160-1161` / `:1262-1263`）现在只有 Java 侧的 setter 在守，
+  仓库里 `case "CONFIG"` / `"COMMAND"` / `"ACL"` / `"TIME"` / `"SWAPDB"` 五个标签**一个都没有**
+  （现读：`grep -rn 'case "CONFIG"' --include='*.java' z-cache-core/src/main` 零命中，
+  同一条管道的阳性对照 `grep -rn 'case "BGREWRITEAOF"'` 命中一处
+  `CommandHandler.java:432`）。
+
 ### Added
 - `RedisServer.serverScope()`：只读拿到本台那一份，测试与嵌入式据此判断作用域边界。
 - `StreamIdFormat`（z-cache-common）：stream ID 的唯一文法（uint64 两段、`-` / `+` 两种位置、

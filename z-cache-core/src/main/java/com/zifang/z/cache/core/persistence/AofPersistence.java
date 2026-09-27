@@ -98,7 +98,7 @@ public class AofPersistence {
      * （{@code server.h:83} 的 {@code CONFIG_DEFAULT_HZ}），也就是<b>每 100ms 量一次</b>。
      * 我们用 {@code ScheduledExecutorService}，能对齐的只有这个周期，不是一条事件循环。
      */
-    static final long AUTO_REWRITE_TICK_MS = 1000L / 10;
+    public static final long AUTO_REWRITE_TICK_MS = 1000L / 10;
 
     /**
      * 当前 fsync 策略
