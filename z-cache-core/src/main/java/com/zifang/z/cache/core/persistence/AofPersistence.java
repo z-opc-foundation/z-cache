@@ -81,6 +81,26 @@ public class AofPersistence {
     public static final int FSYNC_NO = 2;
 
     /**
+     * 自动重写的默认百分比门槛 —— 上游 {@code server.h:98}：
+     * {@code #define AOF_REWRITE_PERC 100}（长到比底座大一倍才重写）。
+     */
+    public static final int AUTO_AOF_REWRITE_PERCENTAGE = 100;
+
+    /**
+     * 自动重写的默认体积地板 —— 上游 {@code server.h:99}：
+     * {@code #define AOF_REWRITE_MIN_SIZE (64*1024*1024)}。
+     */
+    public static final long AUTO_AOF_REWRITE_MIN_SIZE = 64L * 1024 * 1024;
+
+    /**
+     * 自动挡多久量一次体积 —— 上游没有独立的定时器：{@code serverCron} 每轮自己回一个周期，
+     * 那句是 {@code return 1000/server.hz}（{@code server.c:1374}），而 {@code hz} 默认 10
+     * （{@code server.h:83} 的 {@code CONFIG_DEFAULT_HZ}），也就是<b>每 100ms 量一次</b>。
+     * 我们用 {@code ScheduledExecutorService}，能对齐的只有这个周期，不是一条事件循环。
+     */
+    static final long AUTO_REWRITE_TICK_MS = 1000L / 10;
+
+    /**
      * 当前 fsync 策略
      */
     private volatile int fsyncPolicy = FSYNC_EVERYSEC;
