@@ -203,7 +203,7 @@ redis-cli -h localhost -p 16379 SLOWLOG GET 10
 
 | 类别 | 命令 | 状态 |
 |---|---|---|
-| **Key** | SET / GET / DEL / EXISTS / KEYS / TYPE / EXPIRE / TTL / PERSIST | ✅ 但 `EXPIRE`/`TTL`/`PERSIST` **只对 String 键生效**：集合键上实测 `EXPIRE k 100`→`:0`、`TTL k`→`:-2`，而同一个键 `TYPE`→`hash`、`EXISTS`→`:1`（Redis 会真的挂上 TTL）。另：`KEYS`/`SCAN MATCH` 的那把 glob 与 `CONFIG GET` 用的**不是同一条码**（250 上 2928 对 (图案,键名) 实测：交付分歧 74 格，其中 52 格只是没接 `RedisGlob` —— 字符集 `[a-c]`、`\` 转义在命令层根本不生效；余下是字节/码元那一族与一条 4.0.9↔5.0.14 版本差）⇒ 卡 #35 / #36 |
+| **Key** | SET / GET / DEL / EXISTS / KEYS / TYPE / EXPIRE / TTL / PERSIST | ✅ 六种类型都挂得上过期：`EXPIRE`/`TTL`/`PERSIST` 在 hash/list/set/zset/stream 键上实测 `:1` / `:-1` / `:1`（这一行以前写的是"只对 String 键生效"，那是 1.3.x 早期的现状，卡 #13 之后已由 `RedisServerProtocolSemanticsTest.streamsAreOrdinaryKeysForKeyspaceCommands` 逐类型钉住）。另：`KEYS`/`SCAN MATCH` 交付的那一门 glob 现在**就是** `RedisGlob`（含上游"图案恰好一根 `*`"那句快路，13s 接线；250 上 2928 对 (图案,键名) 逐对问过一台活参照：接线前交付分歧 74 格，其中 52 格只是没接）。接线后仍与参照差 32 格、逐格归因（30 格是 UTF-8 字节 vs Java 码元 ⇒ 卡 #36；2 格是 4.0.9↔5.0.14 版本差，按声明目标版本为准）；`HSCAN`/`SSCAN`/`ZSCAN`/`PSUBSCRIBE` 那四家仍是各自的私有 `globToRegex`，**本轮没量过** ⇒ 只记名不动手 |
 | **String** | SETNX / SETEX / GETSET / APPEND / STRLEN / INCR / DECR | ✅ 用错类型读写一律 `-WRONGTYPE`（1.3.5 起，此前静默回 nil/0） |
 | **Hash** | HSET / HGET / HDEL / HMSET / HMGET / HGETALL / HEXISTS | ✅ |
 | **List** | LPUSH / RPUSH / LPOP / RPOP / LRANGE / LLEN / LSET / LTRIM / LMOVE / RPOPLPUSH / BRPOPLPUSH | ✅ 1.3.5 补 `BRPOPLPUSH` |

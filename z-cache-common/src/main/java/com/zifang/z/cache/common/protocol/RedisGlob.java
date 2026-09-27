@@ -6,9 +6,11 @@ package com.zifang.z.cache.common.protocol;
  * <p>
  * 为什么要有这么个类：{@code CONFIG GET <pattern>} 收的是 glob，不是"前缀"也不是正则。
  * 手上现成的替代品有两个，两个都会错：{@code String.startsWith} 把 {@code auto-aof-*} 之外的
- * 写法全当字面量；{@code CommandHandler.globToRegex} 把 {@code [} {@code ]} 转义成正则里的
- * 字面方括号，于是 {@code [ab]} 那一档在两边根本不是同一个语言。判据得集中在一条，
- * 而且这条要能单独被变异验牙 —— 挂在命令层的格子做不到这一点。
+ * 写法全当字面量；{@code globToRegex} 那一族（把 {@code [} {@code ]} 转义成正则里的字面方括号，
+ * {@code [ab]} 那一档在两边根本不是同一个语言）今天还剩四处私有副本 —— {@code HashStore:563}、
+ * {@code SetStore:460}、{@code SortedSetStore:1117}、{@code PubSubManager:372}，
+ * 键枚举那两处（{@code MemoryStore} 与 {@code CommandHandler} 各一份）13s 已删并把交付接回本类。
+ * 判据得集中在一条，而且这条要能单独被变异验牙 —— 挂在命令层的格子做不到这一点。
  * </p>
  *
  * <p>
@@ -33,12 +35,23 @@ package com.zifang.z.cache.common.protocol;
  * </ul>
  *
  * <p>
- * 期望值出自上面那份源码的逐臂推演，不是对拍读数 —— 250 恢复之后要拿参考实例
- * （{@code CONFIG GET} 与 {@code PATTELMatch} 那一类）复跑一遍这张表。
- * 另外记下：{@code SCAN} 的 {@code MATCH} 现在走的仍是 {@code globToRegex}，两边对
- * {@code [..]} 的取舍不同，且 {@code stringmatch} 在 SCAN 那一侧是区分大小写的（
- * {@code stringmatchlen(..., 0)}），CONFIG GET 这一侧才带 {@code nocase=1}。这一处不一致
- * 是遗留，不是本类的判断。
+ * 这张表的期望值最初出自上面那份源码的逐臂推演；13r 已经拿一台活的参照逐行问过
+ * （250 上的 {@code redis-server 4.0.9}，一次性实例）—— 问得到的 59 行逐行同答，
+ * 同一轮还把整张表摊进 2928 个 {@code (图案, 键名)} 对里与参照对拍。
+ * <p>
+ * 13r 记下的那处"遗留不一致"本轮闭合：{@code KEYS} 与 {@code SCAN MATCH} 现在也走本类
+ * （{@code MemoryStore.keyPatternMatches}，{@code nocase = false}，与上游 {@code db.c:550}、
+ * {@code db.c:748} 那两句 {@code stringmatchlen(..., 0)} 同档；带 {@code nocase=1} 的仍然只有
+ * {@code CONFIG GET} 一家），连上游"图案恰好一根 {@code *}"那句快路也一起抄了
+ * （{@code db.c:545}、{@code :663}）。
+ * <p>
+ * 还剩两处与上游不同，各自成卡，不冒充已经做完：① C 的那个循环按<em>字节</em>走、这里按
+ * {@code char} 走，非 ASCII 的键名配单根 {@code ?} 那一族因此仍与参照不同答（13r 实测 30 格，
+ * 卡 #36）；② 空串键名遇上 {@code **}／{@code ***}：4.0.9 的循环头只挡 {@code patternLen}，
+ * 折叠后剩一根 {@code *} 就判命中，5.0.14 的循环头（{@code util.c:51}）多挡一个
+ * {@code stringLen}、空串直接判不匹配 —— 本类照 5.0.14（上面逐臂抄的就是这一版）。
+ * ② 是版本差而不是 bug，而且 {@code KEYS *} 那一格由快路收回，所以线上只有
+ * {@code KEYS **} 这种写法看得见它。
  * </p>
  */
 public final class RedisGlob {

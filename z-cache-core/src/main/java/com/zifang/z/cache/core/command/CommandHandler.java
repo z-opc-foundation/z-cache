@@ -1251,6 +1251,7 @@ public class CommandHandler {
         // 那四句绕过了判活那一道闸（LinkedHashSet 只去重、不筛过期），于是"到点的集合键在 KEYS
         // 里躲不掉"。上游 keysCommand 遍历的是原始 dict，但它逐键问了一句 keyIsExpired
         // （db.c:552）—— 两边给出的键集从此一致，且不再需要这里第二把尺。
+        // 图案的文法也不在这一层：keysDb 里那一条 matcher（RedisGlob，nocase=0）就是 KEYS 的语言。
         Set<String> allKeys = new LinkedHashSet<>(store.keysDb(currentDb, args[1]));
         List<RespBulkString> result = new ArrayList<>();
         for (String k : allKeys) result.add(RespBulkString.of(k));
@@ -4143,6 +4144,4 @@ public class CommandHandler {
         for (int i = 0; i < keys.size(); i++) r[i] = RespBulkString.of(keys.get(i));
         return RespArray.of(new Object[]{RespBulkString.of(nextCursor), RespArray.of(r)});
     }
-
-    private static String globToRegex(String p) { StringBuilder r=new StringBuilder("^"); for(int i=0;i<p.length();i++) { char c=p.charAt(i); if(c=='*')r.append(".*"); else if(c=='?')r.append('.'); else if("\\.[]{}()+-^$|".indexOf(c)>=0)r.append('\\').append(c); else r.append(c); } return r.append('$').toString(); }
 }

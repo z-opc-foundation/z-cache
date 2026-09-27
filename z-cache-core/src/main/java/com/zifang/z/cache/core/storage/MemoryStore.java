@@ -1,6 +1,7 @@
 package com.zifang.z.cache.core.storage;
 
 import com.zifang.z.cache.common.protocol.RedisDoubleFormat;
+import com.zifang.z.cache.common.protocol.RedisGlob;
 import com.zifang.z.cache.common.protocol.RedisIntegerFormat;
 
 import java.nio.charset.StandardCharsets;
@@ -906,13 +907,38 @@ public class MemoryStore {
         if (pattern == null) {
             return result;
         }
-        String regex = globToRegex(pattern);
+        // 上游 keysCommand 在匹配器之外先判一句快路（5.0.14 db.c:545 `allkeys = (pattern[0] == '*'
+        // && plen == 1)`，:550 才进 stringmatchlen）。这一格不是省时间：空串键名在 `*` 底下必须收，
+        // 而 stringmatchlen 的入口条件（util.c:51 `while(patternLen && stringLen)`）把它判成不匹配 ——
+        // 实测参照那一台（4.0.9）`KEYS *` 回得出空串键名，就是这个快路给的。
+        boolean allKeys = isMatchAllPattern(pattern);
         for (String key : liveKeys(db)) {
-            if (key.matches(regex)) {
+            if (allKeys || keyPatternMatches(pattern, key)) {
                 result.add(key);
             }
         }
         return result;
+    }
+
+    /**
+     * 键图案的唯一一把尺 —— {@code KEYS} 与 {@code SCAN MATCH} 都只走这里。
+     * <p>
+     * 上游这两家也是同一把：{@code db.c:550}（keysCommand）与 {@code db.c:748}（scanGenericCommand）
+     * 打的都是 {@code stringmatchlen(pat, patlen, key, ..., 0)}，那个尾参数是 nocase=0，
+     * <b>区分大小写</b>。带 {@code nocase=1} 的那一家只有 {@code CONFIG GET}（{@code config.c:1296}
+     * 的 {@code stringmatch(..., 1)}），它走 {@code CommandHandler} 那一侧，不共用这个方法。
+     * <p>
+     * 这里以前打的是 {@code globToRegex(...)} + {@code String.matches}：那套文法对
+     * {@code [..]}、{@code \}、未闭合的集、前缀式写法都不是同一个语言。13r 拿 2928 个
+     * {@code (图案, 键名)} 对逐对问过一台活的参照，其中 52 格是"匹配器本身判对了、交付的那条码没接上它"。
+     */
+    private static boolean keyPatternMatches(String pattern, String key) {
+        return RedisGlob.matches(pattern, key, false);
+    }
+
+    /** 上面那句快路：图案恰好一根 {@code *} 时不过匹配器（上游两处各写一遍，db.c:545、db.c:663）。 */
+    private static boolean isMatchAllPattern(String pattern) {
+        return pattern.length() == 1 && pattern.charAt(0) == '*';
     }
 
     // ==================== SCAN 迭代器 ====================
@@ -932,7 +958,11 @@ public class MemoryStore {
         // 于是 SCAN 用 HashSet 去重而 KEYS 不去重 —— 同一枚并存键名两句给出两个条数。
         Set<String> allKeys = liveKeys(db);
 
-        String regex = pattern == null ? null : globToRegex(pattern);
+        // 与 KEYS 同一把尺（{@link #keyPatternMatches}），连那根单独 `*` 的快路也一起抄
+        // （上游 db.c:663 `use_pattern = !(pat[0] == '*' && patlen == 1)` —— 它把"图案等于 *"
+        // 直接当成"没带 MATCH"，于是空串键名照样扫得出来）。没带 MATCH 就是 pattern == null，
+        // 上游那一侧对应 db.c:630 的 `use_pattern = 0`。
+        boolean usePattern = pattern != null && !isMatchAllPattern(pattern);
         List<String> sorted = new ArrayList<>(allKeys);
         sorted.sort(String::compareTo);
 
@@ -954,7 +984,7 @@ public class MemoryStore {
         int i = startIndex;
         while (i < sorted.size() && result.size() < limit) {
             String key = sorted.get(i);
-            if (regex == null || key.matches(regex)) {
+            if (!usePattern || keyPatternMatches(pattern, key)) {
                 result.add(key);
             }
             i++;
@@ -1332,23 +1362,6 @@ public class MemoryStore {
 
     private static byte[] copy(byte[] value) {
         return value == null ? null : value.clone();
-    }
-
-    static String globToRegex(String pattern) {
-        StringBuilder regex = new StringBuilder("^");
-        for (int i = 0; i < pattern.length(); i++) {
-            char c = pattern.charAt(i);
-            if (c == '*') {
-                regex.append(".*");
-            } else if (c == '?') {
-                regex.append('.');
-            } else if ("\\.[]{}()+-^$|".indexOf(c) >= 0) {
-                regex.append('\\').append(c);
-            } else {
-                regex.append(c);
-            }
-        }
-        return regex.append('$').toString();
     }
 
     /**
