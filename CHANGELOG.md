@@ -2491,6 +2491,128 @@ XREADGROUP 还要求 `GROUP` 必须是第一个词。顺序与判序在这一支
   当场故意翻面 —— 翻面必须是**改判据那一次**发生的，不许悄悄重定义；② 250 恢复后补跑
   `RedisMemoryFormatTest` / `RedisGlobTest` / `RedisConfigCommandTest` 对参考实例的期望（三支测试的类注释里都记着这一笔）。
 
+#### 那两条旋钮搬进"每台一份、与日志在不在无关"的持有者：13n 的差距 ② 就地消失，判据在同一次提交里翻面（13o）
+
+- **来账**：13n 结尾"下一格"①，卡 #32。当时那句话就是判据：同一台无日志的服务器
+  `CONFIG SET auto-aof-rewrite-percentage 5` 要 `+OK`、`GET` 要读回 5，而现在那 4 格<em>当场故意翻面</em>，
+  且"翻面必须是改判据那一次发生的，不许悄悄重定义"。这一节就是那一次。
+- **先红（判据先翻，生产代码一个字没动）**：`mvn -o -B -pl z-cache-core test -Dtest=RedisConfigCommandTest`
+  → `Tests run: 3, Failures: 1`（`~/.cache/zcache_gauges/grammar_mut/logs/config_13o_red.log`），
+  红的是 `aServerWithoutALogHoldsTheKnobsToo:280`，消息 `没有日志的那一台（8 格）不合格`，
+  `[RED_CELLS=…]` 具名 5 格。五格的期望与实际原文（同一份日志，`grep` 即得）：
+  `SET 有落点` ⇒ 期望 `+OK`，实际 `-ERR CONFIG SET 'auto-aof-rewrite-percentage' is not supported:
+  no data directory configured`；`收下之后 GET 读回新值` ⇒ 期望 `$2=10`，实际 `$3=100`；
+  `地板那一条同样有落点` ⇒ 期望 `+OK`，实际同一句 `not supported`；`地板读回的是字节数` 与
+  `拒过两轮之后先前那个值还在` ⇒ 期望 `$4=1024`，实际 `$8=67108864`。
+  **同一次里另外 3 格是绿的**，而这不是运气：它们钉的正是"认不出的名字 ⇒ `Unsupported`"
+  "越界 ⇒ `badfmt`""默认值答得上"，全与落点无关 —— 13n 立的那条"检查顺序 = 名字 → 文法 → 落点"
+  在这一跑里被证明<em>分得开</em>：换掉落点只推动该推动的那几格。
+- **搬动**：新增 `z-cache-core/…/persistence/AofTuning.java` —— 两条旋钮的<em>唯一持有者</em>，
+  值与默认常量都只写这一处，它存在的理由是结构问题不是行为问题（"旋钮够不够得着"从前取决于
+  "这一台有没有日志"，而上游那两个字段挂在 `server` 上永远存在，`server.h:1077-1078`）；
+  `AofPersistence` 的两个字段换成一份 `AofTuning`（默认自造一本），四个方法原样委托，
+  `AUTO_AOF_REWRITE_PERCENTAGE` / `_MIN_SIZE` 改成指向 `AofTuning.DEFAULT_*` 的别名，
+  `checkAutoRewrite()` 开头 `AofTuning t = tuning;` 再把两个数交给那一拍；`ServerScope` 每台持一份
+  （`final` 成员，可变的是<em>内容</em>不是引用，所以与 `rdb`/`aof` 那两个可换可空的成员不同、不必 volatile）；
+  `RedisServer.initPersistence()` 在 `start()` 之前 `aofPersistence.setTuning(scope.aofTuning())`；
+  `CommandHandler` 新增 `aofTuning()`，它与 `aof()` 的关键差别就是<em>不返回 null</em> ——
+  于是 `configGet`/`configSet` 里"这一台有没有日志"那一整支分支连着 `noLandingSpot()` 一起删掉。
+- **翻面与格数（格数不是手数的）**：测试类注释里"与上游不同处"从三条减到两条，另立一节
+  《这一支自己改过的一次判据》写清那句话当初为什么为真、现在为什么不成立；
+  `aServerWithoutALogAnswersGetButRefusesSet`（4 格）⇒ `aServerWithoutALogHoldsTheKnobsToo`（8 格）。
+  断言消息本身就带 `seen.size()`，本轮 28 份变异日志里每个 @Test 只出一个值：
+  `CONFIG 的线格式（45 格）` / `没有日志的那一台（8 格）` / `CONFIG SET 真的接着自动挡（13 格）`
+  ⇒ 59 → **66 格**。
+- **"同一个对象、不是抄本"不靠注释担保**：第三支 @Test 加了 3 格（10 → 13）。两格问值
+  （`AofPersistence` 自己读回来的百分比与地板各等于命令层写进去的那个数），一格问引用
+  （`a.tuning() == server.serverScope().aofTuning()`）。为什么值不够：抄本若是在 `CONFIG SET` <em>之后</em>
+  才抄的，这一趟两边读数照样对、下一趟才漂 —— 那是只有引用相等拦得住的形状（CH22 就是照这个造的）。
+- **验牙：24 支全死于自己点名的那些格，且没有一支多红**。末行原文
+  `SUMMARY mutants=24 bad=0 control=OK expect=config_expect.json md5(CommandHandler.java)=e0b8db6820d8
+  md5(RedisConfigCommandTest.java)=e191f62bf804 md5(AofPersistence.java)=ff4ac748f375
+  md5(ServerScope.java)=2b9877319744 md5(RedisServer.java)=064a76fce998`
+  （`~/.cache/zcache_gauges/grammar_mut/logs/teeth_13o.out`，`多红=0` 现读出现 **24** 次：
+  `grep -c '多红=0' logs/teeth_13o.out`；控制组 `head1/head2/tail1/tail2` 各 `OK total=3`）。
+  这轮把 TRACKED 从 2 份扩到 5 份 —— 新判据打的就是那三处交接点，只盯 `CommandHandler` 会量不到。
+  新三支各打一处交接点，具名集现读自 `config_expect.json`（与 13n 那张 21 臂表逐格对比）：
+  CH22 `交接点换成开场抄一本` ⇒ 具名 4 格，而**四格全是本轮新增**（引用相等那格、两格"那一侧自己读回来"、
+  一格"自动挡真的换了日志"）；CH23 `日志那一侧的读口答编译期默认值` ⇒ 1 格，也是新增那格；
+  CH24 `本台持有者每次现 new` ⇒ 具名 16 格里 7 格新增。
+  旧两支的牙是<em>搬了位置</em>而不是被拔掉：CH16 从前打"没有落点也照样回 +OK"，现在打
+  "SET 落在一支刚 new 出来的旋钮上"（15/15）；CH17 同理换成"GET 读的是刚 new 的一本"（12/12）。
+  **"新判据会加宽旧变异的波及面"这条老规矩这轮又有一次读数**：与 `expect_a.json`（13n 那张，
+  md5 `45fc8b41a08c3e9362a6566a1f585a9d`）逐臂对，CH4/CH11/CH12/CH14/CH16/CH17/CH18/CH21 这 8 支
+  的具名集全部变宽；具名总次数 79 → 134，去重格名 47 → 55，同时被翻面拿掉两个旧格名 ——
+  `SET 不许回 +OK（那等于收下而没有落点）` 与 `拒过一轮之后默认值还是那个默认值`，
+  正是差距 ② 那两格。旧臂的预期集因此<em>全部重量</em>过，没有沿用 13n 的结论。
+  预期红集仍然不手写：`TEETH_MEASURE=1` 量了两轮 —— `logs/measure_13o.out`（翻注释前的字节）与
+  `logs/measure_13o_final.out`（最终字节），两份 `config_expect.json` **md5 逐字相同**
+  `e934145a965896db7d0ffecb80606c6b`（24 臂 / 具名 134 次 / 去重 55 格），也就是这一轮的中途没有字节漂移。
+  `python3 config_teeth.py --selftest` 四道拦全 `OK`、`rc=0`（`logs/selftest_13o.txt`）。
+- **量具自己也被这一轮改了两处**（当场发现，不是事后追认）：
+  ① 测量轮每支现场打一遍、收尾又把台账打一遍 ⇒ 24 臂显示成 48 行。我第一反应是 13n 记账过的那次
+  "后台双进程污染"，真因是脚本自己叠印：修之前那份测量日志 53 行，修之后 29 行。
+  ② 缺一道拦：`config_expect.json` 里若某一臂没有行，判据退化成"具名 0/0"而<em>当场通过</em>，
+  一支谁都没守的变异会被读成"杀死了"。补上之后拿真删一行做冒烟：`cd ~/.cache/zcache_gauges/grammar_mut &&
+  python3 config_teeth.py --only CH4` → `FATAL expect 表里没这些臂的行（0/0 不算杀死）: CH4`、`rc=2`
+  （`logs/gate_probe.out`），随后表还原、md5 对账回 `e934145a…`。
+- **兄弟量具：把"谁的锚点被我搬断了"从手抄名单改成一把尺**（尺落在
+  `~/.cache/zcache_gauges/anchor_census_runtime.py`，读数存同目录 `anchor_census_runtime_13o.txt`，
+  复算 = `python3 ~/.cache/zcache_gauges/anchor_census_runtime.py`）。它先 `grep` 出引用到本轮那六个文件的
+  量具（`CommandHandler.java` 11 份 / `AofPersistence.java` 7 / `RedisServer.java` 4 / `ServerScope.java` 1 /
+  `RedisConfigCommandTest.java` 1 / `AofTuning.java` 1，去重 **14 份** —— 我上一版账里那句"15 份"是错的，
+  多算的 `ttl_mut/move_teeth.py` 对这六个名字<em>一个都不引用</em>，逐个 `grep -c` 现读全是 0），
+  再把量具 <em>import 进来</em>遍历它算好的 `MUTANTS` / `PROBES`，逐支锚点在它点名的那份字节里 `count`。
+  **为什么非得 import 而不是读源码**：第一版尺走 `ast` 取字面量，三类锚点它认不出 ——
+  `GATE.format(arg="key")` 这种<em>跑出来</em>的、`("…", [(old, "")], …)` 这种替换文本为空串的（"整段摘掉"那一族），
+  以及改一个常量值那种单行锚点。结果是它给 `gate_mut` 只报 2 段（真 16 段）、给本轮那把 `config_teeth`
+  报 0 段（真 21 段），而"认不出"会被读成"没有锚点"，正是要防的那种假绿。
+  **尺自己有牙，是拿 fixture 验的**：七支假臂盖住那四种形状，其中两支的锚点是把真方法名改掉得到的
+  （`configGetRenamedAway`、`NO_SUCH_NAME_PERCENTAGE`）⇒ 尺必须只点名这两支：实测
+  `锚点=5 判得到死活=5 死锚=2`，两支改名臂各自被指名、其余五支不误报；fixture 用完已删。
+  最终读数：**14 份全解析、锚点 208、判得到死活 200、死锚 4、未归属 8**（未归属 = 元组里不写文件、
+  又在该量具点名的所有 .java 里搜不到的那几支，尺不替它编结论）。
+  本轮真搬断的是 `auto_rewrite_mut/teeth.py` 那四段（两个 `if (… < 0) throw` 下界闸、两个
+  `AUTO_AOF_REWRITE_* = 默认值` 常量），修法是把 T9/T10/T11 的锚点指向 `AofTuning.java`，
+  **锚点文字逐字未动，搬的是文件不是判据**，并把 `AofTuning.java` 进它的 TRACKED（不进的话还原步碰不到它，
+  `TEETH_PREFLIGHT` 里那一条 `不在 TRACKED 里` 就是拦这个的）。重量与验收都在 13o 这副字节上跑完：
+  `TEETH_PREFLIGHT=1` → `PREFLIGHT mutants=18 anchors=20 optional=1 OK`，测量轮 `logs/o1_teeth.txt`
+  与脚本里 13k/13l/13m 攒下的预期集**逐臂逐格相同**（现读比对：`逐臂不同的: 无`），
+  验收轮 `logs/o2_teeth.txt` → `SUMMARY mutants=18 bad=0 control=OK`、`rc=0`；普查尺现在报它
+  `锚点=13 死锚=0`。本轮那把 `config_teeth` 经同一把尺报 `锚点=21 死锚=0`，而它自己 `PREFLIGHT` 报的是
+  24 支 —— 两个数不矛盾，是<em>尺按串去重</em>：24 臂里 `CH3/CH4`、`CH7/CH8`、`CH12/CH19` 各共用一支
+  needle（现读 `python3 -c` 载 `MUTANTS` 数 `len({m["needle"]})` → `臂=24 唯一 needle=21`），
+  这个换算普查尺自己不报，是我另数一遍才对上的。
+  **那 4 个死锚不是本轮搬的**，全在 `gate_mut.py`（G5 / G8 / H1 / H2·H3 共用一支），已登记成卡 #33
+  （下一格 ④）。归因是现读的：`git log --oneline -S "return store.typeOfDb(currentDb, key) ==
+  MemoryStore.DataType.NONE" -- …/CommandHandler.java` → 那段字节死在 `e2d3ec8`（stream 键进键空间），
+  G5/G8 那两段死在 `7960050`（XADD/XTRIM 改成上游那一圈扫描），两支都在 13o 之前，而 13o 没动
+  `streamTypeConflict`。**要紧程度也现读**：`gate_mut.py:184`、`:209-211` 要求锚点命中恰好 1 次否则
+  `FATAL`，所以这把尺坏了会响、不会假绿 —— 等于它今天跑不起来，而不是"曾经给出过假牙印"。
+  独立复核走离线那条（不跑变异）：`python3 ~/.cache/zcache_gauges/gate_mut_anchor_check.py`
+  → `臂=18 段=19 命中不是 1 的段=5`、`SUMMARY gate_mut 臂=18 坏臂=5`
+  （读数存 `gate_mut_anchor_check_13o.txt`）。引用 13k—13m 那些旧读数时，仍按 13n 的口径
+  注明量的是哪一副字节。
+- **基线仍是 955，而格数 +7**：`mvn -o -B clean test` BUILD SUCCESS（`Total time: 46.331 s`），
+  `python3 ~/.cache/zcache_gauges/tally_log.py ~/.cache/zcache_gauges/grammar_mut/logs/full_13o_run1.log`
+  → `MODULES=4 run=955 failures=0 errors=0 skipped=0`（`395 + 423 + 135 + 2`）。
+  新增的 7 格全在既有三支 @Test 里面，所以例数尺<em>看不见</em>这一轮 —— 两把尺量的不是同一件事，
+  `run` 数钉的是 @Test，`格` 数钉的是判据。本轮没跑 `install`，`~/.m2` 里那两件 1.3.6 仍是 13n 时段装的，
+  别当发布件。
+- **README 同步（广告与兑现同一次改）**：13n 写进去的那句"没配 dataDir 的那一台 GET 照答默认值、
+  SET 如实拒"搬完之后反过来成了一句做不到的广告，已改成"旋钮住在本台那一份 `AofTuning` 里 ⇒
+  `SET` 收、`GET` 读得回，且改的就是每 100ms 那一拍读的同一本"。
+- **与上游仍不同处两条**（`handleConfig` 与测试类注释同一份）：① 只有那两条旋钮有值可读，
+  `CONFIG GET maxmemory` 回 `*0`、`SET maxmemory` 回上游"认不出的名字"那一档文案；
+  ② `RESETSTAT` / `REWRITE` 不接，落回上游那句 subcommand 语法错，与只列 GET/SET 的 `CONFIG HELP` 咬合。
+  `BGREWRITEAOF` / `SAVE` / `BGSAVE` 在没有 dataDir 的那一台<em>照旧如实拒绝</em> —— 那三条要的是日志本身，
+  不是一本书面旋钮，所以它们那几格一句没动。
+- **下一格**：① `COMMAND` / `ACL` / `TIME` / `SWAPDB` 四个标签现读仍是 0 命中（13j 那一串里剩下的四分之三）；
+  ② 卡 #26（消费组的 PEL 与消费者状态过不了 AOF 重写，因为 `XCLAIM` 没有实现）；
+  ③ 250 恢复后补跑那三支测试对参考实例的期望；
+  ④ 卡 #33（`gate_mut.py` 那 4 支死锚：G5 / G8 / H1 / H2·H3，`e2d3ec8`、`7960050` 两次改字节留下的，
+  修完那把尺才跑得起来）。
+
 ### Added
 - `RedisServer.serverScope()`：只读拿到本台那一份，测试与嵌入式据此判断作用域边界。
 - `StreamIdFormat`（z-cache-common）：stream ID 的唯一文法（uint64 两段、`-` / `+` 两种位置、
