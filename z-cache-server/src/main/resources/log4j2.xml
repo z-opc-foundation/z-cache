@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  日志配置的唯一落点：发行包这一层（`z-cache-server`）。
+
+  为什么它以前不在这里：那份配置原本住在 `z-cache-core/src/main/resources/logback.xml` ——
+  一个<em>库 jar</em> 里带 root logger 配置，等于替所有下游消费者决定"日志长什么样、写到哪"，
+  而那个 `logs/z-cache.log` 是相对进程工作目录的，别人引一次就在别人的目录下开一个文件。
+  13u 把它删掉、按 log4j2 重写在这里，形状（console + 按天滚动的同名文件 + 保留 30 天 + 同样的
+  pattern + `com.zifang.z.cache` 那一档 INFO）逐格照搬，所以从这一台看出去的行为没有变。
+
+  `status="WARN"` 是 log4j2 自己那条状态通道的级别（不是业务日志级别）：配置读错了要能在
+  启动日志里看见，而不是安静地降级成没输出。
+-->
+<Configuration status="WARN">
+    <Appenders>
+        <Console name="CONSOLE" target="SYSTEM_OUT">
+            <PatternLayout pattern="%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"/>
+        </Console>
+
+        <RollingFile name="FILE"
+                     fileName="logs/z-cache.log"
+                     filePattern="logs/z-cache.%d{yyyy-MM-dd}.log">
+            <PatternLayout pattern="%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"/>
+            <Policies>
+                <TimeBasedTriggeringPolicy interval="1" modulate="true"/>
+            </Policies>
+            <DefaultRolloverStrategy>
+                <Delete basePath="logs" maxDepth="1">
+                    <IfFileName glob="z-cache.*.log"/>
+                    <IfLastModified age="30d"/>
+                </Delete>
+            </DefaultRolloverStrategy>
+        </RollingFile>
+    </Appenders>
+
+    <Loggers>
+        <Logger name="com.zifang.z.cache" level="INFO" additivity="false">
+            <AppenderRef ref="CONSOLE"/>
+            <AppenderRef ref="FILE"/>
+        </Logger>
+        <Root level="INFO">
+            <AppenderRef ref="CONSOLE"/>
+            <AppenderRef ref="FILE"/>
+        </Root>
+    </Loggers>
+</Configuration>

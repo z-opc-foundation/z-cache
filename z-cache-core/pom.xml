@@ -79,12 +79,16 @@
         <dependency>
             <groupId>org.apache.logging.log4j</groupId>
             <artifactId>log4j-api</artifactId>
-            <version>2.17.2</version>
         </dependency>
+        <!-- 库只带 API，不带实现，也不带配置文件（`src/main/resources/logback.xml` 本轮删掉了：
+             一个库 jar 里的日志配置会劫持所有下游消费者的 root logger，今天那一份就是把
+             `logs/z-cache.log` 写进别人工作目录的东西）。实现归 app（z-cache-server）与测试。
+             logback-classic 此前在这里是 compile 作用域 —— 代码里一处 `import ch.qos.logback` 都没有，
+             它纯粹是"顺路把 logback 塞给每个消费者"。 -->
         <dependency>
-            <groupId>ch.qos.logback</groupId>
-            <artifactId>logback-classic</artifactId>
-            <version>1.2.13</version>
+            <groupId>org.apache.logging.log4j</groupId>
+            <artifactId>log4j-core</artifactId>
+            <scope>test</scope>
         </dependency>
 
         <!-- Test Dependencies -->

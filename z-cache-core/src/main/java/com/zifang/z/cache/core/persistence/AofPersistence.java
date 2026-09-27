@@ -22,8 +22,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
-import java.util.logging.Level;
-import java.util.logging.Logger;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 /**
  * AOF（Append Only File）追加持久化调度器。
@@ -60,7 +60,7 @@ bar\r
  */
 public class AofPersistence {
 
-    private static final Logger LOGGER = Logger.getLogger(AofPersistence.class.getName());
+    private static final Logger LOGGER = LogManager.getLogger(AofPersistence.class);
 
     /**
      * fsync 策略枚举。
@@ -449,7 +449,7 @@ arg2\r
         }
 
         if (!started.get()) {
-            LOGGER.warning("AOF not started, ignoring command append");
+            LOGGER.warn("AOF not started, ignoring command append");
             return;
         }
 
@@ -477,7 +477,7 @@ arg2\r
         }
 
         if (!started.get()) {
-            LOGGER.warning("AOF not started, ignoring command append");
+            LOGGER.warn("AOF not started, ignoring command append");
             return;
         }
 
@@ -493,7 +493,7 @@ arg2\r
     /** 调用方必须已持有本对象锁。 */
     private void appendRawLocked(String[] command) throws IOException {
         if (rewriting.get()) {
-            LOGGER.fine("AOF rewrite in progress, buffering command");
+            LOGGER.debug("AOF rewrite in progress, buffering command");
             // 在重写期间，命令仍然写入原 AOF 文件
         }
 
@@ -618,7 +618,7 @@ arg2\r
                 } catch (Throwable t) {
                     // 线程池里抛出去的东西没人接：不许静默。标志已经还了，但日志的形状
                     // 停在"重写之前那一份"，除了这一行日志之外没有任何一面看得见它失败过。
-                    LOGGER.log(Level.WARNING, "Background AOF rewrite failed", t);
+                    LOGGER.warn("Background AOF rewrite failed", t);
                 }
             });
             return true;
@@ -976,7 +976,7 @@ arg2\r
                     continue;
                 }
                 if (!header.startsWith("*")) {
-                    LOGGER.warning("Malformed AOF record near \"" + header + "\", stopping replay here");
+                    LOGGER.warn("Malformed AOF record near \"" + header + "\", stopping replay here");
                     break;
                 }
 
@@ -984,7 +984,7 @@ arg2\r
                 try {
                     argc = Integer.parseInt(header.substring(1).trim());
                 } catch (NumberFormatException e) {
-                    LOGGER.warning("Malformed AOF multi-bulk header \"" + header + "\", stopping replay here");
+                    LOGGER.warn("Malformed AOF multi-bulk header \"" + header + "\", stopping replay here");
                     break;
                 }
 
@@ -992,7 +992,7 @@ arg2\r
                 try {
                     command = readCommand(in, argc);
                 } catch (EOFException truncated) {
-                    LOGGER.warning("AOF tail is truncated, dropping the last incomplete command"
+                    LOGGER.warn("AOF tail is truncated, dropping the last incomplete command"
                             + " (replayed " + commandCount + " commands before it)");
                     break;
                 }
@@ -1001,7 +1001,7 @@ arg2\r
                     commandReplayer.accept(command);
                     commandCount++;
                 } catch (Exception e) {
-                    LOGGER.log(Level.WARNING, "Error replaying command: " + String.join(" ", command), e);
+                    LOGGER.warn("Error replaying command: " + String.join(" ", command), e);
                 }
             }
         }
@@ -1085,7 +1085,7 @@ arg2\r
                     }
                 }
             } catch (IOException e) {
-                LOGGER.log(Level.WARNING, "Error during scheduled fsync", e);
+                LOGGER.warn("Error during scheduled fsync", e);
             }
         }, 1, 1, TimeUnit.SECONDS);
     }
@@ -1165,7 +1165,7 @@ arg2\r
                 } catch (Throwable t) {
                     // 这一拍抛出去的东西没人接：不记日志的话，"自动挡从不触发"和"每拍都在抛"
                     // 在盘面上是同一个样子。
-                    LOGGER.log(Level.WARNING, "Scheduled AOF auto-rewrite check failed", t);
+                    LOGGER.warn("Scheduled AOF auto-rewrite check failed", t);
                 }
             }, AUTO_REWRITE_TICK_MS, AUTO_REWRITE_TICK_MS, TimeUnit.MILLISECONDS);
         }

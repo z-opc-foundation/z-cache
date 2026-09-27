@@ -86,17 +86,18 @@
             <artifactId>netty-codec</artifactId>
         </dependency>
 
-        <!-- Logging -->
+        <!-- Logging：客户端那 8 个文件用的都是 log4j2 的 API（`import org.apache.logging.log4j.*`），
+             实现由宿主提供 —— 所以下面那支 `ch.qos.logback:logback-classic`（provided）删掉了：
+             它既不是代码用的那家，`provided` 又让每个消费者以为自己要背 logback。
+             版本交给根 pom 的 log4j-bom，不在这里写死。 -->
         <dependency>
             <groupId>org.apache.logging.log4j</groupId>
             <artifactId>log4j-api</artifactId>
-            <version>2.17.2</version>
         </dependency>
         <dependency>
-            <groupId>ch.qos.logback</groupId>
-            <artifactId>logback-classic</artifactId>
-            <version>1.2.13</version>
-            <scope>provided</scope>
+            <groupId>org.apache.logging.log4j</groupId>
+            <artifactId>log4j-core</artifactId>
+            <scope>test</scope>
         </dependency>
 
         <!-- Test -->

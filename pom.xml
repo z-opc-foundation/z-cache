@@ -60,8 +60,12 @@
         <maven.compiler.target>8</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <netty.version>4.1.138.Final</netty.version>
-        <slf4j.version>1.7.36</slf4j.version>
-        <logback.version>1.2.13</logback.version>
+        <!-- 日志只有一个家族：log4j2。钉 2.17.2 不是"随手沿用旧值"，是零漂移：core/client 今天引的
+             就是 2.17.2，而 spring-boot 2.7.18 的 `spring-boot-starter-log4j2` 带的
+             log4j-core / log4j-slf4j-impl / log4j-jul 也全是 2.17.2 ⇒ "我们的 BOM"与"spring 那一侧"
+             是同一版，不会像 13t 之前那样在测试类路径上同时出现 2.17.2 的 api 与 2.25.4 的桥。
+             抬版本是另一个决定（要连 Java 8 字节码一起验），不在这一格里顺手做。 -->
+        <log4j2.version>2.17.2</log4j2.version>
     </properties>
 
     <dependencyManagement>
@@ -74,15 +78,19 @@
                 <scope>import</scope>
             </dependency>
             <dependency>
-                <groupId>org.slf4j</groupId>
-                <artifactId>slf4j-api</artifactId>
-                <version>${slf4j.version}</version>
+                <groupId>org.apache.logging.log4j</groupId>
+                <artifactId>log4j-bom</artifactId>
+                <version>${log4j2.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
             </dependency>
-            <dependency>
-                <groupId>ch.qos.logback</groupId>
-                <artifactId>logback-classic</artifactId>
-                <version>${logback.version}</version>
-            </dependency>
+            <!-- slf4j-api / logback-classic 的 managed 条目整批删掉：这一族不再是我们的
+                 实现选择（代码里 18 处 logger 全部 import org.apache.logging.log4j，
+                 0 处 import org.slf4j，0 处 import ch.qos.logback —— 现读，见 CHANGELOG 13u。
+                 这 18 支里有 2 支是 13u 才接回来的：它们此前整支走 java.util.logging，
+                 而 JUL 的 LogManager 与 log4j2 的同名不同物，按 import 数出来的是 16。
+                 留着它们＝留着一个"谁都能误引"的入口，而误引的代价要到运行时才现形
+                 （两条 binding 同时在类路径上时，输出走哪家取决于加载顺序）。 -->
         </dependencies>
     </dependencyManagement>
 
