@@ -448,9 +448,9 @@ public class ZCacheClient implements AutoCloseable {
      * 删除 hash 一个或多个字段，返回删除数量。
      */
     public Long hdel(String key, String... fields) {
-        Object[] args = new Object[fields.length + 2];
-        args[0] = "HDEL"; args[1] = key;
-        System.arraycopy(fields, 0, args, 2, fields.length);
+        Object[] args = new Object[fields.length + 1];
+        args[0] = key;
+        System.arraycopy(fields, 0, args, 1, fields.length);
         return toLong(sendCommand("HDEL", (Object[]) args));
     }
 
@@ -504,9 +504,9 @@ public class ZCacheClient implements AutoCloseable {
      * 批量获取 hash 多个字段值。
      */
     public List<String> hmget(String key, String... fields) {
-        Object[] args = new Object[fields.length + 2];
-        args[0] = "HMGET"; args[1] = key;
-        System.arraycopy(fields, 0, args, 2, fields.length);
+        Object[] args = new Object[fields.length + 1];
+        args[0] = key;
+        System.arraycopy(fields, 0, args, 1, fields.length);
         Object response = sendCommand("HMGET", (Object[]) args);
         if (!(response instanceof com.zifang.z.cache.common.protocol.RespArray)) return new ArrayList<>();
         List<String> result = new ArrayList<>();
@@ -520,9 +520,9 @@ public class ZCacheClient implements AutoCloseable {
      * 批量设置 hash 多个字段值。
      */
     public String hmset(String key, String... fieldValues) {
-        Object[] args = new Object[fieldValues.length + 2];
-        args[0] = "HMSET"; args[1] = key;
-        System.arraycopy(fieldValues, 0, args, 2, fieldValues.length);
+        Object[] args = new Object[fieldValues.length + 1];
+        args[0] = key;
+        System.arraycopy(fieldValues, 0, args, 1, fieldValues.length);
         return toString(sendCommand("HMSET", (Object[]) args));
     }
 
@@ -553,9 +553,9 @@ public class ZCacheClient implements AutoCloseable {
      * 从头部插入一个或多个元素。
      */
     public Long lpush(String key, String... values) {
-        Object[] args = new Object[values.length + 2];
-        args[0] = "LPUSH"; args[1] = key;
-        System.arraycopy(values, 0, args, 2, values.length);
+        Object[] args = new Object[values.length + 1];
+        args[0] = key;
+        System.arraycopy(values, 0, args, 1, values.length);
         return toLong(sendCommand("LPUSH", (Object[]) args));
     }
 
@@ -563,9 +563,9 @@ public class ZCacheClient implements AutoCloseable {
      * 从尾部插入一个或多个元素。
      */
     public Long rpush(String key, String... values) {
-        Object[] args = new Object[values.length + 2];
-        args[0] = "RPUSH"; args[1] = key;
-        System.arraycopy(values, 0, args, 2, values.length);
+        Object[] args = new Object[values.length + 1];
+        args[0] = key;
+        System.arraycopy(values, 0, args, 1, values.length);
         return toLong(sendCommand("RPUSH", (Object[]) args));
     }
 
@@ -651,9 +651,9 @@ public class ZCacheClient implements AutoCloseable {
      * 向集合添加一个或多个成员，返回新增数量。
      */
     public Long sadd(String key, String... members) {
-        Object[] args = new Object[members.length + 2];
-        args[0] = "SADD"; args[1] = key;
-        System.arraycopy(members, 0, args, 2, members.length);
+        Object[] args = new Object[members.length + 1];
+        args[0] = key;
+        System.arraycopy(members, 0, args, 1, members.length);
         return toLong(sendCommand("SADD", (Object[]) args));
     }
 
@@ -661,9 +661,9 @@ public class ZCacheClient implements AutoCloseable {
      * 移除集合一个或多个成员，返回移除数量。
      */
     public Long srem(String key, String... members) {
-        Object[] args = new Object[members.length + 2];
-        args[0] = "SREM"; args[1] = key;
-        System.arraycopy(members, 0, args, 2, members.length);
+        Object[] args = new Object[members.length + 1];
+        args[0] = key;
+        System.arraycopy(members, 0, args, 1, members.length);
         return toLong(sendCommand("SREM", (Object[]) args));
     }
 
@@ -705,10 +705,7 @@ public class ZCacheClient implements AutoCloseable {
      * 返回多个集合的交集。
      */
     public List<String> sinter(String... keys) {
-        Object[] args = new Object[keys.length + 1];
-        args[0] = "SINTER";
-        System.arraycopy(keys, 0, args, 1, keys.length);
-        Object response = sendCommand("SINTER", (Object[]) args);
+        Object response = sendCommand("SINTER", (Object[]) keys);
         if (!(response instanceof com.zifang.z.cache.common.protocol.RespArray)) return new ArrayList<>();
         List<String> result = new ArrayList<>();
         for (Object item : ((com.zifang.z.cache.common.protocol.RespArray) response).getElements()) {
@@ -721,10 +718,7 @@ public class ZCacheClient implements AutoCloseable {
      * 返回多个集合的并集。
      */
     public List<String> sunion(String... keys) {
-        Object[] args = new Object[keys.length + 1];
-        args[0] = "SUNION";
-        System.arraycopy(keys, 0, args, 1, keys.length);
-        Object response = sendCommand("SUNION", (Object[]) args);
+        Object response = sendCommand("SUNION", (Object[]) keys);
         if (!(response instanceof com.zifang.z.cache.common.protocol.RespArray)) return new ArrayList<>();
         List<String> result = new ArrayList<>();
         for (Object item : ((com.zifang.z.cache.common.protocol.RespArray) response).getElements()) {
@@ -737,10 +731,7 @@ public class ZCacheClient implements AutoCloseable {
      * 返回第一个集合与其他集合的差集。
      */
     public List<String> sdiff(String... keys) {
-        Object[] args = new Object[keys.length + 1];
-        args[0] = "SDIFF";
-        System.arraycopy(keys, 0, args, 1, keys.length);
-        Object response = sendCommand("SDIFF", (Object[]) args);
+        Object response = sendCommand("SDIFF", (Object[]) keys);
         if (!(response instanceof com.zifang.z.cache.common.protocol.RespArray)) return new ArrayList<>();
         List<String> result = new ArrayList<>();
         for (Object item : ((com.zifang.z.cache.common.protocol.RespArray) response).getElements()) {
@@ -769,9 +760,9 @@ public class ZCacheClient implements AutoCloseable {
      * 移除有序集合一个或多个成员，返回移除数量。
      */
     public Long zrem(String key, String... members) {
-        Object[] args = new Object[members.length + 2];
-        args[0] = "ZREM"; args[1] = key;
-        System.arraycopy(members, 0, args, 2, members.length);
+        Object[] args = new Object[members.length + 1];
+        args[0] = key;
+        System.arraycopy(members, 0, args, 1, members.length);
         return toLong(sendCommand("ZREM", (Object[]) args));
     }
 
@@ -938,10 +929,7 @@ public class ZCacheClient implements AutoCloseable {
      * 监控指定的键。
      */
     public String watch(String... keys) {
-        Object[] args = new Object[keys.length + 1];
-        args[0] = "WATCH";
-        System.arraycopy(keys, 0, args, 1, keys.length);
-        return toString(sendCommand("WATCH", (Object[]) args));
+        return toString(sendCommand("WATCH", (Object[]) keys));
     }
 
     /**
@@ -957,10 +945,7 @@ public class ZCacheClient implements AutoCloseable {
      * 订阅指定频道。
      */
     public void subscribe(String... channels) {
-        Object[] args = new Object[channels.length + 1];
-        args[0] = "SUBSCRIBE";
-        System.arraycopy(channels, 0, args, 1, channels.length);
-        sendCommand("SUBSCRIBE", (Object[]) args);
+        sendCommand("SUBSCRIBE", (Object[]) channels);
     }
 
     /**

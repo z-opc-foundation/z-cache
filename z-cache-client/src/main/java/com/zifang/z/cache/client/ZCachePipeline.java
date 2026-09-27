@@ -46,10 +46,7 @@ public class ZCachePipeline {
     }
 
     public ZCachePipeline del(String... keys) {
-        Object[] args = new Object[keys.length + 1];
-        args[0] = "DEL";
-        System.arraycopy(keys, 0, args, 1, keys.length);
-        futures.add(client.sendCommandAsync("DEL", (Object[]) args));
+        futures.add(client.sendCommandAsync("DEL", (Object[]) keys));
         return this;
     }
 
@@ -81,9 +78,9 @@ public class ZCachePipeline {
     }
 
     public ZCachePipeline hdel(String key, String... fields) {
-        Object[] args = new Object[fields.length + 2];
-        args[0] = "HDEL"; args[1] = key;
-        System.arraycopy(fields, 0, args, 2, fields.length);
+        Object[] args = new Object[fields.length + 1];
+        args[0] = key;
+        System.arraycopy(fields, 0, args, 1, fields.length);
         futures.add(client.sendCommandAsync("HDEL", (Object[]) args));
         return this;
     }
@@ -96,17 +93,17 @@ public class ZCachePipeline {
     // ==================== List 命令 ====================
 
     public ZCachePipeline lpush(String key, String... values) {
-        Object[] args = new Object[values.length + 2];
-        args[0] = "LPUSH"; args[1] = key;
-        System.arraycopy(values, 0, args, 2, values.length);
+        Object[] args = new Object[values.length + 1];
+        args[0] = key;
+        System.arraycopy(values, 0, args, 1, values.length);
         futures.add(client.sendCommandAsync("LPUSH", (Object[]) args));
         return this;
     }
 
     public ZCachePipeline rpush(String key, String... values) {
-        Object[] args = new Object[values.length + 2];
-        args[0] = "RPUSH"; args[1] = key;
-        System.arraycopy(values, 0, args, 2, values.length);
+        Object[] args = new Object[values.length + 1];
+        args[0] = key;
+        System.arraycopy(values, 0, args, 1, values.length);
         futures.add(client.sendCommandAsync("RPUSH", (Object[]) args));
         return this;
     }
@@ -129,17 +126,17 @@ public class ZCachePipeline {
     // ==================== Set 命令 ====================
 
     public ZCachePipeline sadd(String key, String... members) {
-        Object[] args = new Object[members.length + 2];
-        args[0] = "SADD"; args[1] = key;
-        System.arraycopy(members, 0, args, 2, members.length);
+        Object[] args = new Object[members.length + 1];
+        args[0] = key;
+        System.arraycopy(members, 0, args, 1, members.length);
         futures.add(client.sendCommandAsync("SADD", (Object[]) args));
         return this;
     }
 
     public ZCachePipeline srem(String key, String... members) {
-        Object[] args = new Object[members.length + 2];
-        args[0] = "SREM"; args[1] = key;
-        System.arraycopy(members, 0, args, 2, members.length);
+        Object[] args = new Object[members.length + 1];
+        args[0] = key;
+        System.arraycopy(members, 0, args, 1, members.length);
         futures.add(client.sendCommandAsync("SREM", (Object[]) args));
         return this;
     }
@@ -157,9 +154,9 @@ public class ZCachePipeline {
     }
 
     public ZCachePipeline zrem(String key, String... members) {
-        Object[] args = new Object[members.length + 2];
-        args[0] = "ZREM"; args[1] = key;
-        System.arraycopy(members, 0, args, 2, members.length);
+        Object[] args = new Object[members.length + 1];
+        args[0] = key;
+        System.arraycopy(members, 0, args, 1, members.length);
         futures.add(client.sendCommandAsync("ZREM", (Object[]) args));
         return this;
     }
