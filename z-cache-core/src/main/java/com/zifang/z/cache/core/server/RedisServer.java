@@ -272,6 +272,9 @@ public class RedisServer {
 
         // 启动 AOF 写入（追加模式，上面重放过的内容原样保留）
         try {
+            // 自动挡那一拍要问"本台有没有后台快照在跑"（上游 server.c:1303 的 rdb_child_pid == -1）。
+            // 必须接在 start() 之前：start() 一挂上那一拍，第一次读数就可能已经用上了。
+            aofPersistence.setRdbBusy(rdbPersistence::isBackgroundSaving);
             aofPersistence.start(aofPath);
             scope.setAofPersistence(aofPersistence);
             logger.info("AOF persistence started: {}", aofPath);

@@ -172,7 +172,8 @@ public class AofPersistence {
      * （{@code server.h:1078}，"the AOF file is at least N bytes"）。默认 64mb
      * （{@code server.h:99} 的 {@code AOF_REWRITE_MIN_SIZE}，即 {@code 64*1024*1024}）。
      * <p>
-     * 它存在的理由不是"再省一点"：几十个字节的日志重写一次，收益是零、开销是一次 fork。
+     * 它存在的理由不是"再省一点"：几十个字节的日志重写一次，收益是零、开销是把整份状态重导一遍
+     * （本版重写不 fork，见 {@link #rewriteAsync()}，所以这笔开销是同步落在写侧的）。
      * {@code server.c:1306} 用的是严格大于 —— 正好等于地板时<em>不</em>重写。
      * 运行时口 {@code config.c:1262-1263} 收 {@code 0..LONG_MAX}。
      * </p>
@@ -186,6 +187,14 @@ public class AofPersistence {
      * 把触发挂到 fsync 定时器上，等于让 {@code appendfsync always} 顺带关掉自动挡。
      */
     private volatile ScheduledFuture<?> autoRewriteFuture;
+
+    /**
+     * "本台正有一次后台快照在跑吗"的读口 —— 对应上游 {@code server.c:1303} 那一项
+     * （{@code server.rdb_child_pid == -1}）。生产那一侧由 {@code RedisServer.initPersistence()}
+     * 接到 {@link RdbPersistence#isBackgroundSaving()}；默认那一支恒 {@code false} 的含义是
+     * <em>没人接线</em>，见 {@link #setRdbBusy(java.util.function.BooleanSupplier)}。
+     */
+    private volatile java.util.function.BooleanSupplier rdbBusy = () -> false;
 
     /**
      * 最后一次真 fsync 时的字节数 —— 对应上游的 {@code server.aof_fsync_offset}
@@ -1161,7 +1170,8 @@ arg2\r
      * 按上游那一串条件量一次：<b>这一份日志现在该不该自动重写</b>。
      * <p>
      * 逐条对 {@code server.c:1301-1315}：{@code aof_state == AOF_ON}（{@code :1302}）、
-     * 没有子进程在跑（{@code :1303-1304}，我们的对应物是 {@link #rewriting} 那把标志）、
+     * 没有后台保存在跑（{@code :1303} 的 {@code rdb_child_pid == -1}，对应 {@code rdbSaving}）、
+     * 没有后台重写（{@code :1304} 的 {@code aof_child_pid == -1}，对应 {@link #rewriting} 那把标志）、
      * {@code aof_rewrite_perc} 非零（{@code :1305}）、当前体积<b>严格</b>大于地板（{@code :1306}），
      * 然后 {@code base = aof_rewrite_base_size ?: 1}（{@code :1308-1309}）、
      * {@code growth = current*100/base - 100}（{@code :1310}）、{@code growth >= perc}（{@code :1311}）。
@@ -1172,6 +1182,7 @@ arg2\r
      * </p>
      *
      * @param aofOn             这一份日志是否处于"开着"的状态
+     * @param rdbSaving         本台是否正有一次后台快照在跑（上游 {@code rdb_child_pid} 那一项）
      * @param rewriteInProgress 是否已经有人在重写
      * @param current           当前日志体积（分子）
      * @param base              上次接手／换手时的体积（分母）
@@ -1179,8 +1190,8 @@ arg2\r
      * @param minSize           体积地板
      * @return 该不该发起一次自动重写
      */
-    static boolean shouldAutoRewrite(boolean aofOn, boolean rewriteInProgress, long current, long base,
-                                     int percentage, long minSize) {
+    static boolean shouldAutoRewrite(boolean aofOn, boolean rdbSaving, boolean rewriteInProgress,
+                                     long current, long base, int percentage, long minSize) {
         if (!aofOn || rewriteInProgress || percentage == 0 || current <= minSize) {
             return false;
         }
@@ -1195,12 +1206,31 @@ arg2\r
      * @return 是否发起了这一趟重写
      */
     boolean checkAutoRewrite() {
-        if (!shouldAutoRewrite(started.get(), rewriting.get(), appendedBytes, rewriteBaseBytes,
-                autoRewritePercentage, autoRewriteMinSize)) {
+        if (!shouldAutoRewrite(started.get(), rdbBusy.getAsBoolean(), rewriting.get(),
+                appendedBytes, rewriteBaseBytes, autoRewritePercentage, autoRewriteMinSize)) {
             return false;
         }
         LOGGER.info("Starting automatic rewriting of AOF on growth over " + autoRewritePercentage + "%");
         return rewriteAsync();
+    }
+
+    /**
+     * 把"本台有没有后台快照在跑"这一个读口交给自动挡，对应上游 {@code server.c:1303} 的
+     * {@code rdb_child_pid == -1}。
+     * <p>
+     * 默认那一支恒为 {@code false}，而 {@code false} 在这里的含义是<em>没人接线</em>，不是
+     * "问过了、当前空闲"：忘了接的话自动挡照样会在一趟 BGSAVE 中间去换日志，而盘面上看不出差别。
+     * 所以生产那一侧的接线由 {@code RedisServerLifecycleTest} 的结构守卫钉着（读的是
+     * {@code RedisServer.initPersistence()} 的字节，不看这里写了什么注释），测试要控制读数就打这一支。
+     * </p>
+     */
+    public void setRdbBusy(java.util.function.BooleanSupplier busyReader) {
+        this.rdbBusy = busyReader == null ? () -> false : busyReader;
+    }
+
+    /** 当前那个"后台快照在跑吗"的读口，只给判据回读接线用的。 */
+    public java.util.function.BooleanSupplier getRdbBusy() {
+        return rdbBusy;
     }
 
     /** 自动挡的百分比门槛（{@code server.aof_rewrite_perc}）。 */

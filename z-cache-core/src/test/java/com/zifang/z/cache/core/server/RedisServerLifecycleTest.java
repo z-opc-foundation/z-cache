@@ -1938,6 +1938,129 @@ class RedisServerLifecycleTest {
     }
 
     /**
+     * 上游那一拍在决定换不换日志之前先问"有没有后台保存在跑"（{@code server.c:1303} 的
+     * {@code rdb_child_pid == -1}）。本版 BGSAVE 是真异步的（{@code RdbPersistence.saveAsync()}
+     * 把活交给自己的单线程 scheduler），所以这一项在这里有实际对象：挡起来必须不换，放开必须又换得动。
+     * <p>
+     * 这一支用 {@code setRdbBusy} 注入读数，量的是"那一拍真的去问了没有"；
+     * <em>问的是不是真计数器</em>由 {@link #theRewriteTickAsksTheRealBackgroundSaveCounter()} 钉。
+     * </p>
+     */
+    @Test
+    void backgroundSaveBlocksTheRewriteTick() throws Exception {
+        java.nio.file.Path dir = java.nio.file.Files.createTempDirectory("zcache-aof-rdb-busy");
+        java.nio.file.Path aof = dir.resolve("appendonly.aof");
+        int p = freePort();
+        RedisServer server = new RedisServer("127.0.0.1", p, 0);
+        server.setDataDir(dir.toString());
+        Thread th = startAndWait(server, p);
+        Map<String, String> seen = new LinkedHashMap<>();
+        Map<String, String> wrong = new LinkedHashMap<>();
+        AofPersistence a = server.getAofPersistence();
+        assertNotNull(a, "前置条件: 这一台得真的起了 AOF，才谈得上挡它");
+        String notes = "";
+        try (Socket socket = connect(p)) {
+            DataInputStream in = new DataInputStream(socket.getInputStream());
+            a.setAutoAofRewriteMinSize(0L);
+            a.setAutoAofRewritePercentage(100);
+            String big = padValue(400);
+            for (int i = 0; i < 5; i++) {
+                send(socket, "SET", "k", big);
+                assertEquals("+OK", readReply(in), "前置条件: 定窗口那一臂的第 " + (i + 1) + " 笔要落得下去");
+            }
+            long[] fired = awaitSetCount(aof, 1, 10_000L);
+            expectTextCell(seen, wrong, "没人挡 ⇒ 同一组数换得动（用来定窗口）",
+                    String.valueOf(fired[0]), "1",
+                    "先在同一台上量一次\"会换\"，才谈得上量\"被挡\"；实测过了 " + fired[1] + "ms");
+            awaitNotRewriting(a);
+
+            a.setRdbBusy(() -> true);
+            for (int i = 0; i < 4; i++) {
+                send(socket, "SET", "k", big);
+                assertEquals("+OK", readReply(in), "前置条件: 挡住那一臂的写也要落下去");
+            }
+            int before = countSetRecords(aof);
+            long window = Math.max(fired[1], 6 * AofPersistence.AUTO_REWRITE_TICK_MS);
+            Thread.sleep(window);
+            expectTextCell(seen, wrong, "后台快照在跑 ⇒ 那一拍不许换日志",
+                    String.valueOf(countSetRecords(aof)), String.valueOf(before),
+                    "挡起来再写四笔：不换 = 条数停在 " + before + "，换了会塌成 1。窗口 " + window
+                            + "ms 由上面那一臂实测的 " + fired[1] + "ms 推出来（下限 6 拍）");
+
+            a.setRdbBusy(() -> false);
+            long[] firedAgain = awaitSetCount(aof, 1, 10_000L);
+            expectTextCell(seen, wrong, "放开挡 ⇒ 同一台马上又换得动（上一臂不是量具瞎）",
+                    String.valueOf(firedAgain[0]), "1",
+                    "否定式判据的阳性对照：注入恒真与\"那一拍根本没在跑\"在盘面上是同一个样子，"
+                            + "只有放开之后真的换了才分得开。实测过了 " + firedAgain[1] + "ms");
+            if (firedAgain[1] < 0) {
+                notes = "放开那一臂超时，前面\"挡住\"那一格的读数也不可信；";
+            }
+        } finally {
+            server.stop();
+            th.join(DEADLINE_MS);
+        }
+        assertTrue(wrong.isEmpty(), "自动挡问\"有没有后台保存在跑\"（server.c:1303）逐格: " + seen
+                + "；不合格: " + wrong + "；" + notes
+                + " [RED_CELLS=" + String.join("|", wrong.keySet()) + "]");
+    }
+
+    /**
+     * 结构守卫：上面那一支注入的是<em>假的</em>读数，所以它量不到"生产那一侧到底接了谁"。
+     * 这一支读的是三份主代码的字节，钉四件事 —— 接了、接的是真计数、接的时机在挂那一拍之前、
+     * 那一拍真的把这个数传进了条件。
+     */
+    @Test
+    void theRewriteTickAsksTheRealBackgroundSaveCounter() throws Exception {
+        Map<String, String> wrong = new LinkedHashMap<>();
+        String serverSrc = mainSourceOf("server", "RedisServer.java");
+        String aofSrc = mainSourceOf("AofPersistence.java");
+        String rdbSrc = mainSourceOf("RdbPersistence.java");
+
+        String init = methodBody(serverSrc, "private void initPersistence()", wrong, "initPersistence");
+        String tick = methodBody(aofSrc, "boolean checkAutoRewrite()", wrong, "checkAutoRewrite");
+        String rule = methodBody(aofSrc, "static boolean shouldAutoRewrite(", wrong, "shouldAutoRewrite");
+        String reader = methodBody(rdbSrc, "public boolean isBackgroundSaving()", wrong, "isBackgroundSaving");
+
+        if (!init.contains("setRdbBusy(") || !init.contains("isBackgroundSaving")) {
+            wrong.put("生产那一侧接了读口", "initPersistence() 里没有 setRdbBusy(...isBackgroundSaving...) —— "
+                    + "自动挡那一项条件的对象是空的，实测那一臂（注入恒真）照样会绿，所以只能在这一层钉");
+        }
+        int wireAt = init.indexOf("setRdbBusy(");
+        int startAt = init.indexOf("aofPersistence.start(");
+        if (wireAt < 0 || startAt < 0 || wireAt > startAt) {
+            wrong.put("接线在挂那一拍之前", "setRdbBusy 必须在 aofPersistence.start( 之前（start() 一挂上那一拍，"
+                    + "第一次读数就可能已经用上了），实际 接线@" + wireAt + " start@" + startAt);
+        }
+        if (!tick.contains("rdbBusy.getAsBoolean()")) {
+            wrong.put("那一拍真的去问", "checkAutoRewrite() 里没有 rdbBusy.getAsBoolean() —— "
+                    + "接了线而没人读，等于没接；实际: " + tick);
+        }
+        // 只看"这个标识符在体里出现过"是不够的：形参那一行也带着 rdbSaving，摘掉条件里的那一项
+        // 照样绿。所以切出那条 if 的括号再判，让"摘掉 server.c:1303 那一项"这种改法必有格子红。
+        int guardAt = rule.indexOf("if (");
+        int guardEnd = guardAt < 0 ? -1 : rule.indexOf(')', guardAt);
+        String guard = (guardAt < 0 || guardEnd < 0) ? "" : rule.substring(guardAt, guardEnd);
+        if (!guard.contains("rdbSaving")) {
+            wrong.put("条件里真有那一项", "shouldAutoRewrite 的那条 if 里找不到 rdbSaving —— 上游 :1303 那一项没有对象了；"
+                    + "实际条件: " + guard);
+        }
+        if (!reader.contains("bgSaving") || reader.contains("return false")) {
+            wrong.put("读口读的是那个计数", "isBackgroundSaving() 必须返回 bgSaving 的读数而不是写死；实际: " + reader);
+        }
+        // 阳性对照：同一个 methodBody 抽出来的一段里，一条本来就在的接线必须看得见 ——
+        // 否则上面五格全是"抽不到所以都不在"的空转。minSize 挑的是<em>没有一支变异会碰</em>的那一项，
+        // 不然某一臂会把"抽取坏了"这句假话报成一条红。
+        if (!init.contains("setStoreAccessor(accessor)") || !guard.contains("minSize")) {
+            wrong.put("这段抽取本身看得见东西（阳性对照）", "initPersistence() 里连 setStoreAccessor(accessor) 都找不到，"
+                    + "或者那条 if 里连 minSize 都没有 —— 说明抽取坏了，上面几格的\"没有\"不作数；"
+                    + "init 长度 " + init.length() + "，条件: " + guard);
+        }
+        assertTrue(wrong.isEmpty(), "自动挡与后台快照的接线（读的是 src/main 的字节）不合格: " + wrong
+                + " [RED_CELLS=" + String.join("|", wrong.keySet()) + "]");
+    }
+
+    /**
      * 数一份 AOF 里有几条 {@code SET} 记录 —— 只按字节找 RESP 的定长头
      * （{@code $3\r\nSET\r\n}），不读我们自己的任何记账。
      */
@@ -2622,7 +2745,12 @@ class RedisServerLifecycleTest {
 
     /** 主代码的字节 —— surefire 的 cwd 是模块目录，从仓根起算的那一种写法留作兜底。 */
     private static String mainSourceOf(String fileName) throws IOException {
-        String tail = "src/main/java/com/zifang/z/cache/core/persistence/" + fileName;
+        return mainSourceOf("persistence", fileName);
+    }
+
+    /** 主代码的字节，包名可指 —— 结构守卫要跨 persistence 与 server 两个包读接线。 */
+    private static String mainSourceOf(String pkgDir, String fileName) throws IOException {
+        String tail = "src/main/java/com/zifang/z/cache/core/" + pkgDir + "/" + fileName;
         java.nio.file.Path p = java.nio.file.Paths.get(tail);
         if (!java.nio.file.Files.exists(p)) {
             p = java.nio.file.Paths.get("z-cache-core/" + tail);

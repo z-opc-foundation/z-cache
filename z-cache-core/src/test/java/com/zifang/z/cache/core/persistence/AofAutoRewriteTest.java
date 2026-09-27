@@ -62,62 +62,73 @@ class AofAutoRewriteTest {
 
         // 1) aof_state == AOF_ON（:1302）
         expectCell(seen, wrong, "AOF 没开着 ⇒ 不重写",
-                () -> yesNo(AofPersistence.shouldAutoRewrite(false, false, 1_000_000L, 100L, 100, 0L)),
+                () -> yesNo(AofPersistence.shouldAutoRewrite(false, false, false, 1_000_000L, 100L, 100, 0L)),
                 "false", "上游第一个条件就是 aof_state == AOF_ON；这一格与下一格合起来钉住\"开关在不在\"不是恒真");
         expectCell(seen, wrong, "AOF 开着且增幅够 ⇒ 重写",
-                () -> yesNo(AofPersistence.shouldAutoRewrite(true, false, 1_000_000L, 100L, 100, 0L)),
+                () -> yesNo(AofPersistence.shouldAutoRewrite(true, false, false, 1_000_000L, 100L, 100, 0L)),
                 "true", "同一组数只改 aofOn 这一项，两格必须一个真一个假");
 
-        // 2) 没有子进程在重写（:1303-1304）
+        // 2) 没有后台保存在跑（:1303）
+        expectCell(seen, wrong, "后台快照在跑 ⇒ 这一拍不许换日志",
+                () -> yesNo(AofPersistence.shouldAutoRewrite(true, true, false, 1_000_000L, 100L, 100, 0L)),
+                "false", "server.c:1303 那一项是 rdb_child_pid == -1：有后台保存在跑就不发起重写。"
+                        + "本版 BGSAVE 是异步的（RdbPersistence.saveAsync() 把活交给自己的单线程 scheduler），"
+                        + "所以这一项不是摆设 —— 不接它，两笔后台写会同时动盘");
+        expectCell(seen, wrong, "后台快照空了 ⇒ 同一组数照样换",
+                () -> yesNo(AofPersistence.shouldAutoRewrite(true, false, false, 1_000_000L, 100L, 100, 0L)),
+                "true", "上一格的反向邻居：只留一边，\"这一项恒真\"（自动挡从此永不触发）"
+                        + "与\"这一项被摘掉\"两种坏法就分不开");
+
+        // 3) 没有后台重写在跑（:1304）
         expectCell(seen, wrong, "正在重写 ⇒ 不叠第二趟",
-                () -> yesNo(AofPersistence.shouldAutoRewrite(true, true, 1_000_000L, 100L, 100, 0L)),
+                () -> yesNo(AofPersistence.shouldAutoRewrite(true, false, true, 1_000_000L, 100L, 100, 0L)),
                 "false", "上游挡的是 aof_child_pid != -1；我们那把对应标志是 rewriting。叠第二趟会把上一趟的中间态当数据集");
 
-        // 3) aof_rewrite_perc 非零（:1305）
+        // 4) aof_rewrite_perc 非零（:1305）
         expectCell(seen, wrong, "perc=0 是关掉而不是永远重写",
-                () -> yesNo(AofPersistence.shouldAutoRewrite(true, false, 1_000_000L, 100L, 0, 0L)),
+                () -> yesNo(AofPersistence.shouldAutoRewrite(true, false, false, 1_000_000L, 100L, 0, 0L)),
                 "false", "0 在上游是把整数当真假用；翻成 >0 或 >=0 的判断都会让 perc=0 变成\"每拍都重写\"");
 
-        // 4) 体积地板用的是严格大于（:1306）
+        // 5) 体积地板用的是严格大于（:1306）
         expectCell(seen, wrong, "正好等于地板 ⇒ 不重写",
-                () -> yesNo(AofPersistence.shouldAutoRewrite(true, false, 100L, 50L, 100, 100L)),
+                () -> yesNo(AofPersistence.shouldAutoRewrite(true, false, false, 100L, 50L, 100, 100L)),
                 "false", "server.c:1306 是 aof_current_size > aof_rewrite_min_size，不是 >=");
         expectCell(seen, wrong, "超过地板一寸且增幅够 ⇒ 重写",
-                () -> yesNo(AofPersistence.shouldAutoRewrite(true, false, 101L, 50L, 100, 100L)),
+                () -> yesNo(AofPersistence.shouldAutoRewrite(true, false, false, 101L, 50L, 100, 100L)),
                 "true", "同上，多一个字节就该过；这一格是上一格的反向邻居");
         expectCell(seen, wrong, "地板没过时增幅再大也不谈",
-                () -> yesNo(AofPersistence.shouldAutoRewrite(true, false, 50L, 1L, 100, 1000L)),
+                () -> yesNo(AofPersistence.shouldAutoRewrite(true, false, false, 50L, 1L, 100, 1000L)),
                 "false", "current=50 相对 base=1 的增幅是 4900%，但地板 1000 没过 —— 钉的是\"地板先看，增幅后算\"这个次序");
 
-        // 5) growth 与门槛比的是 >=（:1310-1311）
+        // 6) growth 与门槛比的是 >=（:1310-1311）
         expectCell(seen, wrong, "增幅正好等于门槛 ⇒ 重写（>=）",
-                () -> yesNo(AofPersistence.shouldAutoRewrite(true, false, 200L, 100L, 100, 0L)),
+                () -> yesNo(AofPersistence.shouldAutoRewrite(true, false, false, 200L, 100L, 100, 0L)),
                 "true", "200*100/100-100 = 100，而 :1311 是 growth >= aof_rewrite_perc；写成 > 就在这格翻脸");
         expectCell(seen, wrong, "增幅差一个百分点 ⇒ 不重写",
-                () -> yesNo(AofPersistence.shouldAutoRewrite(true, false, 199L, 100L, 100, 0L)),
+                () -> yesNo(AofPersistence.shouldAutoRewrite(true, false, false, 199L, 100L, 100, 0L)),
                 "false", "199*100/100-100 = 99 < 100；这一格与上一格合起来把 >= 与 >、以及整除的那一步都钉住");
         expectCell(seen, wrong, "门槛降到 1 ⇒ 只涨一点也算",
-                () -> yesNo(AofPersistence.shouldAutoRewrite(true, false, 101L, 100L, 1, 100L)),
+                () -> yesNo(AofPersistence.shouldAutoRewrite(true, false, false, 101L, 100L, 1, 100L)),
                 "true", "同一个 101/100 只改门槛：100 时不重写（上一格）、1 时重写，钉的是门槛真的进了算式");
 
-        // 6) base = aof_rewrite_base_size ?: 1（:1308-1309）
+        // 7) base = aof_rewrite_base_size ?: 1（:1308-1309）
         expectCell(seen, wrong, "底座为 0 ⇒ 按 1 算而不是除零",
-                () -> yesNo(AofPersistence.shouldAutoRewrite(true, false, 512L, 0L, 100, 0L)),
+                () -> yesNo(AofPersistence.shouldAutoRewrite(true, false, false, 512L, 0L, 100, 0L)),
                 "true", "上游那句 ?: 1 不是装饰：整数除 0 在 C 里是 UB、在 Java 里是 ArithmeticException，"
                         + "那一拍只会留下一行日志而自动挡从此失灵");
 
-        // 7) 上游默认值下的两格（100 / 64mb）
+        // 8) 上游默认值下的两格（100 / 64mb）
         long mb = 1024L * 1024L;
         expectCell(seen, wrong, "默认门槛下涨到 128mb（底座 64mb）⇒ 重写",
-                () -> yesNo(AofPersistence.shouldAutoRewrite(true, false, 128L * mb, 64L * mb,
+                () -> yesNo(AofPersistence.shouldAutoRewrite(true, false, false, 128L * mb, 64L * mb,
                         AofPersistence.AUTO_AOF_REWRITE_PERCENTAGE, AofPersistence.AUTO_AOF_REWRITE_MIN_SIZE)),
                 "true", "正好 100%，走 >= 那一边");
         expectCell(seen, wrong, "默认门槛下只涨到 127mb ⇒ 不重写",
-                () -> yesNo(AofPersistence.shouldAutoRewrite(true, false, 127L * mb, 64L * mb,
+                () -> yesNo(AofPersistence.shouldAutoRewrite(true, false, false, 127L * mb, 64L * mb,
                         AofPersistence.AUTO_AOF_REWRITE_PERCENTAGE, AofPersistence.AUTO_AOF_REWRITE_MIN_SIZE)),
                 "false", "12700/64 整除得 198，减 100 是 98 —— 差 2 个百分点，不动");
 
-        // 8) 两个旋钮的默认值本身（server.h:98-99）
+        // 9) 两个旋钮的默认值本身（server.h:98-99）
         AofPersistence fresh = new AofPersistence();
         try {
             expectCell(seen, wrong, "默认百分比 100（server.h:98）",
@@ -127,7 +138,7 @@ class AofAutoRewriteTest {
                     () -> String.valueOf(fresh.getAutoAofRewriteMinSize()), String.valueOf(64L * mb),
                     "AOF_REWRITE_MIN_SIZE 是 64*1024*1024");
 
-            // 9) 越界：负数在配置那条路上就被拒（config.c:501-503 / :1160-1161 / :1262-1263），
+            // 10) 越界：负数在配置那条路上就被拒（config.c:501-503 / :1160-1161 / :1262-1263），
             //    而且拒了之后<em>原值不许变</em>。
             expectCell(seen, wrong, "设负百分比 ⇒ 拒",
                     () -> {

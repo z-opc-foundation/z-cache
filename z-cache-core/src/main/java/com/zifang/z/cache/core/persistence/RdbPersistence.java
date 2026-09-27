@@ -1141,4 +1141,19 @@ public class RdbPersistence {
     public boolean isStarted() {
         return started.get();
     }
+
+    /**
+     * 本台此刻是否有一次后台快照在跑 —— {@link #bgSaving} 那一个计数对外唯一的读口。
+     * <p>
+     * 存在的理由不止"BGSAVE 自己用它拒并发"：上游 serverCron 里那一拍在决定<em>要不要自动重写
+     * AOF</em> 之前先问 {@code server.rdb_child_pid == -1}（{@code server.c:1303}），也就是
+     * "有后台保存在跑就不换日志"。自动挡（{@code AofPersistence}）要问的是同一个数，
+     * 而它原来没有任何办法读到 —— 那一项条件因此在整个 13k 里缺席。
+     * </p>
+     *
+     * @return 有后台保存在跑返回 true
+     */
+    public boolean isBackgroundSaving() {
+        return bgSaving.get() != 0;
+    }
 }
