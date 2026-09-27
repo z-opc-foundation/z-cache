@@ -98,6 +98,9 @@ public class CommandHandler {
     private volatile long lastCommandMs = System.currentTimeMillis();
     private volatile String lastCommand = "NULL";
 
+    /** 上游的 {@code CLIENT_CLOSE_AFTER_REPLY}：这一条连接回完当前回应就该被服务端关掉。 */
+    private volatile boolean closeAfterReply;
+
     // ======================== 构造 ========================
 
     public CommandHandler(MemoryStore store) {
@@ -206,6 +209,15 @@ public class CommandHandler {
     }
 
     /**
+     * 这条连接处理完当前命令后该不该由服务端关闭。参照实测（{@code QUIT} 之后服务端 FIN，
+     * 客户端还能读到那一条 {@code +OK}）——所以关闭必须排在回写<em>之后</em>，
+     * 由 {@code RedisServerHandler} 拿 {@code ChannelFutureListener.CLOSE} 落地。
+     */
+    public boolean closeAfterReply() {
+        return closeAfterReply;
+    }
+
+    /**
      * 对外宣告的产品版本号。与 {@code ZCacheServerMain} 共用这一把尺：读打包进 MANIFEST 的
      * Implementation-Version，裸 IDE/classes 目录运行时读不到就如实报 dev，
      * 不再在任何地方硬写一个数字——上一版 INFO 里写着 1.0.2，而 pom 已经是 1.3.x。
@@ -282,6 +294,16 @@ public class CommandHandler {
         this.lastCommand = cmd;
         this.lastCommandMs = System.currentTimeMillis();
 
+        // QUIT 在<em>命令查表之前</em>就地处理（上游 server.c:2585-2596），所以后面那三道门
+        // （订阅态闸门／AUTH／MULTI 入队）都轮不到它：实测参照上 `QUIT extra` 回 +OK 而不是
+        // arity 错、带 requirepass 的服务器上未 AUTH 的连接问 QUIT 也回 +OK（不是 NOAUTH）、
+        // MULTI 期间它回 +OK（不是 +QUEUED）且队列里那条 SET 永远不被执行。
+        // 回写落地之后由服务端关连接，见 RedisServerHandler 的 ChannelFutureListener.CLOSE。
+        if ("QUIT".equals(cmd)) {
+            this.closeAfterReply = true;
+            return RespSimpleString.of("OK");
+        }
+
         // Pub/Sub 模式检查
         PubSubManager pubSub = pubSub();
         if (pubSub != null && channelContext != null && pubSub.isSubscribed(channelContext)) {
@@ -291,7 +313,8 @@ public class CommandHandler {
                 case "PSUBSCRIBE":   return handlePsubscribe(args);
                 case "PUNSUBSCRIBE": return handlePunsubscribe(args);
                 case "PING":         return pubSubPing(args);
-                case "QUIT":         return RespSimpleString.of("OK");
+                // 白名单里那一家 QUIT 不在这里出现：它在 handle() 更前面就被拦下了
+                // （上游把它放在查表之前），闸门这句文案里提到 QUIT 只是那句原文。
                 default:
                     // 上游闸门（server.c:2727-2733）打的是<em>这一句</em>，句子里不带命令名 ——
                     // 白名单外每一家（MULTI／SET／GET／EXEC／AUTH／INFO）回的都是同一串原文。
@@ -321,7 +344,6 @@ public class CommandHandler {
                 case "PING":     result = handlePing(args);       break;
                 case "ECHO":     result = handleEcho(args);       break;
                 case "TIME":     result = handleTime(args);       break;
-                case "QUIT":     result = RespSimpleString.of("OK"); break;
                 case "SELECT":   result = handleSelect(args);     break;
                 case "DBSIZE":   result = handleDbsize();         break;
                 case "SET":      result = handleSet(args);        break;

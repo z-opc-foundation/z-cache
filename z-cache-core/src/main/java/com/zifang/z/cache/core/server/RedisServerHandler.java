@@ -6,6 +6,7 @@ import com.zifang.z.cache.core.command.CommandHandler;
 import com.zifang.z.cache.core.command.ServerScope;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
+import io.netty.channel.ChannelFutureListener;
 import io.netty.util.concurrent.EventExecutorGroup;
 import org.apache.logging.log4j.LogManager;
 import com.zifang.z.cache.core.storage.MemoryStore;
@@ -65,6 +66,14 @@ public class RedisServerHandler extends SimpleChannelInboundHandler<Object> {
             logger.debug("Received: {}", msg);
         }
 
+        // QUIT 之后这条连接<em>不再应答任何命令</em>。参照实测：一次 write 里连着发 QUIT 与 PING，
+        // 服务端只回一帧 simple:OK，第二条命令的 +PONG 根本不存在（上游 processCommand 对
+        // QUIT 直接 return C_ERR，读循环当场跳出）。不拦这一层的话，解码器已经从同一个
+        // 读缓冲里拆出来的后续命令会被照常常通、于是同一条连接上多回一帧。
+        if (commandHandler.closeAfterReply()) {
+            return;
+        }
+
         // 确保 CommandHandler 持有当前 ctx
         commandHandler.setChannelContext(ctx);
 
@@ -80,7 +89,14 @@ public class RedisServerHandler extends SimpleChannelInboundHandler<Object> {
         Object response = commandHandler.handle(msg);
 
         if (response != null) {
-            ctx.writeAndFlush(response);
+            if (commandHandler.closeAfterReply()) {
+                // 上游那面旗叫 CLIENT_CLOSE_AFTER_REPLY，参照实测的顺序是"客户端先读到 +OK、
+                // 然后才看见 FIN"。这里直接 ctx.close() 会排在这次 writeAndFlush 前面，
+                // 那一形是"回应还没落地连接就断了"——正是量具要判红的形状。
+                ctx.writeAndFlush(response).addListener(ChannelFutureListener.CLOSE);
+            } else {
+                ctx.writeAndFlush(response);
+            }
         }
     }
 

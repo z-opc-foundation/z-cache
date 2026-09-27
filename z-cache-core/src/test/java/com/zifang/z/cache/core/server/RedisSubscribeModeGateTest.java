@@ -47,9 +47,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * ＋ {@code python3 ~/.cache/zcache_gauges/subscribe_gate_mut/cmp_gate.py}。</p>
  *
  * <p><em>不在本卡</em>：{@code QUIT} 回完 {@code +OK} 之后上游会<em>关连接</em>
- * （{@code server.c:2592-2596} 的 {@code CLIENT_CLOSE_AFTER_REPLY}），我方两跑都是
+ * （{@code server.c:2592-2596} 的 {@code CLIENT_CLOSE_AFTER_REPLY}）。改前我方两跑都是
  * {@code SOCK_CLOSED_BY_SERVER False} —— 帧对了、连接没关，那是另一件事（卡 #50），
- * 所以 {@code g11_quit#2} 只钉帧，不许顺手把"关"写进判据。</p>
+ * 所以 {@code g11_quit#2} 只钉帧，不许顺手把"关"写进本卡判据。"关"那一半从 13z 起
+ * 由 {@code RedisQuitCloseTest} 独立钉住（卡已闭），本卡这一格<em>仍然</em>只比帧：
+ * 两道判据各管一件事，改"关"的时候不会把"文案"那半绊红。</p>
  */
 class RedisSubscribeModeGateTest {
 
@@ -134,7 +136,7 @@ class RedisSubscribeModeGateTest {
             conn++;
             step(seen, wrong, wire, "g9_pattern_gate#1", conn, "PSUBSCRIBE x*", "['psubscribe','x*',1]");
             step(seen, wrong, wire, "g9_pattern_gate#2", conn, "MULTI", UPSTREAM);
-            // ---- g11_quit：帧在这一卡钉，"回完就关"归卡 #50 ----
+            // ---- g11_quit：本卡只钉帧；"回完 +OK 就关连接"13z 起归 RedisQuitCloseTest ----
             conn++;
             step(seen, wrong, wire, "g11_quit#1", conn, "SUBSCRIBE a", "['subscribe','a',1]");
             step(seen, wrong, wire, "g11_quit#2", conn, "QUIT", "simple:OK");
