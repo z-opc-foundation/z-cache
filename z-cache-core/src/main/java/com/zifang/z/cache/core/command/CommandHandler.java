@@ -436,6 +436,7 @@ public class CommandHandler {
                 case "FLUSHDB":  result = handleFlushdb();  break;
                 case "FLUSHALL": result = handleFlushall(); break;
                 case "INFO":     result = handleInfo(args);    break;
+                case "CONFIG":   result = handleConfig(args);  break;
                 case "CLIENT":   result = handleClient(args);  break;
                 case "DEBUG":    result = handleDebug(args);   break;
                 case "MONITOR":  result = handleMonitor(args);  break;
@@ -1970,6 +1971,135 @@ public class CommandHandler {
         }
         return RespSimpleString.of("Background append only file rewriting started");
     }
+
+    /**
+     * CONFIG 的 GET / SET 两支 —— 把自动挡的那两条旋钮接到命令层。
+     * <p>
+     * 上游 {@code configCommand}（{@code config.c:2248}）按 {@code argv[1]} 分五支：
+     * {@code help}（{@code :2255}，且要 {@code argc==2}）、{@code set}（{@code :2264}，
+     * {@code argc==4}）、{@code get}（{@code :2266}，{@code argc==3}）、{@code resetstat}
+     * （{@code :2268}）、{@code rewrite}（{@code :2272}），其余一律
+     * {@code addReplySubcommandSyntaxError}（{@code :2285} → {@code networking.c:623-629}），
+     * 那句里第一个占位是<b>照客户打进来</b>的那一串（{@code CONFIG FOO bar} 回的是 {@code 'FOO'}），
+     * 第二个才是大写后的命令名。命令表里 {@code config} 的 arity 是 {@code -2}
+     * （{@code server.c:271}），所以光一发 {@code CONFIG} 在进这个函数之前就被
+     * {@code server.c:2612-2615} 那句 {@code wrong number of arguments for 'config' command}
+     * 拦下 —— 名字是表里那一份，小写。
+     * </p>
+     * <p>
+     * 两条旋钮<i>各自用的尺不一样</i>，这一处最容易做错：percentage 走
+     * {@code config_set_numerical_field}（{@code config.c:877-882}，{@code getLongLongFromObject}
+     * 那一把不带单位的整数尺，范围 {@code 0..INT_MAX}，见 {@code :1161}），min-size 走
+     * {@code config_set_memory_field}（{@code :884-888}，{@code memtoll}，范围
+     * {@code 0..LONG_MAX}，见 {@code :1262}）。于是 {@code CONFIG SET auto-aof-rewrite-min-size 100mb}
+     * 收，而 {@code 100mb} 给 percentage 必须拒；同一道理，{@code 05} 在 percentage 那把尺上是
+     * badfmt（{@code RedisIntegerFormat} 不收前导零），给 min-size 反倒收（{@code strtoll} 收）。
+     * 两条都拒时回的是同一句 {@code Invalid argument '%s' for CONFIG SET '%s'}
+     * （{@code :1285-1287}，<b>先值后名</b>，两个占位都照打的写法），名字认不出则是
+     * {@code Unsupported CONFIG parameter: %s}（{@code :1276-1277}）—— 所以顺序必须是
+     * 认名字 → 验格式 → 找落点，反过来会把"我们压根不认识的参数"报成格式错。
+     * </p>
+     * <p>
+     * {@code GET} 那一侧：{@code configGetCommand}（{@code :1328}）先挂一个延迟数组
+     * （{@code :1330}），每命中一条塞<b>两个 bulk</b>（{@code config_get_numerical_field}，
+     * {@code :1311-1319}），匹配用 {@code stringmatch(pattern,name,1)}（{@code util.c:48} 与
+     * {@code :170}，最后一个 1 = 不分大小写）—— 也就是 {@code ?} 与 {@code [..]} 都算数，
+     * 不是"只有星号能用"的简写。顺序按表里出现的先后：percentage（{@code :1361}）在
+     * min-size（{@code :1363}）之前。一条都不命中就是空数组 {@code *0}。值经 {@code ll2string}
+     * 打回十进制，<b>不</b>带单位。
+     * </p>
+     * <p>
+     * <b>三处与上游不等价，都是明写的</b>（判据在 {@code RedisConfigCommandTest} 的类注释里同一份）：
+     * <ol>
+     *   <li>只接这两条名字，{@code CONFIG GET *} 因此只有四个元素，上游是三千多个。</li>
+     *   <li>没配 dataDir 的那一台：{@code GET} 照答编译期默认值，{@code SET} 却如实报错。
+     *       上游那两个字段是 {@code server} 结构里的裸变量，不存在"落点没有"这一说，收下就一定生效；
+     *       我们的旋钮住在 {@link AofPersistence} 里，而它只在有 dataDir 时才存在。回一句
+     *       {@code +OK} 等于"收下而没人管"，比报错更坏。真正的修法是让配置持有者总是存在（已记待办）。</li>
+     *   <li>{@code RESETSTAT} / {@code REWRITE} 没接，落回上游那句子命令语法错 —— 与
+     *       {@code CONFIG HELP} 只列 GET/SET 互相咬合：HELP 里不许有做不到的子命令。</li>
+     * </ol>
+     */
+    private Object handleConfig(String[] args) {
+        if (args.length < 2) return RespError.wrongNumberOfArguments("config");
+        String typed = args[1];
+        if (args.length == 2 && "help".equalsIgnoreCase(typed)) {
+            return helpStatusArray(CONFIG_HELP);
+        }
+        if ("set".equalsIgnoreCase(typed) && args.length == 4) return configSet(args[2], args[3]);
+        if ("get".equalsIgnoreCase(typed) && args.length == 3) return configGet(args[2]);
+        return RespError.of("ERR", "Unknown subcommand or wrong number of arguments for '" + typed
+                + "'. Try CONFIG HELP.");
+    }
+
+    /** {@code configGetCommand}：延迟数组 + 每条命中塞两个 bulk，一条不命中就是 {@code *0}。 */
+    private Object configGet(String pattern) {
+        AofPersistence a = aof();
+        int percentage = a == null ? AofPersistence.AUTO_AOF_REWRITE_PERCENTAGE
+                : a.getAutoAofRewritePercentage();
+        long minSize = a == null ? AofPersistence.AUTO_AOF_REWRITE_MIN_SIZE
+                : a.getAutoAofRewriteMinSize();
+        List<Object> out = new ArrayList<>(4);
+        if (RedisGlob.matches(pattern, AUTO_AOF_REWRITE_PERCENTAGE, true)) {
+            out.add(RespBulkString.of(AUTO_AOF_REWRITE_PERCENTAGE));
+            out.add(RespBulkString.of(String.valueOf(percentage)));
+        }
+        if (RedisGlob.matches(pattern, AUTO_AOF_REWRITE_MIN_SIZE, true)) {
+            out.add(RespBulkString.of(AUTO_AOF_REWRITE_MIN_SIZE));
+            out.add(RespBulkString.of(String.valueOf(minSize)));
+        }
+        return RespArray.of(out);
+    }
+
+    private Object configSet(String name, String value) {
+        if (AUTO_AOF_REWRITE_PERCENTAGE.equalsIgnoreCase(name)) {
+            Long v = RedisIntegerFormat.parse(value);
+            if (v == null || v.longValue() < 0L || v.longValue() > Integer.MAX_VALUE) {
+                return configBadfmt(name, value);
+            }
+            AofPersistence a = aof();
+            if (a == null) return noLandingSpot(name);
+            a.setAutoAofRewritePercentage(v.intValue());
+            return RespSimpleString.of("OK");
+        }
+        if (AUTO_AOF_REWRITE_MIN_SIZE.equalsIgnoreCase(name)) {
+            Long v = RedisMemoryFormat.parse(value);
+            if (v == null || v.longValue() < 0L) {
+                return configBadfmt(name, value);
+            }
+            AofPersistence a = aof();
+            if (a == null) return noLandingSpot(name);
+            a.setAutoAofRewriteMinSize(v.longValue());
+            return RespSimpleString.of("OK");
+        }
+        return RespError.of("ERR", "Unsupported CONFIG parameter: " + name);
+    }
+
+    /** {@code config.c:1285-1287}：先值后名，两个占位都是打进来的那一串原样。 */
+    private static RespError configBadfmt(String name, String value) {
+        return RespError.of("ERR", "Invalid argument '" + value + "' for CONFIG SET '" + name + "'");
+    }
+
+    /** 上游没有这一句：见 {@link #handleConfig} 注释里的第 2 条差距。 */
+    private static RespError noLandingSpot(String name) {
+        return RespError.of("ERR", "CONFIG SET '" + name
+                + "' is not supported: no data directory configured");
+    }
+
+    /** 上游表里的名字原文（{@code config.c:1161}、{@code :1262}）；{@code GET} 打回的就是这一串。 */
+    private static final String AUTO_AOF_REWRITE_PERCENTAGE = "auto-aof-rewrite-percentage";
+    private static final String AUTO_AOF_REWRITE_MIN_SIZE = "auto-aof-rewrite-min-size";
+
+    /**
+     * {@code config.c:2256-2261} 的 {@code help[]} 有四条，这里只写做得到的两条：把
+     * {@code RESETSTAT} / {@code REWRITE} 列出去，就是拿 HELP 承诺一个当场会落回
+     * "Unknown subcommand"的子命令。表头那一行是 {@code addReplyHelp}
+     * （{@code networking.c:604-611}）的模板，命令名取大写；每一条都是状态串（{@code +}）。
+     */
+    private static final List<String> CONFIG_HELP = Collections.unmodifiableList(Arrays.asList(
+            "CONFIG <subcommand> arg arg ... arg. Subcommands are:",
+            "GET <pattern> -- Return parameters matching the glob-like <pattern> and their values.",
+            "SET <parameter> <value> -- Set parameter to value."));
 
     /** LASTSAVE — 最近一次成功快照的 Unix 秒；从未成功过则为 0，不再拿当前时间冒充。 */
     private Object handleLastsave() {

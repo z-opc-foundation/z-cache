@@ -2976,12 +2976,22 @@ class RedisServerProtocolSemanticsTest {
             assertEquals(":0", readReply(in));
             send(socket, "SET", "w:future", "v");
             assertEquals("+OK", readReply(in));
-            send(socket, "EXPIREAT", "w:future", "4000000000");
+            // 这一格原先钉的是一个写死的地板 2_209_500_000，旁边的注释抄的是"实测 2209587794 量级"
+            // —— 那是 2026-09-27 之前的某天量出来的读数。EXPIREAT 用的是绝对时刻，于是
+            // TTL = 4000000000 − now 逐日缩小，本机 17:2x 那一跑量到 :2209498851，比地板小 1 秒
+            // 当场红（服务端算得没错，是这把尺自己走上门）。现在两头同一次取样、比的是差值。
+            long atSeconds = 4_000_000_000L;
+            long sentAtSec = System.currentTimeMillis() / 1000L;
+            send(socket, "EXPIREAT", "w:future", String.valueOf(atSeconds));
             assertEquals(":1", readReply(in));
             send(socket, "TTL", "w:future");
             String farTtl = readReply(in);
-            assertTrue(farTtl.startsWith(":") && Long.parseLong(farTtl.substring(1)) > 2_209_500_000L,
-                    "时刻在远未来时 TTL 要照它算（实测 2209587794 量级）: " + farTtl);
+            assertTrue(farTtl.startsWith(":"), "TTL 回的要是一个整数: " + farTtl);
+            long ttlSeen = Long.parseLong(farTtl.substring(1));
+            long remaining = atSeconds - sentAtSec;
+            assertTrue(ttlSeen <= remaining && ttlSeen >= remaining - 2L,
+                    "TTL 要照那个绝对时刻算：期望落在 (" + (remaining - 2L) + ", " + remaining
+                            + "]，实际 " + ttlSeen + "（答复原文 " + farTtl + "）");
             send(socket, "EXPIREAT", "w:nope", "4102444800");
             assertEquals(":0", readReply(in), "不存在的键回 0");
             send(socket, "EXPIREAT", "w:future", "abc");
