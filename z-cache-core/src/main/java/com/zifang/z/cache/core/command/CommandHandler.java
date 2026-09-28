@@ -1470,9 +1470,10 @@ public class CommandHandler {
     @SuppressWarnings("unchecked")
     private Object handleHscan(String[] args) {
         if (args.length < 3) return RespError.wrongNumberOfArguments("HSCAN");
-        String pattern = null;
-        for (int i = 3; i < args.length; i++) if ("MATCH".equalsIgnoreCase(args[i]) && i+1<args.length) pattern = args[++i];
-        Object[] sr = store.getHashStore(currentDb).hscan(args[1], args[2], pattern);
+        if (!scanCursorAccepted(args[2])) return RespError.of("ERR", "invalid cursor");
+        ScanOptions opt = scanOptions(args, 3);
+        if (opt.error != null) return opt.error;
+        Object[] sr = store.getHashStore(currentDb).hscan(args[1], args[2], opt.pattern);
         Map<String,byte[]> m = (Map<String,byte[]>)sr[1];
         List<Object> fv = new ArrayList<>();
         for (Map.Entry<String,byte[]> e : m.entrySet()) { fv.add(RespBulkString.of(e.getKey())); fv.add(e.getValue()==null?RespBulkString.nullBulkString():RespBulkString.of(e.getValue())); }
@@ -4183,11 +4184,12 @@ public class CommandHandler {
 
     private Object handleSscan(String[] args) {
         if (args.length < 3) return RespError.wrongNumberOfArguments("SSCAN");
-        String pattern = null;
-        for (int i = 3; i < args.length; i++) {
-            if ("MATCH".equalsIgnoreCase(args[i]) && i + 1 < args.length) pattern = args[++i];
-        }
-        Object[] sr = store.getSetStore(currentDb).sscan(args[1], args[2], pattern);
+        // 这一家以前只有<em>半个</em>文法：只挑 MATCH，游标不判、COUNT 与认不得的尾巴静默吞掉
+        // （卡 #52）。四家共用的是 scanCursorAccepted + scanOptions 那两把尺。
+        if (!scanCursorAccepted(args[2])) return RespError.of("ERR", "invalid cursor");
+        ScanOptions opt = scanOptions(args, 3);
+        if (opt.error != null) return opt.error;
+        Object[] sr = store.getSetStore(currentDb).sscan(args[1], args[2], opt.pattern);
         List<byte[]> members = (List<byte[]>) sr[1];
         Object[] r = new Object[members.size()];
         for (int i = 0; i < members.size(); i++) r[i] = RespBulkString.of(members.get(i));
@@ -4198,11 +4200,10 @@ public class CommandHandler {
 
     private Object handleZscan(String[] args) {
         if (args.length < 3) return RespError.wrongNumberOfArguments("ZSCAN");
-        String pattern = null;
-        for (int i = 3; i < args.length; i++) {
-            if ("MATCH".equalsIgnoreCase(args[i]) && i + 1 < args.length) pattern = args[++i];
-        }
-        Object[] sr = store.getSortedSetStore(currentDb).zscan(args[1], args[2], pattern);
+        if (!scanCursorAccepted(args[2])) return RespError.of("ERR", "invalid cursor");
+        ScanOptions opt = scanOptions(args, 3);
+        if (opt.error != null) return opt.error;
+        Object[] sr = store.getSortedSetStore(currentDb).zscan(args[1], args[2], opt.pattern);
         // 负载是 member,score 成对平铺（上游 scanCallback 把分数 append 进同一个列表），
         // 所以这里的元素数天然是偶数 —— 命令层不再"按成员数"算任何东西。
         List<byte[]> payload = (List<byte[]>) sr[1];
@@ -4211,26 +4212,92 @@ public class CommandHandler {
         return RespArray.of(new Object[]{RespBulkString.of((String) sr[0]), RespArray.of(r)});
     }
 
+    // ==================== SCAN 一族的文法（游标 + 选项），四家共用 ====================
+
+    /** C locale 的 isspace 只认这六枚。NBSP（U+00A0）<em>不</em>在其中 —— 实测参照对
+     *  {@code SCAN <NBSP>0} 回的是 invalid cursor，而 {@link Character#isWhitespace} 会把 NBSP
+     *  判成空白，所以这一栏不许换成 isWhitespace。 */
+    private static final String ASCII_SPACE = " \t\n\r\u000B\f";
+
+    /** 上游 {@code parseScanCursorOrReply}（db.c:598-611）那三条件一把尺，四家 scan 共用：
+     *  走的是 <em>无符号</em> 的 strtoul（db.c:604，注释写明"getLongLongFromObject 盖不住整个
+     *  游标空间"），所以 {@code ""}、{@code "+1"}、{@code "-1"}（折成 ULONG_MAX）、
+     *  {@code ULONG_MAX} 本身、前导零<em>全都收</em>；拒的是首字符是空白（:605 第一个条件）、
+     *  一个数字都没吃到或数字后面还有东西（{@code eptr[0] != '\0'}）、绝对值超过 ULONG_MAX
+     *  （errno == ERANGE）。这一条与 {@link RedisIntegerFormat} 那把<em>有符号 LONG_MAX</em>
+     *  尺是两个文法：13y 那轮 SCAN 用了它，于是 "18446744073709551615" 这枚合法游标被当成
+     *  坏游标拒掉（实测参照收它，且把我方这一形钉在 scan_grammar_mut 的量具里）。 */
+    private static boolean scanCursorAccepted(String text) {
+        int n = text.length();
+        if (n == 0) return true;                  // isspace('\0')==false，strtoul("")==0，eptr==ptr
+        if (ASCII_SPACE.indexOf(text.charAt(0)) >= 0) return false;
+        int i = (text.charAt(0) == '+' || text.charAt(0) == '-') ? 1 : 0;
+        int end = i;
+        while (end < n && text.charAt(end) >= '0' && text.charAt(end) <= '9') end++;
+        if (end == i || end != n) return false;   // 数字没吃到，或数字后面还有别的：eptr[0] != '\0'
+        int z = i;
+        while (z < end - 1 && text.charAt(z) == '0') z++;
+        String mag = text.substring(z, end);      // 前导零不参与数值比较
+        return mag.length() < 20
+                || (mag.length() == 20 && mag.compareTo("18446744073709551615") <= 0);
+    }
+
+    /** {@link #scanOptions} 的结果：{@code error} 非 null 就是要原样发出去的那条回复，
+     *  此时另两个字段无意义。 */
+    private static final class ScanOptions {
+        final Object error;
+        final String pattern;
+        final int count;
+
+        private ScanOptions(Object error, String pattern, int count) {
+            this.error = error;
+            this.pattern = pattern;
+            this.count = count;
+        }
+
+        static ScanOptions reply(Object r) {
+            return new ScanOptions(r, null, 0);
+        }
+    }
+
+    /** 上游 {@code scanGenericCommand} 的 "Step 1: Parse options"（db.c:642-670），
+     *  SCAN/HSCAN/SSCAN/ZSCAN 四家跑的就是<em>同一段</em>：COUNT 得带值（:644 的 {@code j >= 2}）、
+     *  得过 getLongFromObjectOrReply（:645）、还得过 {@code count < 1}（:651-653，那一支回的是
+     *  syntax error <em>不是</em> out of range）；MATCH 得带值（:657）；其余任何尾巴都是
+     *  syntax error（:666-668）。{@code from} 就是 :639 那句 {@code i = (o == NULL) ? 2 : 3}。
+     *  游标那一关<em>在此之前</em>（三家在 t_hash.c:830 / t_set.c:1114 / t_zset.c:3132，
+     *  SCAN 在 db.c:804）—— 实测 {@code HSCAN g_hash abc EXTRA} 回 invalid cursor 而不是
+     *  syntax error。 */
+    private static ScanOptions scanOptions(String[] args, int from) {
+        String pattern = null;
+        int count = 10;
+        for (int i = from; i < args.length; i++) {
+            int left = args.length - i;
+            if ("COUNT".equalsIgnoreCase(args[i]) && left >= 2) {
+                int v = intArg(args[++i]);
+                if (v < 1) return ScanOptions.reply(RespError.syntaxError());
+                count = v;
+            } else if ("MATCH".equalsIgnoreCase(args[i]) && left >= 2) {
+                pattern = args[++i];
+            } else {
+                return ScanOptions.reply(RespError.syntaxError());
+            }
+        }
+        return new ScanOptions(null, pattern, count);
+    }
+
     // ==================== SCAN 命令 ====================
 
     private Object handleScan(String[] args) {
         if (args.length < 2) return RespError.wrongNumberOfArguments("SCAN");
-        String cursor = args[1];
-        // 游标不合整数语法就是 invalid cursor（实测 battery38 第 33 行）。以前存储层把坏游标
-        // 当 0 从头再扫一遍：客户端的一个拼写错变成一次全库重扫，而且和"这一轮真扫完了"
-        // 的 0 号游标根本分不开。
-        if (RedisIntegerFormat.parse(cursor) == null) return RespError.of("ERR", "invalid cursor");
-        String pattern = null;
-        int count = 10;
-        for (int i = 2; i < args.length; i++) {
-            if ("MATCH".equalsIgnoreCase(args[i]) && i + 1 < args.length) pattern = args[++i];
-            else if ("COUNT".equalsIgnoreCase(args[i]) && i + 1 < args.length) count = intArg(args[++i]);
-            // 认不得的尾巴、以及只有旗标没有值（COUNT/MATCH 落在末尾）都是 syntax error
-            // （实测 {@code SCAN 0 abc} → syntax error，battery38 第 35 行；
-            //  而 {@code SCAN 0 COUNT abc} 是整数那句，第 34 行 —— 两档不能合并）。
-            else return RespError.syntaxError();
-        }
-        Object[] scanResult = store.scan(currentDb, cursor, pattern, count);
+        // 游标那一关排在选项之前（上游 scanCommand 在 db.c:804 先 parseScanCursorOrReply，
+        // 才进 scanGenericCommand 的 Step 1 —— 实测 {@code SCAN abc EXTRA} 回 invalid cursor）。
+        // 尺也换了：以前这里拿 RedisIntegerFormat 那把<em>有符号</em>尺当游标尺，""、"+1"、
+        // ULONG_MAX 三枚合法游标被判成坏游标（实测参照收它们）。
+        if (!scanCursorAccepted(args[1])) return RespError.of("ERR", "invalid cursor");
+        ScanOptions opt = scanOptions(args, 2);
+        if (opt.error != null) return opt.error;
+        Object[] scanResult = store.scan(currentDb, args[1], opt.pattern, opt.count);
         String nextCursor = (String) scanResult[0];
         List<String> keys = (List<String>) scanResult[1];
         Object[] r = new Object[keys.size()];
