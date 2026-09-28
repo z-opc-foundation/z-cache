@@ -53,15 +53,16 @@
         </dependency>
 
         <!-- Z-Serialize: zero-copy, schema-first binary codec -->
+        <!-- 版本不写：由 z-boot-parent import 的 z-boot-fleet 下发（面值 1.0.13）。
+             以前这里自己钉 ${z-util.version}，属性在本仓根 pom 里 —— 那一格和 fleet 是同值两份账，
+             fleet 抬号时本仓不会跟着动，漂移就是这么来的。 -->
         <dependency>
             <groupId>io.github.yuku123</groupId>
             <artifactId>z-util-serialize-core</artifactId>
-            <version>${z-util.version}</version>
         </dependency>
         <dependency>
             <groupId>io.github.yuku123</groupId>
             <artifactId>z-util-serialize-schema</artifactId>
-            <version>${z-util.version}</version>
         </dependency>
 
         <dependency>

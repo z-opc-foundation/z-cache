@@ -4,15 +4,18 @@
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
+    <!-- 消费入口统一走 z-boot-parent（1.0.19 起全组织口径）：继承第三方地板 + import 兄弟仓 fleet
+         + Java 8 的 pluginManagement。以前这里的 parent 是 com.zifang:z-opc:1.0.0-SNAPSHOT —— 那个
+         pom 只存在于作者本机的 ~/.m2（relativePath 指的 ../pom.xml 根本不存在），换台机器连 pom
+         都读不动；对外发布的件靠 flatten oss 把 parent 剥掉了，所以 Central 消费者没受影响，
+         但"源码能被别人构建"这件事一直是假的。
+         relativePath 必须留空：parent 不在磁盘上，在 repo1。 -->
     <parent>
-        <groupId>com.zifang</groupId>
-        <artifactId>z-opc</artifactId>
-        <version>1.0.0-SNAPSHOT</version>
-        <relativePath>../pom.xml</relativePath>
+        <groupId>io.github.yuku123</groupId>
+        <artifactId>z-boot-parent</artifactId>
+        <version>1.0.19</version>
+        <relativePath/>
     </parent>
-
-    <!-- Maven Central 用 io.github.yuku123（已通过 Sonatype namespace 验证）
-         显式覆盖 parent 的 com.zifang，保留 parent 仅用于继承 monorepo 本地构建链 -->
     <groupId>io.github.yuku123</groupId>
     <artifactId>z-cache</artifactId>
     <version>1.3.6</version>
@@ -56,34 +59,92 @@
     </scm>
 
     <properties>
-        <maven.compiler.source>8</maven.compiler.source>
-        <maven.compiler.target>8</maven.compiler.target>
-        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <netty.version>4.1.138.Final</netty.version>
-        <!-- 日志只有一个家族：log4j2。钉 2.17.2 不是"随手沿用旧值"，是零漂移：core/client 今天引的
-             就是 2.17.2，而 spring-boot 2.7.18 的 `spring-boot-starter-log4j2` 带的
-             log4j-core / log4j-slf4j-impl / log4j-jul 也全是 2.17.2 ⇒ "我们的 BOM"与"spring 那一侧"
-             是同一版，不会像 13t 之前那样在测试类路径上同时出现 2.17.2 的 api 与 2.25.4 的桥。
-             抬版本是另一个决定（要连 Java 8 字节码一起验），不在这一格里顺手做。 -->
+        <!-- 版本口径全部由 parent 下发，这里只留**本仓有意与地板不同**的那一格：
+             netty 4.1.138.Final / z-util 1.0.13 与 floor+fleet 面值一致 ⇒ 属性删掉，
+             由 parent 的 dependencyManagement 供（曾经这里自己钉一份，就是"每个仓自己起名字"的账）。
+             log4j2 反过来必须留着：地板是 2.25.4，本仓要 2.17.2，理由是下面这段零漂移判断。 -->
         <log4j2.version>2.17.2</log4j2.version>
-        <z-util.version>1.0.13</z-util.version>
     </properties>
 
     <dependencyManagement>
         <dependencies>
+            <!-- 本仓自家 5 个模块钉 ${project.version}。这一格不是装饰：fleet 里 z-cache 那一格
+                 钉的是 repo1 上最新的 **1.3.5**，而继承来的 DM 会改写**传递依赖**的版本 ⇒
+                 z-cache-server 的 shade fat jar 实测把 1.3.5 的 z-cache-common 字节码打进了
+                 1.3.6 的包里（迁移前更糟：z-opc 的 DM 压成 1.3.4）。写上这 5 条以后 child 的 DM
+                 压过 parent 的，tree 与 shaded jar 都回到 1.3.6。
+                 每个多模块仓迁到 parent 都要做这一步，否则"仓内构建"会被对外面值反向污染。 -->
             <dependency>
-                <groupId>io.netty</groupId>
-                <artifactId>netty-bom</artifactId>
-                <version>${netty.version}</version>
-                <type>pom</type>
-                <scope>import</scope>
+                <groupId>io.github.yuku123</groupId>
+                <artifactId>z-cache-common</artifactId>
+                <version>${project.version}</version>
             </dependency>
+            <dependency>
+                <groupId>io.github.yuku123</groupId>
+                <artifactId>z-cache-core</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.github.yuku123</groupId>
+                <artifactId>z-cache-client</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.github.yuku123</groupId>
+                <artifactId>z-cache-server</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>io.github.yuku123</groupId>
+                <artifactId>z-cache-spring-boot-starter</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <!-- netty-bom 的 import 删掉：z-boot-dependencies 已经 import 了同一个
+                 io.netty:netty-bom（面值 4.1.138.Final，与本仓迁移前逐字节相同，
+                 迁移后 dependency:tree 的 io.netty 9 件版本一件没动）。 -->
             <dependency>
                 <groupId>org.apache.logging.log4j</groupId>
                 <artifactId>log4j-bom</artifactId>
                 <version>${log4j2.version}</version>
                 <type>pom</type>
                 <scope>import</scope>
+            </dependency>
+            <!-- 日志只有一个家族：log4j2。钉 2.17.2 不是"随手沿用旧值"，是零漂移：core/client 今天引的
+                 就是 2.17.2，而 spring-boot 2.7.18 的 `spring-boot-starter-log4j2` 带的
+                 log4j-core / log4j-slf4j-impl / log4j-jul 也全是 2.17.2 ⇒ "我们的 BOM"与"spring 那一侧"
+                 是同一版，不会像 13t 之前那样在测试类路径上同时出现 2.17.2 的 api 与 2.25.4 的桥。
+                 抬版本是另一个决定（要连 Java 8 字节码一起验），不在这一格里顺手做。
+                 ⚠ 光靠上面那条 import **顶不住**：地板把 log4j-api/core/jul/slf4j-impl 四条**直接**钉在
+                 2.25.4，而"继承来的直接 DM 条目"优先级高于"本仓 import 进来的 BOM" —— 实测迁移后
+                 dependency:tree 里 4 件全漂到 2.25.4，所以必须按坐标逐条写直接条目才能压回去。
+                 这四条是量出来的（tree 里 io.github...log4j 命中 4 个坐标），不是抄的。 -->
+            <dependency>
+                <groupId>org.apache.logging.log4j</groupId>
+                <artifactId>log4j-api</artifactId>
+                <version>${log4j2.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.apache.logging.log4j</groupId>
+                <artifactId>log4j-core</artifactId>
+                <version>${log4j2.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.apache.logging.log4j</groupId>
+                <artifactId>log4j-jul</artifactId>
+                <version>${log4j2.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>org.apache.logging.log4j</groupId>
+                <artifactId>log4j-slf4j-impl</artifactId>
+                <version>${log4j2.version}</version>
+            </dependency>
+            <!-- snakeyaml 同理要显式顶住：monorepo 那侧的 DM 钉的是 2.0（CVE-2022-1471 那一串），
+                 而地板跟着 spring-boot-dependencies 2.7.18 走 1.30 ⇒ 不写这条就静默降版本。
+                 这属于"该由地板统一决定"的格子，先在本仓保住不掉，最终口径待 CEO 判。 -->
+            <dependency>
+                <groupId>org.yaml</groupId>
+                <artifactId>snakeyaml</artifactId>
+                <version>2.0</version>
             </dependency>
             <!-- slf4j-api / logback-classic 的 managed 条目整批删掉：这一族不再是我们的
                  实现选择（代码里 18 处 logger 全部 import org.apache.logging.log4j，
@@ -198,7 +259,12 @@
                             <failOnError>false</failOnError>
                             <failOnWarnings>false</failOnWarnings>
                             <quiet>true</quiet>
-                            <source>${compile.version}</source>
+                            <!-- 这里原先写的是 ${compile.version}：全仓 11 个 pom 引用这个属性，
+                                 只有本仓没有定义它，父链（com.zifang:z-opc）里也没有 ⇒ 传到
+                                 javadoc 插件手里是字面量 "${compile.version}"。因为上面挂着
+                                 failOnError=false，它不炸构建，只让 -source 变成无效参数，
+                                 所以这处点伤一直没人看见。改成 parent 下发的 Java 口径。 -->
+                            <source>${maven.compiler.source}</source>
                         </configuration>
                         <executions>
                             <execution>
