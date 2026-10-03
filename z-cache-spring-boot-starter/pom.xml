@@ -50,6 +50,41 @@
             <artifactId>z-cache-client</artifactId>
             <version>${project.version}</version>
         </dependency>
+        <!-- 2026-10-03: host/ 包 (CacheProxyController / ZCacheEmbeddedServerConfig,
+             自 z-opc main-starter 平移) 引 RedisServer/MemoryStore.
+             provided: 宿主内嵌模式才用; 纯 client 消费方不背这个包. -->
+        <dependency>
+            <groupId>io.github.yuku123</groupId>
+            <artifactId>z-cache-core</artifactId>
+            <version>${project.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <!-- host/CacheProxyController 是 @RestController: servlet + spring-webmvc 由宿主供 -->
+        <dependency>
+            <groupId>javax.servlet</groupId>
+            <artifactId>javax.servlet-api</artifactId>
+            <version>4.0.1</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-webmvc</artifactId>
+            <version>5.3.31</version>
+            <scope>provided</scope>
+        </dependency>
+        <!-- host 类的 jackson (ObjectMapper) 与 slf4j-api: 均由宿主运行时供 -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>2.13.5</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>1.7.36</version>
+            <scope>provided</scope>
+        </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-autoconfigure</artifactId>
