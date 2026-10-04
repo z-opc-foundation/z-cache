@@ -1,8 +1,8 @@
 package com.zifang.z.cache.spring.host;
 
 import com.zifang.z.cache.core.server.RedisServer;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Configuration;
 
@@ -28,7 +28,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 @ConditionalOnProperty(prefix = "z.cache", name = "enabled", havingValue = "true")
 public class ZCacheEmbeddedServerConfig {
 
-    private static final Logger log = LoggerFactory.getLogger(ZCacheEmbeddedServerConfig.class);
+    private static final Logger log = LogManager.getLogger(ZCacheEmbeddedServerConfig.class);
 
     private static volatile RedisServer SHARED_SERVER;
     private static final AtomicBoolean SERVER_STARTED = new AtomicBoolean(false);

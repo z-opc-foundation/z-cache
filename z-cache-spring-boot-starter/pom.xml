@@ -72,18 +72,25 @@
             <version>5.3.31</version>
             <scope>provided</scope>
         </dependency>
-        <!-- host 类的 jackson (ObjectMapper) 与 slf4j-api: 均由宿主运行时供 -->
+        <!-- host 类的 jackson (ObjectMapper) 由宿主运行时供。
+             原来这里还有一条 slf4j-api，是给 ZCacheEmbeddedServerConfig 用的；
+             该类已改用 log4j2（LogManager.getLogger），本模块 src/main 下再无 org.slf4j 引用，
+             这条依赖就成了纯外来日志家族 —— LoggingFamilyGuardTest 判它违规。
+             记日志只走 log4j2 一家，别为了少改一个 import 把外来家族挂在 classpath 上。 -->
         <dependency>
             <groupId>com.fasterxml.jackson.core</groupId>
             <artifactId>jackson-databind</artifactId>
             <version>2.13.5</version>
             <scope>provided</scope>
         </dependency>
+        <!-- 记日志走 log4j2：ZCacheEmbeddedServerConfig 从 slf4j 换过来后，
+             本模块 src/main 有了 log4j2 调用，就必须自己声明 log4j-api
+             （只带 API 不带实现，版本由 parent/fleet 统一下发，与 z-cache-core 同口径）。
+             LoggingFamilyGuardTest 的 aModuleThatLogsDeclaresTheApiItLogsThrough 守着这条：
+             记日志的模块没声明自己用的那支 API ⇒ 换机器/换 parent 时可能直接编译不过。 -->
         <dependency>
-            <groupId>org.slf4j</groupId>
-            <artifactId>slf4j-api</artifactId>
-            <version>1.7.36</version>
-            <scope>provided</scope>
+            <groupId>org.apache.logging.log4j</groupId>
+            <artifactId>log4j-api</artifactId>
         </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
