@@ -19,7 +19,13 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# 仓根 = 从本脚本所在目录向上找第一个带 pom.xml 的目录。
+# 不用固定的 ../.. —— 脚本目录深度各仓不同（_doc/003_script 是两层，z-mcp/tools 是一层）。
+REPO_ROOT="$SCRIPT_DIR"
+while [ ! -f "$REPO_ROOT/pom.xml" ] && [ "$REPO_ROOT" != "/" ]; do
+    REPO_ROOT="$(dirname "$REPO_ROOT")"
+done
+[ -f "$REPO_ROOT/pom.xml" ] || { echo "[verify] 找不到仓根 pom.xml（从 $SCRIPT_DIR 向上）"; exit 1; }
 GROUP_ID="${VERIFY_GROUP_ID:-io.github.yuku123}"
 CENTRAL="${CENTRAL_BASE:-https://repo1.maven.org/maven2}"
 SKIP_SIG="${VERIFY_SKIP_SIGNATURE:-0}"
@@ -107,7 +113,13 @@ PY
 
 # ---------- 探测 ----------
 probe() {  # $1=url → http code
-    curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$1" 2>/dev/null || echo "000"
+    # 只取 curl 的 %{http_code}。curl 自身失败（非 0 退出）时 stdout 可能仍带残缺输出，
+    # 早期写法 `curl ... || echo 000` 会把两者粘在一起（真出现过 "200000" 这种 6 位码）
+    # ⇒ 统一在这里收口，并把结果规整成 3 位。
+    local code
+    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$1" 2>/dev/null)
+    code=$(printf '%s' "$code" | grep -oE '^[0-9]{3}$' || true)
+    printf '%s' "${code:-000}"
 }
 fetch() { curl -s --max-time 30 "$1" 2>/dev/null; }
 
@@ -178,14 +190,27 @@ fi
 CLASSPICK="verify-classes.txt"
 SRCJAR=""
 LISTING=""
+CANDIDATE=""
 if [ -f "$SCRIPT_DIR/$CLASSPICK" ]; then
     echo ""
     echo "──────── 3. sources.jar 内容抽检 ────────"
-    CANDIDATE=""
-    while IFS= read -r cls; do
-        [ -z "$cls" ] && continue
-        aid=$(echo "$cls" | cut -d: -f1); path=$(echo "$cls" | cut -d: -f2)
-        if [ -z "$CANDIDATE" ]; then
+    # 逐行：跳过空行与 # 注释；每行必须能 cut 出 artifactId 与路径两段。
+    while IFS= read -r cls || [ -n "$cls" ]; do
+        cls="${cls%%$'\r'}"                 # 兼容 CRLF
+        case "$cls" in
+            ""|\#*) continue ;;
+        esac
+        aid=$(echo "$cls" | cut -d: -f1)
+        path=$(echo "$cls" | cut -d: -f2-)
+        aid="$(echo "$aid" | tr -d '[:space:]')"
+        path="$(echo "$path" | tr -d '[:space:]')"
+        if [ -z "$aid" ] || [ -z "$path" ] || [ "$aid" = "$cls" ]; then
+            err "无法解析 $CLASSPICK 的一行（需为 <artifactId>:<类路径>）：$cls"
+            continue
+        fi
+        if [ "$aid" != "$CANDIDATE" ]; then
+            # 换了 artifactId ⇒ 换一份 sources.jar
+            [ -n "$SRCJAR" ] && rm -f "$SRCJAR" 2>/dev/null
             CANDIDATE="$aid"
             # unzip -l 要求可 seek 的文件，进程替换（/dev/fd/N）会报
             # "End-of-central-directory signature not found" ⇒ 先落临时文件。
@@ -195,21 +220,19 @@ if [ -f "$SCRIPT_DIR/$CLASSPICK" ]; then
             LISTING=$(unzip -l "$SRCJAR" 2>/dev/null)
             if [ -z "$LISTING" ]; then
                 err "$CANDIDATE sources.jar 下载或读取失败（判据本身坏了，该结论不作数）"
-                rm -f "$SRCJAR"; SRCJAR=""
+                SRCJAR=""; LISTING=""
             fi
         fi
         [ -z "$SRCJAR" ] && continue
-        if [ "$aid" = "$CANDIDATE" ] && [ -n "$path" ]; then
-            if echo "$LISTING" | grep -q " $path\$"; then
-                log "✅ $path 在 $aid sources.jar 中"
-            else
-                err "$path 不在 $aid sources.jar 中（改名后包路径可能未同步）"
-            fi
+        if echo "$LISTING" | grep -q " $path\$"; then
+            log "✅ $path 在 $aid sources.jar 中"
+        else
+            err "$path 不在 $aid sources.jar 中（改名后包路径可能未同步）"
         fi
     done < "$SCRIPT_DIR/$CLASSPICK"
-    [ -n "$SRCJAR" ] && rm -f "$SRCJAR"
+    [ -n "$SRCJAR" ] && rm -f "$SRCJAR" 2>/dev/null
 else
-    warn "无 $CLASSPICK，跳过 sources.jar 抽检（可新建该文件逐行写 <artifactId>:<类路径>）"
+    warn "无 ${CLASSPICK}，跳过 sources.jar 抽检；可新建该文件逐行写 <artifactId>:<类路径>"
 fi
 
 # ---------- 收口 ----------
