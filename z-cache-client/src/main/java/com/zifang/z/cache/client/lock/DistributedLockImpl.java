@@ -16,10 +16,28 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * <p>基于 {@link ZCacheClient} 的 SET NX PX + GET/DEL 实现分布式锁。
  *
- * <p><b>原子性说明</b>：tryLock 使用 SET NX PX 保证原子获取。
- * unlock / renew 在 1.3.0 采用 GET + 条件 DEL/SET 两步操作
- * （非原子），依赖 ownerId 校验保证安全性。当 z-cache-server
- * 支持 EVAL/LUA 后可升级为原子 Lua 脚本（脚本已预置于 resources/scripts/）。
+ * <p><b>原子性说明（务必读完再用这把锁）</b>：{@code tryLock} 用 SET NX PX 获取，
+ * 这一步是原子的。但 {@code unlock} / {@code renew} 走的是 GET + 条件 DEL/SET
+ * <b>两次独立往返</b>，而 <b>当前 z-cache-server 没有实现 EVAL/SCRIPT</b>
+ * （全仓 grep EVAL 只命中本类与本类的单测；{@code resources/scripts/*.lua} 是客户端
+ * 侧的资源，服务端没有解释器），所以类里那两条 {@code tryXxxViaEval} 对着自家
+ * 服务端<b>每次都会落回非原子路径</b>——它不是「以防万一」的兜底，而是唯一路径。
+ *
+ * <p>由此得到的真实性质，请不要误读成「安全」：
+ * <ul>
+ *   <li>ownerId 校验与 DEL/SET <b>不在同一个原子步骤里</b>。校验通过之后、删除或
+ *       改写到达服务端之前，锁可能因 TTL 到期而消失并被另一个客户端拿到；此时本类的
+ *       DEL 会<b>删掉别人的锁</b>，{@code renewFallback} 的 SET（连 XX 都没有）会把
+ *       <b>别人的锁值覆盖成自己的旧值</b>并顺手重置 TTL。两个客户端于是同时认为自己
+ *       持锁，互斥被破坏。</li>
+ *   <li>{@link Lock#getFencingToken()} 的 fencing token 正是为这种「拿锁时已经过期」
+ *       的情形准备的兜底：业务侧在 DB 写入处用 {@code fencing_token < ?} 拒绝陈旧持有者。
+ *       但它<b>不是</b>让 unlock/renew 本身变安全的手段。</li>
+ * </ul>
+ *
+ * <p>要根治需要服务端提供一条原子的「比较 owner 再删除/续期」命令（Redis 的做法是
+ * EVAL + Lua）。在服务端补上之前，请把本类视为<b>尽力而为</b>的锁：配合业务侧
+ * fencing token 使用，且不要把 unlock 的返回值当成互斥已被严格保证。
  *
  * @author zifang
  * @since 1.3.0
@@ -293,12 +311,20 @@ public class DistributedLockImpl implements DistributedLock {
                     "Cannot unlock: lock held by another owner. key='" + key + "'");
         }
 
-        // 双重检查：再次 GET 确认 ownerId 仍匹配后 DEL
+        // 这里只是把窗口从 [第一次 GET .. DEL] 缩到 [第二次 GET .. DEL]，并没有关掉它：
+        // 下面那条 DEL 仍然是裸的，中间没有再校验。若锁在第二次 GET 之后因 TTL 到期
+        // 被别人重新拿到，这条 DEL 会把别人的锁删掉。
+        // 真的能关掉它的是服务端那条原子的「比较 owner 再删」命令。
         Object getResp2 = client.sendCommand("GET", key);
         String value2 = toStringValue(getResp2);
         if (value2 != null && value2.startsWith(ownerId + SEPARATOR)) {
             client.sendCommand("DEL", key);
             logger.debug("Lock released via fallback: key='{}', ownerId={}", key, ownerId);
+        } else {
+            // 第二次 GET 时已经不是自己持有了（期间过期并被别人拿走）：不删是对的，
+            // 但静默返回会让调用方以为「已释放」，所以显式告警。
+            logger.warn("Lock owner changed between checks, not deleting: key='{}', expectedOwner={}, now={}",
+                    key, ownerId, value2);
         }
     }
 
@@ -351,7 +377,10 @@ public class DistributedLockImpl implements DistributedLock {
             return false;
         }
 
-        // SET key value PX（保留原 value，只延长 TTL）
+        // ⚠ 这条 SET 没有任何护栏：既没有 XX（会凭空建出一个没人持有的锁），
+        // ownerId 也只是上一次往返里查过的。若锁在这中间过期并被别人拿到，
+        // 这次 SET 会把<b>别人的锁值覆盖成我们这段旧值</b>、并顺手把 TTL 重置回去 ——
+        // 直接抢走别人的锁。写这里是为了让人看见这个窗口，不是说它是安全的。
         Object setResp = client.sendCommand("SET", key, value, "PX", String.valueOf(ttlMs));
         if (isOk(setResp)) {
             logger.debug("Lock renewed via fallback: key='{}', ttlMs={}", key, ttlMs);
