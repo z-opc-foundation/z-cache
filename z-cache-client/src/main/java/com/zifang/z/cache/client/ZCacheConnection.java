@@ -80,6 +80,11 @@ public class ZCacheConnection implements AutoCloseable {
             return;
         }
 
+        // 允许从 ERROR 重新发起：一次失败的连接会把状态置 ERROR（见下方 catch），
+        // 而重连要能再进一次 —— 不先复位的话，下面的 CAS 必然失败并报
+        // "Cannot connect in state: ERROR"，于是重试只剩一次，等于没有重试。
+        state.compareAndSet(ConnectionState.ERROR, ConnectionState.DISCONNECTED);
+
         if (!state.compareAndSet(ConnectionState.DISCONNECTED, ConnectionState.CONNECTING)) {
             throw new ZCacheClientException("Cannot connect in state: " + state.get());
         }
@@ -265,9 +270,59 @@ public class ZCacheConnection implements AutoCloseable {
     }
 
     private void ensureConnected() {
-        if (state.get() != ConnectionState.CONNECTED && state.get() != ConnectionState.AUTHENTICATED) {
+        if (state.get() == ConnectionState.CONNECTED || state.get() == ConnectionState.AUTHENTICATED) {
+            return;
+        }
+        if (!config.isAutoReconnect()) {
             throw new ZCacheClientException("Not connected, current state: " + state.get());
         }
+        reconnectInternal();
+    }
+
+    /**
+     * 按 {@code autoReconnect} / {@code maxReconnectAttempts} / {@code reconnectInterval}
+     * 三个配置重连。
+     *
+     * <p>此前这三个配置项在主代码里<b>一次都没被读过</b>（只有字段 + getter/setter），
+     * 而 {@code autoReconnect} 默认 <b>true</b>。配合 {@code channelInactive} 只把状态
+     * 置为 DISCONNECTED、{@code ensureConnected} 非 CONNECTED 就直接 throw，
+     * 实际行为是：<b>一次 Redis 重启或网络抖动，客户端永久失效到应用重启为止</b>——
+     * 配置承诺的"自动重连"是假的。</p>
+     *
+     * <p>重试次数与间隔之间会阻塞调用线程（默认 3 × 100ms = 300ms 上限），
+     * 这正是 {@code reconnectInterval} 这个配置项描述的语义。</p>
+     */
+    private void reconnectInternal() {
+        int maxAttempts = Math.max(1, config.getMaxReconnectAttempts());
+        long intervalMs = Math.max(0L, config.getReconnectInterval().toMillis());
+        ZCacheClientException last = null;
+
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            if (attempt > 1 && intervalMs > 0) {
+                try {
+                    Thread.sleep(intervalMs);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new ZCacheClientException("Reconnect interrupted", ie);
+                }
+            }
+            try {
+                connect();
+                logger.info("Reconnected to {}:{} on attempt {}/{}",
+                        config.getHost(), config.getPort(), attempt, maxAttempts);
+                return;
+            } catch (Exception e) {
+                last = (e instanceof ZCacheClientException)
+                        ? (ZCacheClientException) e
+                        : new ZCacheClientException("Reconnect failed", e);
+                logger.warn("Reconnect attempt {}/{} to {}:{} failed: {}",
+                        attempt, maxAttempts, config.getHost(), config.getPort(), e.getMessage());
+            }
+        }
+        throw new ZCacheClientException(
+                "Reconnect failed after " + maxAttempts + " attempt(s) to "
+                        + config.getHost() + ":" + config.getPort()
+                        + ", current state: " + state.get(), last);
     }
 
     private boolean isOk(Object response) {
