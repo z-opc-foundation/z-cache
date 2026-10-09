@@ -7,11 +7,9 @@ import App from './App'
 import 'antd/dist/reset.css'
 
 ReactDOM.createRoot(document.getElementById('root')).render(
-  <React.StrictMode>
-    <ConfigProvider locale={zhCN}>
-      <BrowserRouter>
-        <App/>
-      </BrowserRouter>
-    </ConfigProvider>
-  </React.StrictMode>,
+    <React.StrictMode>
+        <ConfigProvider locale={zhCN}>
+            <BrowserRouter><App/></BrowserRouter>
+        </ConfigProvider>
+    </React.StrictMode>,
 )

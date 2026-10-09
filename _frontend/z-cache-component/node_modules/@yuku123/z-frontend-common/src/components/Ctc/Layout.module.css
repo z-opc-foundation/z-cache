@@ -1,0 +1,145 @@
+.layout {
+    min-height: 100vh;
+}
+
+.header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0 24px;
+    background: #001529;
+    height: 48px;
+    line-height: 48px;
+}
+
+.logo {
+    display: flex;
+    align-items: center;
+}
+
+.logoText {
+    color: #fff;
+    font-size: 16px;
+    font-weight: 600;
+}
+
+.headerRight {
+    display: flex;
+    align-items: center;
+}
+
+.userInfo {
+    display: flex;
+    align-items: center;
+    cursor: pointer;
+    color: #fff;
+}
+
+.userName {
+    margin-left: 8px;
+    color: #fff;
+}
+
+.mainLayout {
+    margin-top: 0;
+    min-height: calc(100vh - 48px);
+}
+
+.sider {
+    background: #fff;
+    min-height: calc(100vh - 48px);
+}
+
+.menu {
+    border-right: none;
+}
+
+.collapsedBtn {
+    position: absolute;
+    bottom: 16px;
+    left: 50%;
+    transform: translateX(-50%);
+    cursor: pointer;
+    padding: 8px 16px;
+    background: #f5f5f5;
+    border-radius: 4px;
+    color: #666;
+}
+
+.collapsedBtn:hover {
+    background: #e6f7ff;
+    color: #1890ff;
+}
+
+.content {
+    padding: 24px;
+    background: #f5f5f5;
+    min-height: calc(100vh - 48px);
+    overflow: auto;
+}
+
+.userDropdownPanel {
+    background: #fff;
+    border-radius: 8px;
+    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.12);
+    padding: 16px;
+    width: 360px;
+}
+
+.tenantSection {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.tenantLabel {
+    font-size: 14px;
+    color: #666;
+    white-space: nowrap;
+}
+
+.tenantCascader {
+    flex: 1;
+}
+
+.panelDivider {
+    margin: 12px 0;
+}
+
+.userSection {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.userInfoRow {
+    display: flex;
+    font-size: 14px;
+    line-height: 1.6;
+}
+
+.userInfoLabel {
+    color: #999;
+    width: 70px;
+    flex-shrink: 0;
+}
+
+.menuSection {
+    display: flex;
+    flex-direction: column;
+}
+
+.menuItem {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    cursor: pointer;
+    border-radius: 4px;
+    font-size: 14px;
+    color: #333;
+}
+
+.menuItem:hover {
+    background: #f5f5f5;
+}

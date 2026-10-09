@@ -1,27 +1,18 @@
-import {Card, Space, Typography} from 'antd'
+import {Navigate, Route, Routes} from 'react-router-dom'
 import {AppLayout} from '@yuku123/z-frontend-common'
-import Status from './Status'
-
-const {Title, Paragraph} = Typography
+import {menuItems, routeTable} from '@yuku123/z-cache-component/pages'
 
 export default function App() {
     return (
-        <AppLayout
-            menuItems={[
-                {key: '/', label: '服务状态'},
-            ]}
-            appTitle="cache 服务台"
-            appShort="cache-"
-        >
-            <Space direction="vertical" size="large" style={{width: '100%'}}>
-                <Card>
-                    <Title level={3} style={{margin: 0}}>cache 服务台</Title>
-                    <Paragraph type="secondary" style={{marginBottom: 0}}>
-                        独立运行壳（lead 005 §9.1 suit）· 后端 actuator 探针见下方
-                    </Paragraph>
-                </Card>
-                <Status/>
-            </Space>
-        </AppLayout>
+        <Routes>
+            <Route path="/" element={<Navigate to="/overview" replace/>}/>
+            <Route path="/" element={
+                <AppLayout menuItems={menuItems} appTitle="z-cache 缓存中心" appShort="CACHE"/>
+            }>
+                {routeTable.map((r) => (
+                    <Route key={r.path} path={r.path} element={<r.Component/>}/>
+                ))}
+            </Route>
+        </Routes>
     )
 }
