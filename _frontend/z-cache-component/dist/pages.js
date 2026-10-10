@@ -1,9 +1,10 @@
-import pe, { useState as j, useEffect as K } from "react";
-import { ReloadOutlined as Z, SearchOutlined as ye, PieChartOutlined as he, KeyOutlined as ve } from "@ant-design/icons";
-import { Typography as D, Space as Q, Button as S, Alert as ee, Spin as xe, Row as Ee, Col as P, Card as g, Statistic as C, Descriptions as V, Input as je, Table as _e, Modal as Te, Tag as Re } from "antd";
-import { c as I } from "./api-DfrsadMq.js";
-import { a as Je } from "./api-DfrsadMq.js";
-var N = { exports: {} }, k = {};
+import ye, { useState as g, useEffect as M } from "react";
+import { ReloadOutlined as Q, SearchOutlined as xe, HomeOutlined as ve, PieChartOutlined as ge, KeyOutlined as je } from "@ant-design/icons";
+import { Typography as $, Space as I, Button as w, Alert as ee, Spin as be, Row as re, Col as O, Card as E, Statistic as C, Descriptions as H, Input as Ee, Table as Te, Modal as ke, Tag as te } from "antd";
+import { c as z } from "./api-DfrsadMq.js";
+import { a as He } from "./api-DfrsadMq.js";
+import { useNavigate as _e } from "react-router-dom";
+var N = { exports: {} }, R = {};
 /**
  * @license React
  * react-jsx-runtime.production.js
@@ -13,29 +14,29 @@ var N = { exports: {} }, k = {};
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
  */
-var G;
-function ge() {
-  if (G) return k;
-  G = 1;
-  var a = Symbol.for("react.transitional.element"), v = Symbol.for("react.fragment");
-  function p(x, c, u) {
-    var y = null;
-    if (u !== void 0 && (y = "" + u), c.key !== void 0 && (y = "" + c.key), "key" in c) {
-      u = {};
-      for (var h in c)
-        h !== "key" && (u[h] = c[h]);
-    } else u = c;
-    return c = u.ref, {
-      $$typeof: a,
-      type: x,
-      key: y,
-      ref: c !== void 0 ? c : null,
-      props: u
+var X;
+function Re() {
+  if (X) return R;
+  X = 1;
+  var n = Symbol.for("react.transitional.element"), l = Symbol.for("react.fragment");
+  function h(y, a, d) {
+    var x = null;
+    if (d !== void 0 && (x = "" + d), a.key !== void 0 && (x = "" + a.key), "key" in a) {
+      d = {};
+      for (var v in a)
+        v !== "key" && (d[v] = a[v]);
+    } else d = a;
+    return a = d.ref, {
+      $$typeof: n,
+      type: y,
+      key: x,
+      ref: a !== void 0 ? a : null,
+      props: d
     };
   }
-  return k.Fragment = v, k.jsx = p, k.jsxs = p, k;
+  return R.Fragment = l, R.jsx = h, R.jsxs = h, R;
 }
-var w = {};
+var S = {};
 /**
  * @license React
  * react-jsx-runtime.development.js
@@ -45,126 +46,126 @@ var w = {};
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
  */
-var X;
-function be() {
-  return X || (X = 1, process.env.NODE_ENV !== "production" && (function() {
-    function a(e) {
+var K;
+function Se() {
+  return K || (K = 1, process.env.NODE_ENV !== "production" && (function() {
+    function n(e) {
       if (e == null) return null;
       if (typeof e == "function")
-        return e.$$typeof === fe ? null : e.displayName || e.name || null;
+        return e.$$typeof === me ? null : e.displayName || e.name || null;
       if (typeof e == "string") return e;
       switch (e) {
         case T:
           return "Fragment";
-        case te:
+        case ae:
           return "Profiler";
-        case re:
+        case ne:
           return "StrictMode";
-        case se:
+        case ie:
           return "Suspense";
-        case le:
-          return "SuspenseList";
         case ce:
+          return "SuspenseList";
+        case de:
           return "Activity";
-        case ue:
+        case fe:
           return "ViewTransition";
       }
       if (typeof e == "object")
         switch (typeof e.tag == "number" && console.error(
           "Received an unexpected object in getComponentNameFromType(). This is likely a bug in React. Please file an issue."
         ), e.$$typeof) {
-          case b:
+          case _:
             return "Portal";
-          case ae:
+          case se:
             return e.displayName || "Context";
-          case ne:
-            return (e._context.displayName || "Context") + ".Consumer";
           case oe:
+            return (e._context.displayName || "Context") + ".Consumer";
+          case le:
             var t = e.render;
             return e = e.displayName, e || (e = t.displayName || t.name || "", e = e !== "" ? "ForwardRef(" + e + ")" : "ForwardRef"), e;
-          case ie:
-            return t = e.displayName || null, t !== null ? t : a(e.type) || "Memo";
-          case $:
+          case ue:
+            return t = e.displayName || null, t !== null ? t : n(e.type) || "Memo";
+          case L:
             t = e._payload, e = e._init;
             try {
-              return a(e(t));
+              return n(e(t));
             } catch {
             }
         }
       return null;
     }
-    function v(e) {
+    function l(e) {
       return "" + e;
     }
-    function p(e) {
+    function h(e) {
       try {
-        v(e);
+        l(e);
         var t = !1;
       } catch {
         t = !0;
       }
       if (t) {
         t = console;
-        var o = t.error, s = typeof Symbol == "function" && Symbol.toStringTag && e[Symbol.toStringTag] || e.constructor.name || "Object";
-        return o.call(
+        var s = t.error, i = typeof Symbol == "function" && Symbol.toStringTag && e[Symbol.toStringTag] || e.constructor.name || "Object";
+        return s.call(
           t,
           "The provided key is an unsupported type %s. This value must be coerced to a string before using it here.",
-          s
-        ), v(e);
+          i
+        ), l(e);
       }
     }
-    function x(e) {
+    function y(e) {
       if (e === T) return "<>";
-      if (typeof e == "object" && e !== null && e.$$typeof === $)
+      if (typeof e == "object" && e !== null && e.$$typeof === L)
         return "<...>";
       try {
-        var t = a(e);
+        var t = n(e);
         return t ? "<" + t + ">" : "<...>";
       } catch {
         return "<...>";
       }
     }
-    function c() {
-      var e = L.A;
+    function a() {
+      var e = Y.A;
       return e === null ? null : e.getOwner();
     }
-    function u() {
+    function d() {
       return Error("react-stack-top-frame");
     }
-    function y(e) {
-      if (M.call(e, "key")) {
+    function x(e) {
+      if (J.call(e, "key")) {
         var t = Object.getOwnPropertyDescriptor(e, "key").get;
         if (t && t.isReactWarning) return !1;
       }
       return e.key !== void 0;
     }
-    function h(e, t) {
-      function o() {
-        W || (W = !0, console.error(
+    function v(e, t) {
+      function s() {
+        U || (U = !0, console.error(
           "%s: `key` is not a prop. Trying to access it will result in `undefined` being returned. If you need to access the same value within the child component, you should pass it as a different prop. (https://react.dev/link/special-props)",
           t
         ));
       }
-      o.isReactWarning = !0, Object.defineProperty(e, "key", {
-        get: o,
+      s.isReactWarning = !0, Object.defineProperty(e, "key", {
+        get: s,
         configurable: !0
       });
     }
     function f() {
-      var e = a(this.type);
-      return J[e] || (J[e] = !0, console.error(
+      var e = n(this.type);
+      return B[e] || (B[e] = !0, console.error(
         "Accessing element.ref was removed in React 19. ref is now a regular prop. It will be removed from the JSX Element type in a future release."
       )), e = this.props.ref, e !== void 0 ? e : null;
     }
-    function i(e, t, o, s, _, E) {
-      var l = o.ref;
+    function u(e, t, s, i, b, j) {
+      var c = s.ref;
       return e = {
-        $$typeof: d,
+        $$typeof: m,
         type: e,
         key: t,
-        props: o,
-        _owner: s
-      }, (l !== void 0 ? l : null) !== null ? Object.defineProperty(e, "ref", {
+        props: s,
+        _owner: i
+      }, (c !== void 0 ? c : null) !== null ? Object.defineProperty(e, "ref", {
         enumerable: !1,
         get: f
       }) : Object.defineProperty(e, "ref", { enumerable: !1, value: null }), e._store = {}, Object.defineProperty(e._store, "validated", {
@@ -181,247 +182,247 @@ function be() {
         configurable: !1,
         enumerable: !1,
         writable: !0,
-        value: _
+        value: b
       }), Object.defineProperty(e, "_debugTask", {
         configurable: !1,
         enumerable: !1,
         writable: !0,
-        value: E
+        value: j
       }), Object.freeze && (Object.freeze(e.props), Object.freeze(e)), e;
     }
-    function m(e, t, o, s, _, E) {
-      var l = t.children;
-      if (l !== void 0)
-        if (s)
-          if (de(l)) {
-            for (s = 0; s < l.length; s++)
-              O(l[s]);
-            Object.freeze && Object.freeze(l);
+    function p(e, t, s, i, b, j) {
+      var c = t.children;
+      if (c !== void 0)
+        if (i)
+          if (he(c)) {
+            for (i = 0; i < c.length; i++)
+              P(c[i]);
+            Object.freeze && Object.freeze(c);
           } else
             console.error(
               "React.jsx: Static children should always be an array. You are likely explicitly calling React.jsxs or React.jsxDEV. Use the Babel transform instead."
             );
-        else O(l);
-      if (M.call(t, "key")) {
-        l = a(e);
-        var R = Object.keys(t).filter(function(me) {
-          return me !== "key";
+        else P(c);
+      if (J.call(t, "key")) {
+        c = n(e);
+        var k = Object.keys(t).filter(function(pe) {
+          return pe !== "key";
         });
-        s = 0 < R.length ? "{key: someKey, " + R.join(": ..., ") + ": ...}" : "{key: someKey}", B[l + s] || (R = 0 < R.length ? "{" + R.join(": ..., ") + ": ...}" : "{}", console.error(
+        i = 0 < k.length ? "{key: someKey, " + k.join(": ..., ") + ": ...}" : "{key: someKey}", G[c + i] || (k = 0 < k.length ? "{" + k.join(": ..., ") + ": ...}" : "{}", console.error(
           `A props object containing a "key" prop is being spread into JSX:
   let props = %s;
   <%s {...props} />
 React keys must be passed directly to JSX without using spread:
   let props = %s;
   <%s key={someKey} {...props} />`,
-          s,
-          l,
-          R,
-          l
-        ), B[l + s] = !0);
+          i,
+          c,
+          k,
+          c
+        ), G[c + i] = !0);
       }
-      if (l = null, o !== void 0 && (p(o), l = "" + o), y(t) && (p(t.key), l = "" + t.key), "key" in t) {
-        o = {};
-        for (var F in t)
-          F !== "key" && (o[F] = t[F]);
-      } else o = t;
-      return l && h(
-        o,
+      if (c = null, s !== void 0 && (h(s), c = "" + s), x(t) && (h(t.key), c = "" + t.key), "key" in t) {
+        s = {};
+        for (var D in t)
+          D !== "key" && (s[D] = t[D]);
+      } else s = t;
+      return c && v(
+        s,
         typeof e == "function" ? e.displayName || e.name || "Unknown" : e
-      ), i(
+      ), u(
         e,
-        l,
-        o,
-        c(),
-        _,
-        E
+        c,
+        s,
+        a(),
+        b,
+        j
       );
     }
-    function O(e) {
-      A(e) ? e._store && (e._store.validated = 1) : typeof e == "object" && e !== null && e.$$typeof === $ && (e._payload.status === "fulfilled" ? A(e._payload.value) && e._payload.value._store && (e._payload.value._store.validated = 1) : e._store && (e._store.validated = 1));
+    function P(e) {
+      A(e) ? e._store && (e._store.validated = 1) : typeof e == "object" && e !== null && e.$$typeof === L && (e._payload.status === "fulfilled" ? A(e._payload.value) && e._payload.value._store && (e._payload.value._store.validated = 1) : e._store && (e._store.validated = 1));
     }
     function A(e) {
-      return typeof e == "object" && e !== null && e.$$typeof === d;
+      return typeof e == "object" && e !== null && e.$$typeof === m;
     }
-    var n = pe, d = Symbol.for("react.transitional.element"), b = Symbol.for("react.portal"), T = Symbol.for("react.fragment"), re = Symbol.for("react.strict_mode"), te = Symbol.for("react.profiler"), ne = Symbol.for("react.consumer"), ae = Symbol.for("react.context"), oe = Symbol.for("react.forward_ref"), se = Symbol.for("react.suspense"), le = Symbol.for("react.suspense_list"), ie = Symbol.for("react.memo"), $ = Symbol.for("react.lazy"), ce = Symbol.for("react.activity"), ue = Symbol.for("react.view_transition"), fe = Symbol.for("react.client.reference"), L = n.__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE, M = Object.prototype.hasOwnProperty, de = Array.isArray, Y = console.createTask ? console.createTask : function() {
+    var o = ye, m = Symbol.for("react.transitional.element"), _ = Symbol.for("react.portal"), T = Symbol.for("react.fragment"), ne = Symbol.for("react.strict_mode"), ae = Symbol.for("react.profiler"), oe = Symbol.for("react.consumer"), se = Symbol.for("react.context"), le = Symbol.for("react.forward_ref"), ie = Symbol.for("react.suspense"), ce = Symbol.for("react.suspense_list"), ue = Symbol.for("react.memo"), L = Symbol.for("react.lazy"), de = Symbol.for("react.activity"), fe = Symbol.for("react.view_transition"), me = Symbol.for("react.client.reference"), Y = o.__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE, J = Object.prototype.hasOwnProperty, he = Array.isArray, F = console.createTask ? console.createTask : function() {
       return null;
     };
-    n = {
+    o = {
       react_stack_bottom_frame: function(e) {
         return e();
       }
     };
-    var W, J = {}, U = n.react_stack_bottom_frame.bind(
-      n,
-      u
-    )(), q = Y(x(u)), B = {};
-    w.Fragment = T, w.jsx = function(e, t, o) {
-      var s = 1e4 > L.recentlyCreatedOwnerStacks++;
-      if (s) {
-        var _ = Error.stackTraceLimit;
+    var U, B = {}, q = o.react_stack_bottom_frame.bind(
+      o,
+      d
+    )(), V = F(y(d)), G = {};
+    S.Fragment = T, S.jsx = function(e, t, s) {
+      var i = 1e4 > Y.recentlyCreatedOwnerStacks++;
+      if (i) {
+        var b = Error.stackTraceLimit;
         Error.stackTraceLimit = 10;
-        var E = Error("react-stack-top-frame");
-        Error.stackTraceLimit = _;
-      } else E = U;
-      return m(
+        var j = Error("react-stack-top-frame");
+        Error.stackTraceLimit = b;
+      } else j = q;
+      return p(
         e,
         t,
-        o,
+        s,
         !1,
-        E,
-        s ? Y(x(e)) : q
+        j,
+        i ? F(y(e)) : V
       );
-    }, w.jsxs = function(e, t, o) {
-      var s = 1e4 > L.recentlyCreatedOwnerStacks++;
-      if (s) {
-        var _ = Error.stackTraceLimit;
+    }, S.jsxs = function(e, t, s) {
+      var i = 1e4 > Y.recentlyCreatedOwnerStacks++;
+      if (i) {
+        var b = Error.stackTraceLimit;
         Error.stackTraceLimit = 10;
-        var E = Error("react-stack-top-frame");
-        Error.stackTraceLimit = _;
-      } else E = U;
-      return m(
+        var j = Error("react-stack-top-frame");
+        Error.stackTraceLimit = b;
+      } else j = q;
+      return p(
         e,
         t,
-        o,
+        s,
         !0,
-        E,
-        s ? Y(x(e)) : q
+        j,
+        i ? F(y(e)) : V
       );
     };
-  })()), w;
+  })()), S;
 }
-var H;
-function ke() {
-  return H || (H = 1, process.env.NODE_ENV === "production" ? N.exports = ge() : N.exports = be()), N.exports;
+var Z;
+function we() {
+  return Z || (Z = 1, process.env.NODE_ENV === "production" ? N.exports = Re() : N.exports = Se()), N.exports;
 }
-var r = ke();
-const { Title: we, Paragraph: Se } = D;
-function z(a) {
-  return a == null ? "—" : typeof a == "number" ? a.toLocaleString("zh-CN") : String(a);
+var r = we();
+const { Title: Oe, Paragraph: Pe } = $;
+function W(n) {
+  return n == null ? "—" : typeof n == "number" ? n.toLocaleString("zh-CN") : String(n);
 }
-function Oe() {
-  const [a, v] = j(null), [p, x] = j(null), [c, u] = j(!1), [y, h] = j(null), f = async () => {
-    u(!0);
+function Ae() {
+  const [n, l] = g(null), [h, y] = g(null), [a, d] = g(!1), [x, v] = g(null), f = async () => {
+    d(!0);
     try {
-      const [i, m] = await Promise.all([
-        I.overview().catch(() => null),
-        I.info().catch(() => null)
+      const [u, p] = await Promise.all([
+        z.overview().catch(() => null),
+        z.info().catch(() => null)
       ]);
-      v(i), x(m), h(null);
-    } catch (i) {
-      h((i == null ? void 0 : i.message) || String(i));
+      l(u), y(p), v(null);
+    } catch (u) {
+      v((u == null ? void 0 : u.message) || String(u));
     } finally {
-      u(!1);
+      d(!1);
     }
   };
-  return K(() => {
+  return M(() => {
     f();
-    const i = setInterval(f, 15e3);
-    return () => clearInterval(i);
+    const u = setInterval(f, 15e3);
+    return () => clearInterval(u);
   }, []), /* @__PURE__ */ r.jsxs("div", { children: [
-    /* @__PURE__ */ r.jsxs(Q, { style: { marginBottom: 16 }, children: [
-      /* @__PURE__ */ r.jsx(we, { level: 4, style: { margin: 0 }, children: "缓存总览" }),
-      /* @__PURE__ */ r.jsx(S, { icon: /* @__PURE__ */ r.jsx(Z, {}), onClick: f, loading: c, children: "刷新" }),
-      /* @__PURE__ */ r.jsx(D.Text, { type: "secondary", children: "15s 自动刷新" })
+    /* @__PURE__ */ r.jsxs(I, { style: { marginBottom: 16 }, children: [
+      /* @__PURE__ */ r.jsx(Oe, { level: 4, style: { margin: 0 }, children: "缓存总览" }),
+      /* @__PURE__ */ r.jsx(w, { icon: /* @__PURE__ */ r.jsx(Q, {}), onClick: f, loading: a, children: "刷新" }),
+      /* @__PURE__ */ r.jsx($.Text, { type: "secondary", children: "15s 自动刷新" })
     ] }),
-    /* @__PURE__ */ r.jsx(Se, { type: "secondary", children: "/cache/overview + /cache/info：键数 / 内存 / 命中率。" }),
-    y && /* @__PURE__ */ r.jsx(ee, { type: "error", showIcon: !0, style: { marginBottom: 16 }, message: "后端未连接", description: y }),
-    c && !a && /* @__PURE__ */ r.jsx(xe, {}),
-    a && /* @__PURE__ */ r.jsxs(Ee, { gutter: 16, style: { marginBottom: 16 }, children: [
-      /* @__PURE__ */ r.jsx(P, { span: 6, children: /* @__PURE__ */ r.jsx(g, { children: /* @__PURE__ */ r.jsx(C, { title: "键总数", value: z(a.keyCount ?? a.totalKeys) }) }) }),
-      /* @__PURE__ */ r.jsx(P, { span: 6, children: /* @__PURE__ */ r.jsx(g, { children: /* @__PURE__ */ r.jsx(C, { title: "内存使用", value: z(a.usedMemory ?? a.memoryUsed) }) }) }),
-      /* @__PURE__ */ r.jsx(P, { span: 6, children: /* @__PURE__ */ r.jsx(g, { children: /* @__PURE__ */ r.jsx(C, { title: "命中率", value: a.hitRate != null ? `${(a.hitRate * 100).toFixed(1)}%` : "—" }) }) }),
-      /* @__PURE__ */ r.jsx(P, { span: 6, children: /* @__PURE__ */ r.jsx(g, { children: /* @__PURE__ */ r.jsx(C, { title: "过期键", value: z(a.expiredKeys) }) }) })
+    /* @__PURE__ */ r.jsx(Pe, { type: "secondary", children: "/cache/overview + /cache/info：键数 / 内存 / 命中率。" }),
+    x && /* @__PURE__ */ r.jsx(ee, { type: "error", showIcon: !0, style: { marginBottom: 16 }, message: "后端未连接", description: x }),
+    a && !n && /* @__PURE__ */ r.jsx(be, {}),
+    n && /* @__PURE__ */ r.jsxs(re, { gutter: 16, style: { marginBottom: 16 }, children: [
+      /* @__PURE__ */ r.jsx(O, { span: 6, children: /* @__PURE__ */ r.jsx(E, { children: /* @__PURE__ */ r.jsx(C, { title: "键总数", value: W(n.keyCount ?? n.totalKeys) }) }) }),
+      /* @__PURE__ */ r.jsx(O, { span: 6, children: /* @__PURE__ */ r.jsx(E, { children: /* @__PURE__ */ r.jsx(C, { title: "内存使用", value: W(n.usedMemory ?? n.memoryUsed) }) }) }),
+      /* @__PURE__ */ r.jsx(O, { span: 6, children: /* @__PURE__ */ r.jsx(E, { children: /* @__PURE__ */ r.jsx(C, { title: "命中率", value: n.hitRate != null ? `${(n.hitRate * 100).toFixed(1)}%` : "—" }) }) }),
+      /* @__PURE__ */ r.jsx(O, { span: 6, children: /* @__PURE__ */ r.jsx(E, { children: /* @__PURE__ */ r.jsx(C, { title: "过期键", value: W(n.expiredKeys) }) }) })
     ] }),
-    p && /* @__PURE__ */ r.jsx(g, { title: "Redis INFO", children: /* @__PURE__ */ r.jsx(V, { column: 2, bordered: !0, size: "small", children: Object.entries(p).slice(0, 20).map(([i, m]) => /* @__PURE__ */ r.jsx(V.Item, { label: i, children: typeof m == "object" ? JSON.stringify(m) : String(m) }, i)) }) })
+    h && /* @__PURE__ */ r.jsx(E, { title: "Redis INFO", children: /* @__PURE__ */ r.jsx(H, { column: 2, bordered: !0, size: "small", children: Object.entries(h).slice(0, 20).map(([u, p]) => /* @__PURE__ */ r.jsx(H.Item, { label: u, children: typeof p == "object" ? JSON.stringify(p) : String(p) }, u)) }) })
   ] });
 }
-const { Title: Ae, Paragraph: Pe, Text: Ce } = D;
-function Ne(a) {
-  const v = { string: "blue", hash: "green", list: "purple", set: "orange", zset: "cyan" };
-  return /* @__PURE__ */ r.jsx(Re, { color: v[a] || "default", children: a || "—" });
+const { Title: Ce, Paragraph: Ne, Text: Ie } = $;
+function ze(n) {
+  const l = { string: "blue", hash: "green", list: "purple", set: "orange", zset: "cyan" };
+  return /* @__PURE__ */ r.jsx(te, { color: l[n] || "default", children: n || "—" });
 }
-function Ie() {
-  const [a, v] = j([]), [p, x] = j("*"), [c, u] = j(!1), [y, h] = j(null), [f, i] = j(null), m = async () => {
-    u(!0);
+function $e() {
+  const [n, l] = g([]), [h, y] = g("*"), [a, d] = g(!1), [x, v] = g(null), [f, u] = g(null), p = async () => {
+    d(!0);
     try {
-      const n = await I.keys({ pattern: p }), d = Array.isArray(n) ? n : (n == null ? void 0 : n.keys) || [];
-      v(d.map((b, T) => typeof b == "string" ? { key: T, name: b } : { key: T, ...b })), h(null);
-    } catch (n) {
-      h((n == null ? void 0 : n.message) || String(n));
+      const o = await z.keys({ pattern: h }), m = Array.isArray(o) ? o : (o == null ? void 0 : o.keys) || [];
+      l(m.map((_, T) => typeof _ == "string" ? { key: T, name: _ } : { key: T, ..._ })), v(null);
+    } catch (o) {
+      v((o == null ? void 0 : o.message) || String(o));
     } finally {
-      u(!1);
+      d(!1);
     }
   };
-  K(() => {
-    m();
+  M(() => {
+    p();
   }, []);
-  const O = async (n) => {
+  const P = async (o) => {
     try {
-      const d = await I.key({ key: n.name || n.key });
-      i({ ...n, ...d });
-    } catch (d) {
-      i({ ...n, error: (d == null ? void 0 : d.message) || String(d) });
+      const m = await z.key({ key: o.name || o.key });
+      u({ ...o, ...m });
+    } catch (m) {
+      u({ ...o, error: (m == null ? void 0 : m.message) || String(m) });
     }
   }, A = [
     {
       title: "键名",
       key: "name",
       ellipsis: !0,
-      render: (n, d) => /* @__PURE__ */ r.jsx(Ce, { code: !0, style: { fontSize: 12 }, children: d.name || d.key })
+      render: (o, m) => /* @__PURE__ */ r.jsx(Ie, { code: !0, style: { fontSize: 12 }, children: m.name || m.key })
     },
-    { title: "类型", dataIndex: "type", key: "type", width: 100, render: Ne },
+    { title: "类型", dataIndex: "type", key: "type", width: 100, render: ze },
     {
       title: "TTL",
       dataIndex: "ttl",
       key: "ttl",
       width: 100,
-      render: (n) => n == null ? "—" : n < 0 ? "永不过期" : `${n}s`
+      render: (o) => o == null ? "—" : o < 0 ? "永不过期" : `${o}s`
     },
     {
       title: "操作",
       key: "op",
       width: 100,
-      render: (n, d) => /* @__PURE__ */ r.jsx(S, { size: "small", onClick: () => O(d), children: "详情" })
+      render: (o, m) => /* @__PURE__ */ r.jsx(w, { size: "small", onClick: () => P(m), children: "详情" })
     }
   ];
   return /* @__PURE__ */ r.jsxs("div", { children: [
-    /* @__PURE__ */ r.jsxs(Q, { style: { marginBottom: 16 }, wrap: !0, children: [
-      /* @__PURE__ */ r.jsx(Ae, { level: 4, style: { margin: 0 }, children: "键浏览" }),
+    /* @__PURE__ */ r.jsxs(I, { style: { marginBottom: 16 }, wrap: !0, children: [
+      /* @__PURE__ */ r.jsx(Ce, { level: 4, style: { margin: 0 }, children: "键浏览" }),
       /* @__PURE__ */ r.jsx(
-        je,
+        Ee,
         {
-          value: p,
-          onChange: (n) => x(n.target.value),
-          onPressEnter: m,
+          value: h,
+          onChange: (o) => y(o.target.value),
+          onPressEnter: p,
           placeholder: "如 user:* ",
           style: { width: 240 },
-          prefix: /* @__PURE__ */ r.jsx(ye, {})
+          prefix: /* @__PURE__ */ r.jsx(xe, {})
         }
       ),
-      /* @__PURE__ */ r.jsx(S, { type: "primary", onClick: m, loading: c, children: "搜索" }),
-      /* @__PURE__ */ r.jsx(S, { icon: /* @__PURE__ */ r.jsx(Z, {}), onClick: m, children: "刷新" })
+      /* @__PURE__ */ r.jsx(w, { type: "primary", onClick: p, loading: a, children: "搜索" }),
+      /* @__PURE__ */ r.jsx(w, { icon: /* @__PURE__ */ r.jsx(Q, {}), onClick: p, children: "刷新" })
     ] }),
-    /* @__PURE__ */ r.jsx(Pe, { type: "secondary", children: "Redis 键空间浏览（/cache/keys?pattern=）+ 单键详情（/cache/key）。" }),
-    y && /* @__PURE__ */ r.jsx(ee, { type: "error", showIcon: !0, style: { marginBottom: 16 }, message: "后端未连接", description: y }),
-    /* @__PURE__ */ r.jsx(g, { children: /* @__PURE__ */ r.jsx(
-      _e,
+    /* @__PURE__ */ r.jsx(Ne, { type: "secondary", children: "Redis 键空间浏览（/cache/keys?pattern=）+ 单键详情（/cache/key）。" }),
+    x && /* @__PURE__ */ r.jsx(ee, { type: "error", showIcon: !0, style: { marginBottom: 16 }, message: "后端未连接", description: x }),
+    /* @__PURE__ */ r.jsx(E, { children: /* @__PURE__ */ r.jsx(
+      Te,
       {
         rowKey: "key",
-        dataSource: a,
+        dataSource: n,
         columns: A,
-        loading: c,
+        loading: a,
         size: "small",
         pagination: { pageSize: 20 }
       }
     ) }),
     /* @__PURE__ */ r.jsx(
-      Te,
+      ke,
       {
         title: f ? `键详情：${f.name || f.key}` : "",
         open: !!f,
-        onCancel: () => i(null),
-        footer: /* @__PURE__ */ r.jsx(S, { onClick: () => i(null), children: "关闭" }),
+        onCancel: () => u(null),
+        footer: /* @__PURE__ */ r.jsx(w, { onClick: () => u(null), children: "关闭" }),
         width: 700,
         children: f && /* @__PURE__ */ r.jsx("pre", { style: {
           maxHeight: 400,
@@ -436,17 +437,61 @@ function Ie() {
     )
   ] });
 }
-const ze = [
-  { key: "/overview", icon: /* @__PURE__ */ r.jsx(he, {}), label: "总览" },
-  { key: "/keys", icon: /* @__PURE__ */ r.jsx(ve, {}), label: "键浏览" }
-], De = [
-  { path: "overview", Component: Oe },
-  { path: "keys", Component: Ie }
+const { Title: Le, Paragraph: Ye } = $;
+function Fe() {
+  const n = _e(), [l, h] = g(null);
+  M(() => {
+    const a = localStorage.getItem("userInfo");
+    if (a)
+      try {
+        h(JSON.parse(a));
+      } catch {
+        h({ name: a });
+      }
+  }, []);
+  const y = De.filter((a) => a.key !== "/z-cache/home");
+  return /* @__PURE__ */ r.jsxs("div", { children: [
+    /* @__PURE__ */ r.jsx(E, { style: { marginBottom: 16, background: "linear-gradient(135deg, #7c3aed 0%, #6d28d9 100%)", border: "none" }, children: /* @__PURE__ */ r.jsxs(I, { direction: "vertical", size: 4, style: { color: "#fff" }, children: [
+      /* @__PURE__ */ r.jsxs(Le, { level: 3, style: { color: "#fff", margin: 0 }, children: [
+        "欢迎",
+        l != null && l.name ? `，${l.name}` : ""
+      ] }),
+      /* @__PURE__ */ r.jsx(Ye, { style: { color: "rgba(255,255,255,0.85)", margin: 0 }, children: "z-cache 缓存中心 管理台" }),
+      (l == null ? void 0 : l.role) && /* @__PURE__ */ r.jsx(te, { style: { marginTop: 8, background: "rgba(255,255,255,0.2)", color: "#fff", border: "none" }, children: l.role })
+    ] }) }),
+    /* @__PURE__ */ r.jsx(re, { gutter: [16, 16], children: y.map((a) => /* @__PURE__ */ r.jsx(O, { xs: 24, sm: 12, md: 12, lg: 8, children: /* @__PURE__ */ r.jsx(E, { hoverable: !0, onClick: () => n(a.key), style: { borderTop: "3px solid #7c3aed" }, children: /* @__PURE__ */ r.jsxs(I, { align: "start", size: 12, children: [
+      /* @__PURE__ */ r.jsx("div", { style: {
+        width: 44,
+        height: 44,
+        borderRadius: 8,
+        flexShrink: 0,
+        background: "rgba(124,58,237,0.08)",
+        color: "#7c3aed",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        fontSize: 20
+      }, children: a.icon }),
+      /* @__PURE__ */ r.jsxs("div", { style: { minWidth: 0 }, children: [
+        /* @__PURE__ */ r.jsx("div", { style: { fontSize: 15, fontWeight: 600, color: "#0f172a" }, children: a.label }),
+        /* @__PURE__ */ r.jsx("div", { style: { fontSize: 12, color: "#94a3b8", marginTop: 2 }, children: a.key })
+      ] })
+    ] }) }) }, a.key)) })
+  ] });
+}
+const De = [
+  { key: "/z-cache/home", label: "首页", icon: /* @__PURE__ */ r.jsx(ve, {}) },
+  { key: "/z-cache/overview", label: "总览", icon: /* @__PURE__ */ r.jsx(ge, {}) },
+  { key: "/z-cache/keys", label: "键浏览", icon: /* @__PURE__ */ r.jsx(je, {}) }
+], qe = [
+  { path: "/z-cache/home", Component: Fe },
+  { path: "/z-cache/overview", Component: Ae },
+  { path: "/z-cache/keys", Component: $e }
 ];
 export {
-  Ie as Keys,
-  Oe as Overview,
-  Je as configureCache,
-  ze as menuItems,
-  De as routeTable
+  $e as Keys,
+  Ae as Overview,
+  He as configureCache,
+  De as menuItems,
+  qe as routeTable
 };
