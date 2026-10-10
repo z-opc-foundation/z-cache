@@ -493,5 +493,5 @@ export {
   Ae as Overview,
   He as configureCache,
   De as menuItems,
-  qe as routeTable
+  qe as routes
 };
