@@ -16,7 +16,7 @@ export const menuItems = [
     { key: '/z-cache/keys', label: '键浏览', icon: <KeyOutlined /> },
 ]
 
-export const routeTable = [
+export const routes = [
     { path: '/z-cache/home', Component: HomePage },
     { path: '/z-cache/overview', Component: Overview },
     { path: '/z-cache/keys', Component: Keys },
