@@ -1,9 +1,9 @@
 package com.zifang.z.cache.core.serialize;
 
-import io.zifu.z.serialize.core.CodecRegistry;
-import io.zifu.z.serialize.core.ReflectCodec;
-import io.zifu.z.serialize.core.ZDeserializer;
-import io.zifu.z.serialize.core.ZSerializer;
+import com.zifang.util.serialize.core.CodecRegistry;
+import com.zifang.util.serialize.core.ReflectCodec;
+import com.zifang.util.serialize.core.ZDeserializer;
+import com.zifang.util.serialize.core.ZSerializer;
 
 import java.io.IOException;
 
@@ -53,7 +53,7 @@ public final class ZCacheCodec {
         }
 
         // 检查是否有 @ZMessage 注解（使用反射 codec）
-        if (object.getClass().isAnnotationPresent(io.zifu.z.serialize.annotation.ZMessage.class)) {
+        if (object.getClass().isAnnotationPresent(com.zifang.util.serialize.annotation.ZMessage.class)) {
             return ZSerializer.INSTANCE.toBytes(object);
         }
 
@@ -81,7 +81,7 @@ public final class ZCacheCodec {
         }
 
         // 检查是否有 @ZMessage 注解
-        if (clazz.isAnnotationPresent(io.zifu.z.serialize.annotation.ZMessage.class)) {
+        if (clazz.isAnnotationPresent(com.zifang.util.serialize.annotation.ZMessage.class)) {
             return ZDeserializer.INSTANCE.fromBytes(bytes, clazz);
         }
 
@@ -106,7 +106,7 @@ public final class ZCacheCodec {
      */
     public static boolean isZSerializable(Class<?> clazz) {
         return CodecRegistry.isRegistered(clazz)
-                || clazz.isAnnotationPresent(io.zifu.z.serialize.annotation.ZMessage.class);
+                || clazz.isAnnotationPresent(com.zifang.util.serialize.annotation.ZMessage.class);
     }
 
     // ==================== Java 序列化 Fallback ====================

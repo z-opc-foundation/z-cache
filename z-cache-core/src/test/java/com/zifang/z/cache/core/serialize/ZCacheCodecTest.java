@@ -1,8 +1,8 @@
 package com.zifang.z.cache.core.serialize;
 
-import io.zifu.z.serialize.annotation.FieldType;
-import io.zifu.z.serialize.annotation.ZField;
-import io.zifu.z.serialize.annotation.ZMessage;
+import com.zifang.util.serialize.annotation.FieldType;
+import com.zifang.util.serialize.annotation.ZField;
+import com.zifang.util.serialize.annotation.ZMessage;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
