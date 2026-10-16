@@ -68,6 +68,38 @@
 
     <dependencyManagement>
         <dependencies>
+
+        <!-- ⚠ z-util 三件必须同版本一起动：dependencyManagement 会连**传递依赖**一起改写，
+             只抬其中一件会被 BOM 把另外两件压回旧版（实测踩过）。JsonUtil.toPlainValue /
+             JsonCursor 需要 >= 1.2.2。
+             serialize 两件同样要钉：ZCacheCodec 已跟进"z-util-serialize 根包改名"
+             （com.zifang.util.serialize.core / .annotation），而 BOM 给的 1.0.19 还是旧包名，
+             于是 z-cache-core 直接编译不过 —— 这里补齐到与源树同版本。 -->
+            <dependency>
+                <groupId>io.github.yuku123</groupId>
+                <artifactId>z-util-core</artifactId>
+                <version>1.2.3</version>
+            </dependency>
+            <dependency>
+                <groupId>io.github.yuku123</groupId>
+                <artifactId>z-util-parser-json</artifactId>
+                <version>1.2.3</version>
+            </dependency>
+            <dependency>
+                <groupId>io.github.yuku123</groupId>
+                <artifactId>z-util-dsl-kernel</artifactId>
+                <version>1.2.3</version>
+            </dependency>
+            <dependency>
+                <groupId>io.github.yuku123</groupId>
+                <artifactId>z-util-serialize-core</artifactId>
+                <version>1.2.3</version>
+            </dependency>
+            <dependency>
+                <groupId>io.github.yuku123</groupId>
+                <artifactId>z-util-serialize-schema</artifactId>
+                <version>1.2.3</version>
+            </dependency>
             <!-- 本仓自家 5 个模块钉 ${project.version}。这一格不是装饰：fleet 里 z-cache 那一格
                  钉的是 repo1 上最新的 **1.3.5**，而继承来的 DM 会改写**传递依赖**的版本 ⇒
                  z-cache-server 的 shade fat jar 实测把 1.3.5 的 z-cache-common 字节码打进了

@@ -1,6 +1,6 @@
 package com.zifang.z.cache.spring.host;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
+import com.zifang.util.json.JsonUtil;
 import com.zifang.z.cache.client.ZCacheClient;
 import com.zifang.z.cache.core.server.RedisServer;
 import com.zifang.z.cache.core.storage.MemoryStore;
@@ -12,6 +12,7 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import javax.servlet.http.HttpServletResponse;
+import java.nio.charset.StandardCharsets;
 import java.lang.management.ManagementFactory;
 import java.lang.reflect.Field;
 import java.io.InputStream;
@@ -20,7 +21,6 @@ import java.net.Socket;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.Charset;
 import java.nio.charset.CodingErrorAction;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
@@ -110,7 +110,6 @@ public class CacheProxyController {
 
     private final ObjectProvider<ZCacheClient> clientProvider;
     private final ObjectProvider<ZCacheEmbeddedServerConfig> embeddedProvider;
-    private final ObjectMapper mapper = new ObjectMapper();
 
     /** server 侧端口：Spring Environment 视角（system property + application.properties 合并后） */
     @Value("${z.cache.server.port:6379}")
@@ -1012,7 +1011,7 @@ public class CacheProxyController {
     }
 
     private void writeJson(HttpServletResponse resp, int status, Object body) throws Exception {
-        byte[] out = mapper.writeValueAsBytes(body);
+        byte[] out = JsonUtil.toJson(body).getBytes(StandardCharsets.UTF_8);
         resp.setStatus(status);
         resp.setContentType("application/json;charset=UTF-8");
         resp.setContentLength(out.length);
