@@ -5,7 +5,7 @@ import {
 } from 'antd'
 import {ReloadOutlined, SearchOutlined} from '@ant-design/icons'
 import {cacheApi, cacheErrorText, authorityTag, fmtBytes, fmtTtl, asText} from '../services/api'
-import {PageHeader} from '@/common/components/ui'
+import {PageHeader} from '@yuku123/z-frontend-common/ui'
 
 /** MemoryStore.DataType 的实际取值（z-cache-core 1.3.1 枚举：NONE/STRING/HASH/LIST/SET/ZSET） */
 const TYPE_COLOR = {

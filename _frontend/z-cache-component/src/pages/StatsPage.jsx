@@ -2,7 +2,7 @@ import {useCallback, useEffect, useState} from 'react'
 import {Alert, Button, Card, Col, Descriptions, Row, Select, Space, Statistic, Table, Tag} from 'antd'
 import {ReloadOutlined} from '@ant-design/icons'
 import {cacheApi, cacheErrorText, authorityTag, fmtBytes} from '../services/api'
-import {PageHeader} from '@/common/components/ui'
+import {PageHeader} from '@yuku123/z-frontend-common/ui'
 
 const HOT_COLUMNS = [
     {title: 'key', dataIndex: 'key', key: 'key', ellipsis: true, render: (v) => <code>{v}</code>},

@@ -2,7 +2,7 @@ import {useCallback, useEffect, useState} from 'react'
 import {Alert, Button, Card, Descriptions, Space, Table, Tag} from 'antd'
 import {ReloadOutlined} from '@ant-design/icons'
 import {cacheApi, cacheErrorText, authorityTag} from '../services/api'
-import {PageHeader} from '@/common/components/ui'
+import {PageHeader} from '@yuku123/z-frontend-common/ui'
 
 const CMD_COLUMNS = [
     {title: 'RESP 命令', dataIndex: 'command', key: 'command', width: 140, render: (v) => <code>{v}</code>},

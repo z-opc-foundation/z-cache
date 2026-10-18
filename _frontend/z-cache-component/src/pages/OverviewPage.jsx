@@ -2,7 +2,7 @@ import {useCallback, useEffect, useState} from 'react'
 import {Alert, Button, Card, Col, Descriptions, Row, Statistic, Table, Tag} from 'antd'
 import {ReloadOutlined} from '@ant-design/icons'
 import {cacheApi, cacheErrorText, authorityTag, fmtUptime} from '../services/api'
-import {PageHeader} from '@/common/components/ui'
+import {PageHeader} from '@yuku123/z-frontend-common/ui'
 
 const DB_COLUMNS = [
     {title: '库', dataIndex: 'db', key: 'db', width: 70, render: (v) => `db${v}`},
