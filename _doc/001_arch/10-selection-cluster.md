@@ -135,7 +135,7 @@ z-cache 当前是单节点模式（[README.md](file:///Users/zifang/workplace/ce
 `TASK-20260918-004` 计划写一份"生产级运维手册"。基于本调研结论，建议手册骨架：
 
 ```
-z-cache/_doc/002_deploy/集群模式运维手册.md
+z-cache/_doc/002_deploy/01-cluster-mode-ops.md
 ├── 1. 部署前置条件
 │   ├── 至少 3 master + 3 replica 起步（保证 quorum）
 │   ├── 网络要求：节点间互联带宽 ≥ 1Gbps，延迟 < 1ms（同机房）

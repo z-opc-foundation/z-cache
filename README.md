@@ -226,7 +226,7 @@ ZCACHE_PORT=6380 ZCACHE_MEMORY_LIMIT=1g docker compose up -d --build
 
 发布脚本在 [`_doc/003_script/`](_doc/003_script/)：`build.sh`、`package.sh`、
 `deploy_maven_center.sh`（一键发 Central）、`install-settings.sh`（写凭证进 `~/.m2/settings.xml`）。
-集群模式（规划）的运维手册见 [`_doc/002_deploy/集群模式运维手册.md`](_doc/002_deploy/集群模式运维手册.md)。
+集群模式（规划）的运维手册见 [`_doc/002_deploy/01-cluster-mode-ops.md`](_doc/002_deploy/01-cluster-mode-ops.md)。
 
 ---
 
@@ -244,22 +244,22 @@ MIT License，全文见根 [`LICENSE`](LICENSE)（`Copyright (c) 2026 z-opc-foun
 
 - [`_doc/001_arch/`](_doc/001_arch/) —— 架构与设计：
   - [`01-module-structure.md`](_doc/001_arch/01-module-structure.md) —— 模块结构与命令清单
-  - [`分布式锁设计.md`](_doc/001_arch/分布式锁设计.md) —— DistributedLock API / Watchdog 设计稿（文中"Lua 解锁"是设计目标，服务端尚未实现 EVAL，实际走 GET+DEL）
-  - [`分布式锁方案选型-2026Q4.md`](_doc/001_arch/分布式锁方案选型-2026Q4.md) —— Redisson vs 自研选型调研
-  - [`集群模式架构选型-2026Q4.md`](_doc/001_arch/集群模式架构选型-2026Q4.md) —— 一致性哈希 vs 16384 槽调研（2.0.0 规划）
+  - [`08-design.md`](_doc/001_arch/08-design.md) —— DistributedLock API / Watchdog 设计稿（文中"Lua 解锁"是设计目标，服务端尚未实现 EVAL，实际走 GET+DEL）
+  - [`09-selection.md`](_doc/001_arch/09-selection.md) —— Redisson vs 自研选型调研
+  - [`10-selection-cluster.md`](_doc/001_arch/10-selection-cluster.md) —— 一致性哈希 vs 16384 槽调研（2.0.0 规划）
   - 测试产物（**非架构文档**，如实标注）：
-    [`TEST_README.md`](_doc/005_testing/TEST_README.md)（z-cache-client 测试模块说明）、
-    [`TEST_REPORT.md`](_doc/005_testing/TEST_REPORT.md)（覆盖率报告）、
-    [`TEST_STATUS.md`](_doc/005_testing/TEST_STATUS.md)（全模块测试状态）
+    [`01-test-readme.md`](_doc/005_testing/01-test-readme.md)（z-cache-client 测试模块说明）、
+    [`02-test-report.md`](_doc/005_testing/02-test-report.md)（覆盖率报告）、
+    [`03-test-status.md`](_doc/005_testing/03-test-status.md)（全模块测试状态）
 - [`_doc/002_deploy/`](_doc/002_deploy/) —— 部署：
-  - [`集群模式运维手册.md`](_doc/002_deploy/集群模式运维手册.md) —— 面向 1.3.0/2.0.0 目标的运维手册
+  - [`01-cluster-mode-ops.md`](_doc/002_deploy/01-cluster-mode-ops.md) —— 面向 1.3.0/2.0.0 目标的运维手册
 - [`_doc/003_script/`](_doc/003_script/) —— 构建 / 发布 / 测试脚本：
   - [`build.sh`](_doc/003_script/build.sh) · [`package.sh`](_doc/003_script/package.sh) ·
     [`deploy_maven_center.sh`](_doc/003_script/deploy_maven_center.sh) ·
     [`install-settings.sh`](_doc/003_script/install-settings.sh) ·
     [`run-client-tests.sh`](_doc/003_script/run-client-tests.sh)
 - `_doc/004_skill/` —— AI skill / 审计：
-  - [`audit-pre-release-1.3.0.md`](_doc/006_release/audit-pre-release-1.3.0.md) —— 1.3.0 发布前合规审计报告
+  - [`01-audit-pre-release-1.3.0.md`](_doc/006_release/01-audit-pre-release-1.3.0.md) —— 1.3.0 发布前合规审计报告
 - 命令级测试电池记录：[`_doc/005_testing/battery20.txt`](_doc/005_testing/battery20.txt) —— RESP 命令序列原文（`HSET`/`HINCRBYFLOAT` 等），是测试输入而非文档正文
 
 > 说明：旧 README 曾称"`_doc/004_skill/` 尚不存在、2.0.0 才重命名"，实测该目录已在且含审计文件，本目录已据实更正。

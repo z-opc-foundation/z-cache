@@ -4,7 +4,7 @@
 > 作者：consumer001
 > 完成日期：2026-09-18
 > 关联任务：TASK-20260918-003
-> 关联调研：[分布式锁方案选型-2026Q4.md](分布式锁方案选型-2026Q4.md)（推荐方案 B：自研）
+> 关联调研：[09-selection.md](09-selection.md) 分布式锁方案选型-2026Q4（推荐方案 B：自研）
 > 关联大需求：[001 z-cache 对标 Redis 功能补齐](../../../z-opc-foundation-lead/002_项目需求/001_特性需求/001_z-cache_对标_Redis_功能补齐/README.md)
 
 ## 1. 设计目标
@@ -622,7 +622,7 @@ z-cache/z-cache-client/src/main/resources/scripts/
 - [Redis EVAL / Lua 脚本](https://redis.io/commands/eval/)
 - [Martin Kleppmann "How to do distributed locking"](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html)
 - [Antirez 关于 Redlock 的回应](http://antirez.com/news/101)
-- z-cache 内部：[调研报告 分布式锁方案选型-2026Q4.md](分布式锁方案选型-2026Q4.md)
+- z-cache 内部：[调研报告 09-selection.md](09-selection.md)
 - Redisson 锁文档：https://redisson.org/docs/data-and-services/locks-and-synchronizers/
 
 ---

@@ -4,7 +4,7 @@
 > 作者：consumer001
 > 完成日期：2026-09-18
 > 关联任务：TASK-20260918-004
-> 关联调研：[集群模式架构选型-2026Q4.md](../001_arch/集群模式架构选型-2026Q4.md)（推荐方案 B：16384 哈希槽 + Redis Cluster 风格）
+> 关联调研：[10-selection-cluster.md](../001_arch/10-selection-cluster.md) 集群模式架构选型-2026Q4（推荐方案 B：16384 哈希槽 + Redis Cluster 风格）
 > 关联大需求：[001 z-cache 对标 Redis 功能补齐](../../../z-opc-foundation-lead/002_项目需求/001_特性需求/001_z-cache_对标_Redis_功能补齐/README.md)
 
 ## 0. 关于本文档
@@ -903,7 +903,7 @@ redis-cli -h node-1 -p 16379 cluster info
 - [Redis Cluster Specification](https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster_spec/)
 - [Redis Cluster 教程](https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-tutorial/)
 - [Redis 集群管理工具 redis-cli](https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/#redis-cli)
-- z-cache 调研：[集群模式架构选型-2026Q4.md](../001_arch/集群模式架构选型-2026Q4.md)
+- z-cache 调研：[10-selection-cluster.md](../001_arch/10-selection-cluster.md)
 - z-cache 部署：[003_script/build.sh](../003_script/build.sh)
 - z-cache 启动入口：[ZCacheServerMain.java](../../z-cache-core/src/main/java/com/zifang/z/cache/core/server/ZCacheServerMain.java)
 - z-cache 主项目：[README.md](../../README.md)
