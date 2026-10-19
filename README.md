@@ -100,7 +100,7 @@ z-cache/
 | 层级 | 技术（来自 pom 实测） |
 |------|------|
 | 语言 / 运行时 | Java 8（全组织口径；JDK9+ 用 `release 8` 卡死，Docker 基镜像 `eclipse-temurin:8-jre`） |
-| 网络 | Netty 4.1.138.Final（版本走 `z-boot-dependencies:1.0.20` 地板，本仓不再自钉） |
+| 网络 | Netty 4.1.138.Final（版本走 `z-boot-parent` 自带地板，本仓不再自钉） |
 | 日志 | Log4j2 **2.17.2**（本仓有意压回，理由见「版本链」；只有一个日志家族，`logback`/`slf4j` 已整批撤出） |
 | 序列化 | `z-util-serialize-core` / `z-util-serialize-schema`（版本走 fleet） |
 | Spring 集成 | Spring Boot 2.7.18（`spring-boot-autoconfigure`，starter 用） |
