@@ -8,7 +8,7 @@
 
 ## 1. 调研背景
 
-z-cache 当前是单节点模式（[README.md](file:///Users/zifang/workplace/ceo_workplace/z-opc-foundation/z-cache/README.md) 中虽然已出现集群模式 YAML 配置示例，但 [z-cache-core/src/main/java/com/zifang/z/cache/core/](file:///Users/zifang/workplace/ceo_workplace/z-opc-foundation/z-cache/z-cache-core/src/main/java/com/zifang/z/cache/core/) 下**完全没有 `cluster`/`replication`/`sentinel` 子包**），无法支撑分布式场景。
+z-cache 当前是单节点模式（[README.md](../../README.md) 中虽然已出现集群模式 YAML 配置示例，但 [z-cache-core/src/main/java/com/zifang/z/cache/core/](../../z-cache-core/src/main/java/com/zifang/z/cache/core/) 下**完全没有 `cluster`/`replication`/`sentinel` 子包**），无法支撑分布式场景。
 
 需要从三种主流方案中选择：
 
@@ -16,7 +16,7 @@ z-cache 当前是单节点模式（[README.md](file:///Users/zifang/workplace/ce
 - **方案 B**：16384 哈希槽映射（参考 Redis Cluster）
 - **方案 C**：Codis（基于 ZooKeeper 的 Proxy 层方案）
 
-调研结论将决定 [TASK-20260918-004](../done/2026-09-19/TASK-20260918-004.md) 集群运维手册与后续集群代码实现路径。
+调研结论将决定 [TASK-20260918-004](../../../z-opc-foundation-lead/002_项目需求/002_任务队列/done/2026-09-18/TASK-20260918-004.md) 集群运维手册与后续集群代码实现路径。
 
 ## 2. z-cache 现状盘点
 
@@ -24,7 +24,7 @@ z-cache 当前是单节点模式（[README.md](file:///Users/zifang/workplace/ce
 
 | 维度 | 文档声称 | 实际代码 |
 |---|---|---|
-| 模块结构（[01-module-structure.md](file:///Users/zifang/workplace/ceo_workplace/z-opc-foundation/z-cache/_doc/001_arch/01-module-structure.md)） | 含 `replication`、`cluster`、`sentinel` 子模块 | **不存在**这些子目录 |
+| 模块结构（[01-module-structure.md](01-module-structure.md)） | 含 `replication`、`cluster`、`sentinel` 子模块 | **不存在**这些子目录 |
 | README 集群配置示例 | 含 `z.cache.cluster.nodes` 配置 | **无对应解析代码** |
 | 命令支持 | 文档列了 `CLUSTER`、`MIGRATE`、`RESTORE`、`DUMP` | **未实现** |
 | Spring Boot starter 集群支持 | 文档宣称 | **无对应 starter 集群代码** |

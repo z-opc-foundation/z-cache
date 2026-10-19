@@ -17,7 +17,7 @@ redis-cli / GUI）零修改即可连。它要解决的不是"再造一个 Redis 
 | **仓库** | `z-cache` |
 | **Maven 坐标** | `io.github.yuku123:z-cache`（根聚合 POM，`packaging=pom`） |
 | **当前版本** | `1.3.6`（根 POM 用直接 `<version>`，**不是** `${revision}` CI-friendly 占位） |
-| **父项目** | `io.github.yuku123:z-boot-parent:1.0.21`（`<relativePath/>` 留空：parent 在 repo1，不在磁盘） |
+| **父项目** | `io.github.yuku123:z-boot-parent:1.1.0`（`<relativePath/>` 留空：parent 在 repo1，不在磁盘） |
 | **Maven Central** | 实测 `z-cache` 及 5 个子件在 `1.3.6` 与 `1.3.5` 均可从 repo1 取到（`.pom` HTTP 200；不存在版本回 404）。见下方「版本链」关于 CHANGELOG 仍标 Unreleased 的账目漂移 |
 | **默认端口** | `6379`（`RedisServer.DEFAULT_PORT`）；默认**只 bind `127.0.0.1`**，对外服务需显式 `--host 0.0.0.0` |
 | **数据库数** | 16（`MemoryStore.DEFAULT_DB_COUNT`） |
@@ -30,10 +30,10 @@ redis-cli / GUI）零修改即可连。它要解决的不是"再造一个 Redis 
 
 本仓是全组织迁移到 `z-boot-parent` 消费入口的试点，版本链三层，逐层实测：
 
-- **parent**：`io.github.yuku123:z-boot-parent:1.0.21`（repo1 可读，实测 200）。它负责 Java 8 的
+- **parent**：`io.github.yuku123:z-boot-parent:1.1.0`（repo1 可读，实测 200）。它负责 Java 8 的
   pluginManagement、第三方地板与兄弟仓权威表。
-- **floor（地板）**：`z-boot-parent` 的父 POM 是 `io.github.yuku123:z-boot-dependencies:1.0.20`，统一第三方版本口径。
-- **fleet（舰队表）**：parent import 了 `io.github.yuku123:z-boot-fleet:1.0.1`（兄弟仓对外版本权威表）。
+- **floor（地板）**：第三方版本口径已并进 `z-boot-parent` 自身（`z-boot-dependencies` 文件夹随 2026-10-08 火车制拓扑退役）。
+- **fleet（舰队表）**：兄弟仓对外版本权威表也已并进 `z-boot-parent` 的 `dependencyManagement`（`z-boot-fleet` 文件夹同期退役）。
 
 本仓 POM **只保留与地板有意不同的一格** —— `<log4j2.version>2.17.2</log4j2.version>`：地板给的是 2.25.4，
 但 `spring-boot-starter-log4j2`（随 Spring Boot 2.7.18）带的 `log4j-core/slf4j-impl/jul` 全是 2.17.2，
@@ -76,13 +76,13 @@ redis-cli / GUI）零修改即可连。它要解决的不是"再造一个 Redis 
 
 ```
 z-cache/
-├── pom.xml                     # 根聚合 POM：继承 z-boot-parent:1.0.21，版本 1.3.6，log4j2 压回 2.17.2
+├── pom.xml                     # 根聚合 POM：继承 z-boot-parent:1.1.0，版本 1.3.6，log4j2 压回 2.17.2
 ├── z-cache-common/             # 14 个 src/main 类：协议编解码、RedisGlob、共享类型（不引日志实现）
 ├── z-cache-core/               # 27 个类：存储引擎 MemoryStore、RESP 服务端 RedisServer/ZCacheServerMain、
 │                               #   命令处理 CommandHandler、持久化 RdbPersistence/AofPersistence
 ├── z-cache-client/             # 16 个类：ZCacheClient（同步/异步）、pool/ZCachePool、lock/* 分布式锁
 ├── z-cache-server/             # 2 个类：Main（委托 core.ZCacheServerMain）+ HealthCheck；maven-shade 打 fat jar
-├── z-cache-spring-boot-starter/# 3 个类：ZCacheProperties/ZCacheAutoConfiguration/ZCacheTemplate
+├── z-cache-spring-boot-starter/# 6 个类：ZCacheProperties/ZCacheAutoConfiguration/ZCacheTemplate/ZCacheEmbeddedServerConfig/CacheHostAutoConfiguration/CacheProxyController
 ├── Dockerfile                  # 多阶段 maven:temurin-8 → temurin-8-jre，EXPOSE 6379，非 root（uid 10001）
 ├── docker-compose.yml          # 本地构建 image z-cache:latest，端口 ${ZCACHE_PORT:-6379}:6379
 ├── CHANGELOG.md                # 逐版本详细变更（本 README 不复制其中的探针级叙述）
@@ -117,8 +117,8 @@ z-cache/
 mvn clean install -DskipTests
 ```
 
-第三方版本一律由 `z-boot-parent` → `z-boot-dependencies`（地板）+ `z-boot-fleet`（兄弟仓权威表）供给，
-模块 POM 不应再出现字面版本钉；若报找不到版本，先确认本地/镜像能解析到 `io.github.yuku123:z-boot-parent:1.0.21`。
+第三方版本一律由 `z-boot-parent:1.1.0` 供给（第三方地板与兄弟仓权威表均已并入 parent 自身），
+模块 POM 不应再出现字面版本钉；若报找不到版本，先确认本地/镜像能解析到 `io.github.yuku123:z-boot-parent:1.1.0`。
 
 ### 起一台服务端（RESP over TCP）
 
@@ -243,6 +243,8 @@ MIT License，全文见根 [`LICENSE`](LICENSE)（`Copyright (c) 2026 z-opc-foun
 根路径只留本 `README.md`）。以下链接逐个对应磁盘真实文件，并按"它到底是什么"如实归类：
 
 - [`_doc/001_arch/`](_doc/001_arch/) —— 架构与设计：
+  - [`00-overview.md`](_doc/001_arch/00-overview.md) —— 项目总览：5 个模块的职责边界、RESP2 命令面做到哪一格、存储引擎与 16 库、
+    RDB/AOF 持久化、分布式锁的非原子解锁、嵌入式缓存、Spring Boot starter 的配置与 Bean、部署形态与源码包树
   - [`01-module-structure.md`](_doc/001_arch/01-module-structure.md) —— 模块结构与命令清单
   - [`08-design.md`](_doc/001_arch/08-design.md) —— DistributedLock API / Watchdog 设计稿（文中"Lua 解锁"是设计目标，服务端尚未实现 EVAL，实际走 GET+DEL）
   - [`09-selection.md`](_doc/001_arch/09-selection.md) —— Redisson vs 自研选型调研
@@ -257,11 +259,13 @@ MIT License，全文见根 [`LICENSE`](LICENSE)（`Copyright (c) 2026 z-opc-foun
   - [`build.sh`](_doc/003_script/build.sh) · [`package.sh`](_doc/003_script/package.sh) ·
     [`deploy_maven_center.sh`](_doc/003_script/deploy_maven_center.sh) ·
     [`install-settings.sh`](_doc/003_script/install-settings.sh) ·
-    [`run-client-tests.sh`](_doc/003_script/run-client-tests.sh)
-- `_doc/004_skill/` —— AI skill / 审计：
+    [`run-client-tests.sh`](_doc/003_script/run-client-tests.sh) ·
+    [`verify_central.sh`](_doc/003_script/verify_central.sh)
+- [`_doc/006_release/`](_doc/006_release/) —— 发布审计：
   - [`01-audit-pre-release-1.3.0.md`](_doc/006_release/01-audit-pre-release-1.3.0.md) —— 1.3.0 发布前合规审计报告
 - 命令级测试电池记录：[`_doc/005_testing/battery20.txt`](_doc/005_testing/battery20.txt) —— RESP 命令序列原文（`HSET`/`HINCRBYFLOAT` 等），是测试输入而非文档正文
 
-> 说明：旧 README 曾称"`_doc/004_skill/` 尚不存在、2.0.0 才重命名"，实测该目录已在且含审计文件，本目录已据实更正。
+> 说明：旧 README 曾把上面那份审计报告挂在 `_doc/004_skill/` 名下，并称"`_doc/004_skill/` 已在"。
+> 实测该目录**并不存在**，审计报告实际落在 `_doc/006_release/`，本目录已据实更正（`004_skill` 槽位按需不建）。
 
 _Maintained by the z-opc-foundation organization._

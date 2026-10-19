@@ -22,10 +22,10 @@
 
 | 已实现 | 位置 | 本设计复用方式 |
 |---|---|---|
-| `SET key value NX PX ms` | [CommandHandler.java:302](file:///Users/zifang/workplace/ceo_workplace/z-opc-foundation/z-cache/z-cache-core/src/main/java/com/zifang/z/cache/core/command/CommandHandler.java#L302) | tryLock 内部调用 |
+| `SET key value NX PX ms` | [CommandHandler.java:302](../../z-cache-core/src/main/java/com/zifang/z/cache/core/command/CommandHandler.java#L302) | tryLock 内部调用 |
 | `EVAL / EVALSHA` | CommandHandler | 原子解锁用 Lua 脚本 |
 | `EXPIRE / PEXPIRE` | CommandHandler | renew 用 XX 选项延长 TTL |
-| `ZCacheClient.setnx` | [ZCacheClient.java:184](file:///Users/zifang/workplace/ceo_workplace/z-opc-foundation/z-cache/z-cache-client/src/main/java/com/zifang/z/cache/client/ZCacheClient.java#L184) | 本设计的高级 API 替代品 |
+| `ZCacheClient.setnx` | [ZCacheClient.java:184](../../z-cache-client/src/main/java/com/zifang/z/cache/client/ZCacheClient.java#L184) | 本设计的高级 API 替代品 |
 
 ## 2. 公共 API 定义
 

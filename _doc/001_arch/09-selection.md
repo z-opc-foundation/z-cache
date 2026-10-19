@@ -22,10 +22,10 @@ z-cache 当前在 README、01-module-structure.md 与 01 章节均把"分布式�
 
 | 能力 | 实现位置 | 行号 |
 |---|---|---|
-| `SETNX key value`（单节点原子） | `CommandHandler.handleSetnx` | [CommandHandler.java:395](file:///Users/zifang/workplace/ceo_workplace/z-opc-foundation/z-cache/z-cache-core/src/main/java/com/zifang/z/cache/core/command/CommandHandler.java#L395) |
-| `SET key value NX PX ms`（Redlock 原语） | `CommandHandler.handleSet` 的 NX/PX 选项 | [CommandHandler.java:302](file:///Users/zifang/workplace/ceo_workplace/z-opc-foundation/z-cache/z-cache-core/src/main/java/com/zifang/z/cache/core/command/CommandHandler.java#L302) |
-| 单节点 `setIfAbsentDb`（SETNX 内部） | `MemoryStore.setIfAbsentDb` | [MemoryStore.java:217](file:///Users/zifang/workplace/ceo_workplace/z-opc-foundation/z-cache/z-cache-core/src/main/java/com/zifang/z/cache/core/storage/MemoryStore.java#L217) |
-| `setnx(key, value, ttl, unit)` 客户端封装 | `ZCacheClient.setnx` | [ZCacheClient.java:184](file:///Users/zifang/workplace/ceo_workplace/z-opc-foundation/z-cache/z-cache-client/src/main/java/com/zifang/z/cache/client/ZCacheClient.java#L184) |
+| `SETNX key value`（单节点原子） | `CommandHandler.handleSetnx` | [CommandHandler.java:395](../../z-cache-core/src/main/java/com/zifang/z/cache/core/command/CommandHandler.java#L395) |
+| `SET key value NX PX ms`（Redlock 原语） | `CommandHandler.handleSet` 的 NX/PX 选项 | [CommandHandler.java:302](../../z-cache-core/src/main/java/com/zifang/z/cache/core/command/CommandHandler.java#L302) |
+| 单节点 `setIfAbsentDb`（SETNX 内部） | `MemoryStore.setIfAbsentDb` | [MemoryStore.java:217](../../z-cache-core/src/main/java/com/zifang/z/cache/core/storage/MemoryStore.java#L217) |
+| `setnx(key, value, ttl, unit)` 客户端封装 | `ZCacheClient.setnx` | [ZCacheClient.java:184](../../z-cache-client/src/main/java/com/zifang/z/cache/client/ZCacheClient.java#L184) |
 | Netty 4.1.100.Final | `z-cache-core/pom.xml` | — |
 | 已支持 RESP 协议 + AOF/RDB 持久化 | `RedisServerHandler` + `RdbPersistence` / `AofPersistence` | — |
 
