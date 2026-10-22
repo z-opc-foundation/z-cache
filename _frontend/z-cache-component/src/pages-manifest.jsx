@@ -1,4 +1,4 @@
-import { HomeOutlined, KeyOutlined, PieChartOutlined } from '@ant-design/icons'
+import { HomeOutlined, KeyOutlined, PieChartOutlined, ReadOutlined } from '@ant-design/icons'
 import Overview from './pages/Overview'
 import Keys from './pages/Keys'
 
@@ -7,6 +7,7 @@ export {default as Overview} from './pages/Overview'
 export {default as Keys} from './pages/Keys'
 import HomePage from './pages/HomePage'
 import CacheApp from './pages/CacheApp.jsx'
+import ComponentDocPage from './pages/ComponentDoc.jsx'
 
 /** 菜单 + 路由清单（lead 008 §10/§14/§16 批量落地）。App 壳在 suit 侧组装。 */
 export const appMeta = { title: 'z-cache 缓存中心', short: 'z-cache' }
@@ -15,14 +16,18 @@ export const menuItems = [
     { key: '/z-cache/home', label: '首页', icon: <HomeOutlined /> },
     { key: '/z-cache/overview', label: '总览', icon: <PieChartOutlined /> },
     { key: '/z-cache/keys', label: '键浏览', icon: <KeyOutlined /> },
+    { key: '/z-cache/docs', label: '组件文档', icon: <ReadOutlined /> },
 ]
 
 export const routes = [
     { path: '/z-cache/home', Component: HomePage },
     { path: '/z-cache/overview', Component: Overview },
     { path: '/z-cache/keys', Component: Keys },
+    { path: '/z-cache/docs', Component: ComponentDocPage },
     { path: '/z-cache/:rest*', Component: CacheApp },
 ]
 
 export { default as HomePage } from './pages/HomePage'
 export { default as LoginPage } from './pages/LoginPage'
+// 主壳接线用：文档页统一以 ComponentDocPage 这个名字从主入口导出。
+export { default as ComponentDocPage } from './pages/ComponentDoc.jsx'

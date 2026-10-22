@@ -7,4 +7,4 @@
  * "does not provide an export named 'HomePage'"（独立壳 z-cache-suit 就是这么白屏的）。
  * 补齐后，组件的公开出口与 manifest 实际提供的东西一致。
  */
-export {menuItems, routes, Overview, Keys, HomePage, LoginPage} from './pages-manifest.jsx'
+export {menuItems, routes, Overview, Keys, HomePage, LoginPage, ComponentDocPage} from './pages-manifest.jsx'
