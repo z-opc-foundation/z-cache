@@ -206,6 +206,7 @@ kubectl -n z-cache rollout status statefulset/z-cache
 | labels | Service / StatefulSet / PVC 上带 `compare-target: redis` | 照抄保留 | 线上既有标签，不动 |
 | redis 的 resources | 空（`resources: {}`） | 照抄为空 | 不擅自加资源限制 |
 | z-cache 的 resources.limits | 只有 `memory: 1Gi`（无 cpu limit） | 照抄 | 不擅自加 cpu limit |
+| SA 令牌自动挂载 | `automount != false`（未关） | 同样不含该字段 | 本域是两个 **StatefulSet**，而 SA 令牌收敛的方案 §十 把 **10 个 StatefulSet 列为卡内口径外的扩展项**（有状态滚动会按序号逐个重建 ⇒ 有数据面中断窗口，需单独安排、清单来源分散）⇒ **当前未关是已知且有意的状态，不是漏项**；本清单也不引入该字段 |
 
 ## 6. 待办（不在本任务范围内）
 
