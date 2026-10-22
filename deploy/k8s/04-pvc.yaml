@@ -1,0 +1,38 @@
+# ============================================================
+# z-cache —— PersistentVolumeClaim（z-cache 的数据盘）
+# 线上实况（/tmp/zdeploy-base/z-cache.yaml 导出为准）：
+#   PVC  z-cache-data  2Gi  ReadWriteOnce  storageClass local-path  Filesystem
+#   labels app=z-cache, compare-target=redis
+#   被 StatefulSet z-cache 挂在 /data
+#
+# ⚠ 这块盘是**节点本地**存储（rancher.io/local-path）：
+#   线上已绑到 zifang001（PV 注解 volume.kubernetes.io/selected-node=zifang001），
+#   与 StatefulSet z-cache 的 nodeSelector（zifang001）互相印证 —— 两者必须一致，
+#   否则 Pod 挂不上盘、一直 Pending。
+#   ⇒ 换节点 = 换一块盘（数据不跟着走），迁移要人工搬数据。
+#
+# ⚠ 对已有 PVC 执行 apply 是幂等的：不会重绑、不会扩容、不会清数据。
+#   **绝不要 kubectl delete pvc z-cache-data -n z-cache** —— local-path 上删 PVC
+#   会连带删掉 PV 里的数据。
+#
+# ⚠ redis 的盘（data-redis-0）是 StatefulSet 的 volumeClaimTemplates 自动建的，
+#   **不在本文件里**（见 02-statefulset-redis.yaml）。
+# ============================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: z-cache-data
+  namespace: z-cache
+  labels:
+    app: z-cache
+    # 线上 PVC 上带着这个标签（用途：标记它是 redis 的对比实现）⇒ 照抄。
+    compare-target: redis
+    app.kubernetes.io/part-of: z-opc-foundation
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  volumeMode: Filesystem
+  resources:
+    requests:
+      storage: 2Gi
