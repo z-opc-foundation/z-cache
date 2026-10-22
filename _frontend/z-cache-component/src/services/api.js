@@ -22,7 +22,8 @@ import request from '@yuku123/z-frontend-common'
  * 实测报文形状（对着 CacheProxyController 源码，不是猜的）：
  *   GET /api/cache/__instance       → {jvm, surface:"RESP2/TCP", httpSurfaceOfZCache, lifecycleBean,
  *                                       isServerStartedClaimedByStarter, serverFieldReflected, serverReflectError,
- *                                       embeddedRunning, boundPort, storeAvailable,
+ *                                       embeddedRunning, boundPort, storeAvailable, storeAvailableNote,
+ *                                       embeddedReadPathUsable, embeddedReadPathUsableNote,
  *                                       serverPortFromSystemProperty, serverPortFromSpringEnv,
  *                                       serverPortResolutionDiverges, configuredPort, acceptingNow,
  *                                       embeddedPortOwnedByThisJvm, foreignListenerSuspected,
@@ -35,10 +36,19 @@ import request from '@yuku123/z-frontend-common'
  *                                       client:{present, transportConnected, dbsize, target, authority},
  *                                       authorityDiverges, foreignListenerSuspected}
  *   GET /api/cache/keys             → {pattern, limit, sourceUsed, db, matchedTotal, truncated,
- *                                       keys:[{key, type, ttlSeconds, byteLength?}], authority
- *                                       [, dbIgnoredForClientPath, dbIgnoreReason]}
- *                                       路 B 的行: {key, type, ttlSeconds} 且 type 可能是 {command,error} 对象
- *   GET /api/cache/key?key=&db=     → {key, sourceUsed, db, type, exists, ttlSeconds, pttlMillis, keyVersion,
+ *                                       keys:[{key, type, typeNote, typeSource, desyncSuspect,
+ *                                              desyncReason?, rawReply?, ttlSeconds, ttlSecondsError?,
+ *                                              ttlSecondsNote?, byteLength, byteLengthNote, authority}],
+ *                                       authority [, dbIgnoredForClientPath, dbIgnoreReason]
+ *                                       [, desyncRows, totalRows, desyncRate, desyncNote, typeVocabulary]}
+ *                                       路 B 的行：type 是**归一后的大写枚举名**（STRING/HASH/LIST/SET/ZSET/NONE）
+ *                                       或 null；null 且 desyncSuspect=true ⇒ 这一行的应答与所发命令对不上
+ *                                       （串台），**不采信**，原始应答留在 rawReply、判据在 desyncReason。
+ *                                       byteLength 恒为 null（路 B 不发 STRLEN）⇒ 页面显示"未测"，
+ *                                       不是"非 string"（那会把"没测"渲染成否定结论）。
+ *   GET /api/cache/key?key=&db=     → {key, sourceUsed, db, type, typeNote, typeSource, desyncSuspect,
+ *                                       desyncReason?, rawReply?, ttlSeconds, ttlSecondsError?,
+ *                                       pttlMillis, pttlMillisError?, keyVersion,
  *                                       value:{…按类型…}, authority}
  *   GET /api/cache/info             → {authorityOfClient, raw, sections{Server/Clients/Memory/Stats/Keyspace},
  *                                       hardcodedInUpstream[], responderVsOwnBuild, embedded{…}}
@@ -56,6 +66,9 @@ import request from '@yuku123/z-frontend-common'
  *                                       notCountedAsIssued, readOnlyCommandsAllowedByWhitelist[],
  *                                       neverIssuedDespiteBeingSupportedByServer[], neverIssuedReason, serverBindAddress}
  * 出错时后端回 {status:"error", source:"z-opc-cache-read-api", message, hint} + HTTP 400/404/503。
+ *   503（路 A 不可用）额外带 serverFieldReflected / serverReflectError / embeddedRunning /
+ *   storeAvailable / embeddedReadPathUsable / blockedReason，**hint 里写的是真因**
+ *   （反射失败 / 没 bind 上=B1 / store 为 null 三分支），不是固定那句"反射为空"。
  *
  * 刻意不提供的东西（不是遗漏）：
  *   - 任何写操作。后端只有 @GetMapping，前端也就不会有"清空 / 批量删除 / 设值"这类按钮 ——

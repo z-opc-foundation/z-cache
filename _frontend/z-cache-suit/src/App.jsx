@@ -2,6 +2,7 @@ import { Component, useEffect, useState } from 'react'
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
 import { AppLayout } from '@yuku123/z-frontend-common'
 import { menuItems, routes, HomePage, LoginPage } from '@yuku123/z-cache-component/pages'
+import { CacheApp } from '@yuku123/z-cache-component'
 import { Result, Button } from 'antd'
 
 class ErrorBoundary extends Component {
@@ -69,6 +70,10 @@ export default function App() {
                         {routes.map((r) => (
                             <Route key={r.path} path={r.path} element={<r.Component />} />
                         ))}
+                        {/* 组件自己的完整 App 壳（z-opc 主壳里就是以 /cache/* 挂进来的那一个）：
+                            键浏览页在它的 /keys 子路由上。suit 里给它一个 /z-cache/app/* 的落点，
+                            浏览器实测就能直接打到与主壳同一个组件。 */}
+                        <Route path="/z-cache/app/*" element={<CacheApp/>}/>
                         <Route path="*" element={<NotFound />} />
                     </Route>
                 </Routes>

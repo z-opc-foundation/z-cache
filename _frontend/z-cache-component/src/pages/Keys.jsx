@@ -6,9 +6,13 @@ import {cacheApi} from '../services/api'
 
 const {Title, Paragraph, Text} = Typography
 
+/**
+ * type 的取值域与路 A/路 B 统一成**大写**枚举名（STRING/HASH/LIST/SET/ZSET/NONE）。
+ * 旧版这里写的是小写（'string'/'hash'…）⇒ 后端归一成大写后一个都匹配不上，标签全变成默认色。
+ */
 function typeTag(t) {
-    const map = {string: 'blue', hash: 'green', list: 'purple', set: 'orange', zset: 'cyan'}
-    return <Tag color={map[t] || 'default'}>{t || '—'}</Tag>
+    const map = {STRING: 'blue', HASH: 'green', LIST: 'purple', SET: 'orange', ZSET: 'cyan', NONE: 'default'}
+    return <Tag color={map[t] || 'default'}>{t || '未采信'}</Tag>
 }
 
 export default function Keys() {
@@ -44,9 +48,21 @@ export default function Keys() {
     const columns = [
         {title: '键名', key: 'name', ellipsis: true,
             render: (_, r) => <Text code style={{fontSize: 12}}>{r.name || r.key}</Text>},
-        {title: '类型', dataIndex: 'type', key: 'type', width: 100, render: typeTag},
-        {title: 'TTL', dataIndex: 'ttl', key: 'ttl', width: 100,
-            render: (v) => v == null ? '—' : v < 0 ? '永不过期' : `${v}s`},
+        {title: '类型', dataIndex: 'type', key: 'type', width: 100,
+            // 「没测」时显示什么 —— 假绿列探针要靠这个声明把"没测"与"测过且正常"分开
+            unmeasured: '未采信',
+            render: (v, r) => (r?.desyncSuspect
+                ? <Tag color="red">应答错位·未采信</Tag>
+                : typeTag(v))},
+        {title: 'TTL', dataIndex: 'ttlSeconds', key: 'ttlSeconds', width: 100,
+            // ⚠️ 旧版这一列的取键写的是 ttl（后端从来没给过 'ttl' 这个键，给的是 ttlSeconds）
+            // ⇒ 这一列一直是空的（假绿列：键名对不上，列全是空）。TASK-20260925-041 由探针抓出并修掉。
+            // （注：探针是按字面量扫 dataIndex 的，所以这里**不能**把旧写法原样写进注释 ——
+            //  否则它会当成页面真有一个 ttl 列，造出一个查无此列的假红。）
+            unmeasured: '未测',
+            render: (v, r) => (r?.ttlSecondsError
+                ? <Tag color="red">读数不可信</Tag>
+                : (v == null ? '未测' : (v < 0 ? '永不过期' : `${v}s`)))},
         {title: '操作', key: 'op', width: 100,
             render: (_, r) => <Button size="small" onClick={() => openDetail(r)}>详情</Button>},
     ]

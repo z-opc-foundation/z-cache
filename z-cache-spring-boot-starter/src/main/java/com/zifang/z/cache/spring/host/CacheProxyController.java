@@ -2,6 +2,11 @@ package com.zifang.z.cache.spring.host;
 
 import com.zifang.util.json.JsonUtil;
 import com.zifang.z.cache.client.ZCacheClient;
+import com.zifang.z.cache.common.protocol.RespArray;
+import com.zifang.z.cache.common.protocol.RespBulkString;
+import com.zifang.z.cache.common.protocol.RespError;
+import com.zifang.z.cache.common.protocol.RespInteger;
+import com.zifang.z.cache.common.protocol.RespSimpleString;
 import com.zifang.z.cache.core.server.RedisServer;
 import com.zifang.z.cache.core.storage.MemoryStore;
 import org.springframework.beans.factory.ObjectProvider;
@@ -108,6 +113,19 @@ public class CacheProxyController {
             "SMEMBERS", "SCARD", "SISMEMBER",
             "ZCARD", "ZSCORE", "ZRANGE", "INFO");
 
+    /**
+     * 归一后 type 的<b>唯一</b>合法取值域：{@code MemoryStore.DataType} 的枚举名（<b>大写</b>）。
+     *
+     * <p>为什么统一成大写（D2）：上游 server 回的是小写 {@code "string"}，而路 A 给的是
+     * {@code MemoryStore.DataType.name()} = {@code "STRING"}。两路本来就不等价，
+     * 前端还拿大写去比 ⇒ 类型筛选永远 0 命中。现在两路都在后端归一成大写，前端直接比。
+     *
+     * <p>为什么是这个集合而不是"任何字符串都算类型"（D3）：归一<b>不</b>等于把错位的应答也洗成合法类型。
+     * 拿不到这六个之一，就不是类型名 ⇒ 标 {@code desyncSuspect}，不显示成类型。
+     */
+    private static final Set<String> VALID_TYPES = unmodifiableSet(
+            "STRING", "HASH", "LIST", "SET", "ZSET", "NONE");
+
     private final ObjectProvider<ZCacheClient> clientProvider;
     private final ObjectProvider<ZCacheEmbeddedServerConfig> embeddedProvider;
 
@@ -157,6 +175,14 @@ public class CacheProxyController {
         out.put("embeddedRunning", Boolean.valueOf(running));
         out.put("boundPort", Integer.valueOf(boundPort));
         out.put("storeAvailable", Boolean.valueOf(store != null));
+        // D1：storeAvailable 与"路 A 503"曾经互相打脸 —— storeAvailable 取的是 store 对象在不在
+        // （不 gate running），而 storeOrNull() 额外有一道 isRunning() 闸门。
+        // ⇒ 这两个字段同页并列，谁看得懂谁是权威一目了然：能不能读 = store!=null && running。
+        out.put("storeAvailableNote", "store 对象在不在（**不** gate isRunning）"
+                + " ⇒ storeAvailable=true 与「路 A 503」可以并存，那不是矛盾，是两个口径");
+        out.put("embeddedReadPathUsable", Boolean.valueOf(store != null && running));
+        out.put("embeddedReadPathUsableNote", "路 A 真正能不能读 = store!=null && isRunning()；"
+                + "false ⇒ /keys?source=embedded 与 /hotkeys 必然 503，hint 里写的是真因（见 D1）");
 
         // ---- 端口配置：两条解析链的分歧是 z-cache 特有的坑（E8）
         String staticBlockPort = System.getProperty("z.cache.server.port");
@@ -207,7 +233,7 @@ public class CacheProxyController {
         out.put("invariant", "内嵌 bind 成功之后，路 A(embedded) 与 路 B(client) 的 dbsize 必须恒等；"
                 + "不等即证明本 controller 在编数据。当前 bind 未成功 ⇒ 两路必然分歧，这是预期的 B1 现象。");
         out.put("blockedReason", running ? null
-                : "B1: 本 JVM 的 RedisServer 没有 bind 上 " + effectiveConfigured
+                : "B1: 本 JVM 的 RedisServer 没有 bind 上 " + portText()
                         + "（实测 java.net.BindException: Address already in use，见交接文件 §二 E5）。"
                         + "解法见 §十。");
 
@@ -264,9 +290,10 @@ public class CacheProxyController {
             emb.put("storeUptimeSeconds", Long.valueOf((System.currentTimeMillis() - store.getStartTime()) / 1000L));
             emb.put("storeUptimeNote", "自 MemoryStore 构造起算，【不是】自 bind 成功起算；bind 失败时它照样在涨");
         } else {
-            emb.put("unavailableReason", server == null
-                    ? "反射拿不到 ZCacheEmbeddedServerConfig.SHARED_SERVER（见 reflectError）"
-                    : "RedisServer 实例存在但 getStore() 返回 null");
+            // D1 第三处受害者：这里也把"没 bind"说成"反射拿不到"。
+            // 改成与 /keys、/hotkeys 同一句真因（分三支），三个端点的口径从此一致。
+            emb.put("unavailableReason", embeddedUnavailableHint());
+            emb.put("embeddedReadPathUsable", Boolean.FALSE);
         }
         out.put("embedded", emb);
 
@@ -325,8 +352,7 @@ public class CacheProxyController {
         MemoryStore store = storeOrNull();
         boolean useEmbedded = !"client".equals(source) && store != null;
         if (!"client".equals(source) && "embedded".equals(source) && store == null) {
-            writeJson(resp, 503, err("in-process MemoryStore unavailable",
-                    reflectError == null ? "SHARED_SERVER 反射为空" : reflectError));
+            writeJson(resp, 503, embeddedUnavailable("in-process MemoryStore unavailable"));
             return;
         }
         out.put("sourceUsed", useEmbedded ? "embedded" : "client");
@@ -364,7 +390,28 @@ public class CacheProxyController {
             List<String> page = ks.size() > cap ? ks.subList(0, cap) : ks;
             out.put("matchedTotal", Integer.valueOf(ks.size()));
             out.put("truncated", Boolean.valueOf(ks.size() > cap));
-            out.put("keys", describeClient(page, client));
+            List<Map<String, Object>> rows = describeClient(page, client);
+            out.put("keys", rows);
+            // D3：本次采样的错位数与总数**必须**在响应体顶层给出 ——
+            // 页面要在表头黄标里写明"路 B 本次有 N/M 行的应答对不上，这些行的类型/TTL 不参与展示"，
+            // 否则读者只能看到一堆空格子，不知道是"没数据"还是"数据不可信"。
+            int desync = 0;
+            for (Map<String, Object> r : rows) {
+                if (Boolean.TRUE.equals(r.get("desyncSuspect"))) {
+                    desync++;
+                }
+            }
+            out.put("desyncRows", Integer.valueOf(desync));
+            out.put("totalRows", Integer.valueOf(rows.size()));
+            out.put("desyncRate", Double.valueOf(rows.isEmpty() ? 0d
+                    : (double) desync / (double) rows.size()));
+            out.put("desyncNote",
+                    "路 B 的每行要发命令（TYPE/TTL），走的是**业务共用**的那条 RESP 连接；"
+                            + "本 JVM 从没 bind 过 6379（见 blockedReason），对面是谁也不确定。"
+                            + "⇒ 本次 " + rows.size() + " 行里有 " + desync
+                            + " 行的应答与所发命令对不上（疑似串台），这些行的 type/TTL **不参与展示**，"
+                            + "原始应答保留在该行的 rawReply 里，判据见该行的 desyncReason。");
+            out.put("typeVocabulary", "大写枚举名，与路 A 同一取值域：" + String.join("/", VALID_TYPES));
         } catch (Exception e) {
             out.put("keys", Collections.emptyList());
             out.put("error", e.getClass().getName() + ": " + e.getMessage());
@@ -399,7 +446,7 @@ public class CacheProxyController {
             }
             MemoryStore.DataType t = store.getKeyType(key, db);
             out.put("db", Integer.valueOf(db));
-            out.put("type", t == null ? "none" : t.name());
+            out.put("type", t == null ? "NONE" : t.name());
             out.put("exists", Boolean.valueOf(store.existsDb(db, key)));
             out.put("ttlSeconds", Long.valueOf(store.ttlDb(db, key)));
             out.put("pttlMillis", Long.valueOf(store.pttlDb(db, key)));
@@ -441,22 +488,45 @@ public class CacheProxyController {
         out.put("dbIgnoredForClientPath", Boolean.TRUE);
         out.put("authority", authorityOfClient(serverRunning(), isConnected(client)));
         try {
-            out.put("type", safeSend(client, "TYPE", key));
-            out.put("ttlSeconds", client.ttl(key));
-            out.put("pttlMillis", client.pttl(key));
-            String t = String.valueOf(out.get("type"));
+            // D2：type 归一成大写枚举名（与路 A 同一取值域）；D3：拿不到就 null + 标记，不假装
+            TypeReading tr = normalizeTypeReading(safeSend(client, "TYPE", key));
+            out.put("type", tr.desync || tr.failed ? null : tr.value);
+            out.put("typeNote", tr.note);
+            out.put("typeSource", tr.source);
+            out.put("desyncSuspect", Boolean.valueOf(tr.desync || tr.failed));
+            if (tr.desync || tr.failed) {
+                out.put("rawReply", tr.raw);
+                out.put("desyncReason", tr.note);
+            }
+            try {
+                out.put("ttlSeconds", client.ttl(key));
+            } catch (Exception e) {
+                out.put("ttlSeconds", null);
+                out.put("ttlSecondsError", e.getClass().getSimpleName() + ": " + e.getMessage());
+                out.put("desyncSuspect", Boolean.TRUE);
+            }
+            try {
+                out.put("pttlMillis", client.pttl(key));
+            } catch (Exception e) {
+                out.put("pttlMillis", null);
+                out.put("pttlMillisError", e.getClass().getSimpleName() + ": " + e.getMessage());
+            }
+            String t = tr.desync || tr.failed ? null : tr.value;
             Map<String, Object> val = new LinkedHashMap<String, Object>();
-            if ("string".equals(t)) {
+            if (t == null) {
+                // 类型不可信 ⇒ 不按类型去取值（按错的类型发命令只会再多一次串台机会）
+                val.put("note", "类型读数不可信 ⇒ 不按类型取值（见 desyncReason / rawReply）");
+            } else if ("STRING".equals(t)) {
                 val.put("value", safeSend(client, "GET", key));
-            } else if ("hash".equals(t)) {
+            } else if ("HASH".equals(t)) {
                 val.put("entries", safeSend(client, "HGETALL", key));
-            } else if ("list".equals(t)) {
+            } else if ("LIST".equals(t)) {
                 val.put("length", safeSend(client, "LLEN", key));
                 val.put("items", safeSend(client, "LRANGE", key, "0", String.valueOf(cap - 1)));
-            } else if ("set".equals(t)) {
+            } else if ("SET".equals(t)) {
                 val.put("cardinality", safeSend(client, "SCARD", key));
                 val.put("members", safeSend(client, "SMEMBERS", key));
-            } else if ("zset".equals(t)) {
+            } else if ("ZSET".equals(t)) {
                 val.put("cardinality", safeSend(client, "ZCARD", key));
                 val.put("membersWithScores", safeSend(client, "ZRANGE", key, "0", String.valueOf(cap - 1), "WITHSCORES"));
             }
@@ -519,8 +589,10 @@ public class CacheProxyController {
                         HttpServletResponse resp) throws Exception {
         MemoryStore store = storeOrNull();
         if (store == null) {
-            writeJson(resp, 503, err("in-process MemoryStore unavailable",
-                    reflectError == null ? "SHARED_SERVER 反射为空" : reflectError));
+            // D1：这一处与 /keys?source=embedded 用的是**同一句撒谎的表达式**
+            // （reflectError == null ? "SHARED_SERVER 反射为空" : reflectError），
+            // 所以 2026-09-26 01:44 那轮普查里 /cache/stats 的 ERROR 也是它背的锅。
+            writeJson(resp, 503, embeddedUnavailable("in-process MemoryStore unavailable"));
             return;
         }
         if (db < 0 || db >= store.getDbCount()) {
@@ -675,6 +747,79 @@ public class CacheProxyController {
             return null;
         }
         return s.getStore();
+    }
+
+    // ------------------------------------------------------------------ D1：路 A 不可用的真因
+
+    /**
+     * 路 A（进程内）当前处于什么状态 —— <b>三态 + 口径</b>，不许再压缩成一句"反射为空"。
+     *
+     * <p>旧实现把三件不同的事混成一句：{@code reflectError == null ? "SHARED_SERVER 反射为空" : reflectError}。
+     * 反射**成功**但 server 没 bind（isRunning()=false，B1）时，reflectError 必为空
+     * ⇒ 那句"反射为空"**必然**被打印出来，而它是错的（反射是成功的）。
+     *
+     * @return 键：serverReflected / reflectError / running / storeAvailable / embeddedReadPathUsable / blockedReason
+     */
+    private Map<String, Object> embeddedState() {
+        RedisServer s = resolveEmbeddedServer();
+        MemoryStore st = s == null ? null : s.getStore();
+        boolean running = s != null && s.isRunning();
+        Map<String, Object> m = new LinkedHashMap<String, Object>();
+        m.put("serverReflected", Boolean.valueOf(s != null));
+        m.put("reflectError", reflectError);
+        m.put("running", Boolean.valueOf(running));
+        m.put("storeAvailable", Boolean.valueOf(st != null));
+        m.put("embeddedReadPathUsable", Boolean.valueOf(st != null && running));
+        m.put("blockedReason", running ? null
+                : "B1: 本 JVM 的 RedisServer 没有 bind 上 " + portText()
+                        + "（实测 java.net.BindException: Address already in use，见交接文件 §二 E5）。"
+                        + "解法见 §十。");
+        return m;
+    }
+
+    /** 端口的文字形态：没注入（0）时不能写"没有 bind 上 0"这种看不懂的话 */
+    private String portText() {
+        return serverPortFromSpringEnv > 0 ? String.valueOf(serverPortFromSpringEnv)
+                : "(端口未注入/未知，@Value 未生效)";
+    }
+
+    /**
+     * 路 A 读不到数的**真因**（一句话，含 B1 点名）。
+     * 分支与 {@link #embeddedState()} 的字段一一对应，不猜、不兜底成固定文案。
+     */
+    private String embeddedUnavailableHint() {
+        Map<String, Object> st = embeddedState();
+        if (st.get("reflectError") != null) {
+            return "内嵌 server 反射失败：" + st.get("reflectError")
+                    + " ⇒ 这一路在本进程里取不到数（不是「缓存是空的」）";
+        }
+        if (!Boolean.TRUE.equals(st.get("serverReflected"))) {
+            return "内嵌 server 反射不到（SHARED_SERVER 为 null：static 块没跑到 / startServer 提前返回）"
+                    + " ⇒ 这一路在本进程里取不到数（不是「缓存是空的」）";
+        }
+        if (!Boolean.TRUE.equals(st.get("running"))) {
+            return "内嵌 server **反射成功但没有 bind 上端口**（isRunning()=false）"
+                    + " ⇒ 真因是 B1：本 JVM 的 RedisServer 起不来（实测 java.net.BindException: Address already in use，"
+                    + "6379 的属主是别的进程），不是反射问题。"
+                    + " 路 A 在本进程里用不了 ⇒ 请改看路 B，并注意路 B 读到的也不是本 JVM 的缓存（authority=EXTERNAL_PROCESS）。";
+        }
+        if (!Boolean.TRUE.equals(st.get("storeAvailable"))) {
+            return "内嵌 server 在跑但 getStore() 返回 null（store 没建起来）⇒ 这一路取不到数";
+        }
+        return "内嵌读路可用（store!=null && isRunning()=true）—— 本分支不该被走到，若看到请连同上下文报给工具作者";
+    }
+
+    /** 路 A 不可用时的 503 响应体：带真因 + 状态字段（不再只有一句错归因） */
+    private Map<String, Object> embeddedUnavailable(String message) {
+        Map<String, Object> m = err(message, embeddedUnavailableHint());
+        Map<String, Object> st = embeddedState();
+        m.put("serverFieldReflected", st.get("serverReflected"));
+        m.put("serverReflectError", st.get("reflectError"));
+        m.put("embeddedRunning", st.get("running"));
+        m.put("storeAvailable", st.get("storeAvailable"));
+        m.put("embeddedReadPathUsable", st.get("embeddedReadPathUsable"));
+        m.put("blockedReason", st.get("blockedReason"));
+        return m;
     }
 
     private boolean serverRunning() {
@@ -836,33 +981,226 @@ public class CacheProxyController {
         }
     }
 
+    // ------------------------------------------------------------------ D2 / D3：路 B 的 type 归一与错位标记
+
+    /**
+     * 归一后的 type 读数。
+     *
+     * <p><b>为什么不能直接把 {@code RespXxx} 交给 Jackson</b>（D2）：
+     * {@code safeSend} 返回的是 {@code RespSimpleString}/{@code RespBulkString} 这类 bean，
+     * 按 bean 序列化出来是 {@code {"value":"string"}} / {@code {"data":[...],"empty":false,"null":false,"string":"..."}} ——
+     * 前端拿到的不是"类型名"，是一坨协议细节的 JSON 原文，类型筛选永远 0 命中。
+     *
+     * <p><b>为什么归一之后还要标错位</b>（D3）：
+     * 归一只解决"形状"，不解决"内容对不对"。实测同一次响应里就有三种互斥形状：
+     * {@code {value:"string"}}（对）、{@code {data,empty,null,string}}（BulkString 里装的是<em>别的 key 名</em>）、
+     * {@code {value:"-1"}}（TTL 的整数应答落进了 TYPE 槽）。
+     * ⇒ 归一后若拿不到合法类型名，<b>不许</b>把它塞进大写枚举冒充类型（D2 末尾那句警告），
+     * 只能标记 {@code desyncSuspect} + 保留 {@code rawReply}，由页面降级显示。
+     */
+    private static final class TypeReading {
+        /** 合法类型名（大写）；不可信时为 null */
+        final String value;
+        /** 应答与"TYPE 的应答"不相容 ⇒ 疑似串台 */
+        final boolean desync;
+        /** 读命令本身失败（连接层异常 / 服务端报错）—— 不是错位，但也采信不了 */
+        final boolean failed;
+        /** 原始应答的可读形态（进 rawReply） */
+        final String raw;
+        /** 应答的协议形状名（进 typeSource） */
+        final String source;
+        /** 人话说明（进 typeNote） */
+        final String note;
+
+        TypeReading(String value, boolean desync, boolean failed, String raw, String source, String note) {
+            this.value = value;
+            this.desync = desync;
+            this.failed = failed;
+            this.raw = raw;
+            this.source = source;
+            this.note = note;
+        }
+    }
+
+    /**
+     * 归一 + 判形状。合法类型名只有 {@link #VALID_TYPES} 六个（大写枚举名，两路统一）。
+     *
+     * <p>协议类是 z-cache-common 里的（本仓同族模块，编译期可见），所以直接按类型判定；
+     * 只有"不认识的类"才退到反射兜底 —— 反射拿不到就报"形状不认识"，不猜。
+     */
+    private static TypeReading normalizeTypeReading(Object raw) {
+        if (raw == null) {
+            return new TypeReading(null, false, true, "(null)", "NONE",
+                    "没拿到应答（读命令没发出去或已返回 null）");
+        }
+        if (raw instanceof RespSimpleString) {
+            String v = ((RespSimpleString) raw).getValue();
+            return classifyTypeText(v, "RespSimpleString{value=" + v + "}", "RESP_SIMPLE_STRING");
+        }
+        if (raw instanceof RespBulkString) {
+            RespBulkString b = (RespBulkString) raw;
+            String v = b.isNull() ? null : b.getString();
+            return classifyTypeText(v, "RespBulkString{string=" + v + "}", "RESP_BULK_STRING");
+        }
+        if (raw instanceof RespInteger) {
+            long v = ((RespInteger) raw).getValue();
+            return new TypeReading(null, true, false, "RespInteger{value=" + v + "}", "RESP_INTEGER",
+                    "TYPE 槽里回来的是**整数应答**（" + v + "）—— 这不是类型名，"
+                            + "多半是 TTL 的应答串到了 TYPE 槽 ⇒ 该行不采信");
+        }
+        if (raw instanceof RespError) {
+            RespError e = (RespError) raw;
+            return new TypeReading(null, false, true,
+                    "RespError{errorType=" + e.getErrorType() + ", message=" + e.getMessage() + "}",
+                    "RESP_ERROR", "命令报错：" + e.getErrorType() + " / " + e.getMessage());
+        }
+        if (raw instanceof RespArray) {
+            RespArray a = (RespArray) raw;
+            return new TypeReading(null, true, false, "RespArray{size=" + a.size() + "}", "RESP_ARRAY",
+                    "TYPE 槽里回来的是**数组应答**（size=" + a.size() + "）—— 不是类型名 ⇒ 该行不采信");
+        }
+        if (raw instanceof String) {
+            return classifyTypeText((String) raw, (String) raw, "PLAIN_STRING");
+        }
+        if (raw instanceof Number) {
+            return new TypeReading(null, true, false, raw.getClass().getSimpleName() + "{" + raw + "}",
+                    "PLAIN_NUMBER", "TYPE 槽里回来的是数字（" + raw + "）—— 不是类型名 ⇒ 该行不采信");
+        }
+        if (raw instanceof Map) {
+            Object err = ((Map<?, ?>) raw).get("error");
+            if (err != null) {
+                return new TypeReading(null, false, true, String.valueOf(raw), "SAFE_SEND_ERROR",
+                        "读命令失败：" + err);
+            }
+        }
+        // 不认识的类：反射兜底一次（getString/getValue），拿不到就报"形状不认识"——不猜
+        Object refl = reflectiveString(raw);
+        if (refl != null) {
+            return classifyTypeText(String.valueOf(refl),
+                    raw.getClass().getSimpleName() + "{" + refl + "}", "REFLECTED");
+        }
+        return new TypeReading(null, true, false, raw.getClass().getName(), "UNKNOWN_SHAPE",
+                "不认识的应答形状（" + raw.getClass().getName() + "）⇒ 该行不采信");
+    }
+
+    /** 拿字符串形态当类型名判：合法 ⇒ 采信；不合法 ⇒ 判错位，并说清错在哪 */
+    private static TypeReading classifyTypeText(String v, String raw, String source) {
+        if (v == null || v.isEmpty()) {
+            return new TypeReading(null, true, false, raw, source,
+                    "TYPE 应答是空的 ⇒ 采信不了（该行不采信）");
+        }
+        String upper = v.trim().toUpperCase(java.util.Locale.ROOT);
+        if (VALID_TYPES.contains(upper)) {
+            return new TypeReading(upper, false, false, raw, source,
+                    "归一自 " + source + "（原始值 " + v + "）");
+        }
+        if (v.trim().matches("^-?[0-9]+$")) {
+            return new TypeReading(null, true, false, raw, source,
+                    "TYPE 槽里回来的是**整数应答**（" + v.trim() + "）—— 不是类型名，"
+                            + "多半是 TTL 的应答串到了 TYPE 槽 ⇒ 该行不采信");
+        }
+        return new TypeReading(null, true, false, raw, source,
+                "TYPE 槽里回来的是 \"" + v + "\"，不是类型名（合法值域：" + String.join("/", VALID_TYPES)
+                        + "）—— 多半是**别的命令或别的 key 的应答**串台 ⇒ 该行不采信");
+    }
+
+    /** 反射兜底：找 getString() / getValue()；都没有就返回 null（由上层判"形状不认识"） */
+    private static Object reflectiveString(Object o) {
+        for (String m : new String[]{"getString", "getValue"}) {
+            try {
+                java.lang.reflect.Method mm = o.getClass().getMethod(m);
+                Object v = mm.invoke(o);
+                if (v != null) {
+                    return v;
+                }
+            } catch (Throwable ignore) {
+                // 没有这个方法 / 调不动 ⇒ 试下一个
+            }
+        }
+        return null;
+    }
+
     private List<Map<String, Object>> describeEmbedded(List<String> keys, MemoryStore store, int db) {
         List<Map<String, Object>> rows = new ArrayList<Map<String, Object>>();
         for (String k : keys) {
             Map<String, Object> r = new LinkedHashMap<String, Object>();
             r.put("key", k);
             MemoryStore.DataType t = store.getKeyType(k, db);
-            r.put("type", t == null ? "none" : t.name());
+            // 两路统一大写枚举名（D2）：路 A 原来给 "none"（小写），路 B 给 "string"（小写），
+            // 前端却拿大写去比 ⇒ 筛选永远 0 命中。现在两路都是 MemoryStore.DataType.name()。
+            r.put("type", t == null ? "NONE" : t.name());
+            r.put("typeNote", t == null ? "该库里没有这个 key" : "路 A：MemoryStore 进程内直读（权威）");
+            r.put("typeSource", "EMBEDDED_STORE");
+            r.put("desyncSuspect", Boolean.FALSE);
             r.put("ttlSeconds", Long.valueOf(store.ttlDb(db, k)));
             r.put("byteLength", Integer.valueOf(t == MemoryStore.DataType.STRING
                     ? len(store.getDb(db, k)) : -1));
+            // D4：区分"这一格没测"（null）与"测了、结论是非 string"（-1）
+            r.put("byteLengthNote", t == MemoryStore.DataType.STRING
+                    ? "路 A：MemoryStore 里的原始字节长度"
+                    : "路 A：该 key 不是 string，没有长度可言（-1 是**测出来的**结论，不是没测）");
             r.put("authority", "THIS_JVM_IN_PROCESS");
             rows.add(r);
         }
         return rows;
     }
 
+    /**
+     * 路 B 的一行。
+     *
+     * <p><b>D2</b>：type 不再是原始 RESP bean，而是归一后的字符串（大写枚举名）或 null。
+     * <p><b>D3</b>：应答错位必须**标记并降级**，不许归一化到"看起来正常" ——
+     * 拿不到合法类型名 ⇒ {@code type=null} + {@code desyncSuspect=true} + {@code rawReply} 保留原始应答。
+     * <p><b>D4</b>：路 B 没有行内长度来源（不发 STRLEN）⇒ {@code byteLength=null} + note，
+     * <b>不</b>用 -1 冒充"非 string"（那会把"没测"渲染成"测过的否定结论"）。
+     */
     private List<Map<String, Object>> describeClient(List<String> keys, ZCacheClient client) {
         List<Map<String, Object>> rows = new ArrayList<Map<String, Object>>();
+        String authority = authorityOfClient(serverRunning(), isConnected(client));
         for (String k : keys) {
             Map<String, Object> r = new LinkedHashMap<String, Object>();
             r.put("key", k);
-            r.put("type", safeSend(client, "TYPE", k));
-            try {
-                r.put("ttlSeconds", client.ttl(k));
-            } catch (Exception e) {
-                r.put("ttlSecondsError", e.getClass().getSimpleName() + ": " + e.getMessage());
+
+            TypeReading tr = normalizeTypeReading(safeSend(client, "TYPE", k));
+            boolean suspect = tr.desync || tr.failed;
+            r.put("type", suspect ? null : tr.value);
+            r.put("typeNote", tr.note);
+            r.put("typeSource", tr.source);
+            if (suspect) {
+                // 原始应答留底：这是"为什么不信这一行"的证据，不给就只剩一个空格子
+                r.put("rawReply", tr.raw);
             }
+
+            if (suspect) {
+                // 同行 TYPE 都没对 ⇒ 整行不采信；此时**不再**为它多发一条 TTL 命令
+                // （每多一条命令就多一次串台机会 —— D3 的第 3 条：别为了填列而填列）
+                r.put("ttlSeconds", null);
+                r.put("ttlSecondsNote", "同行 TYPE 已不可信 ⇒ 本行整体不采信，未再发 TTL");
+            } else {
+                try {
+                    r.put("ttlSeconds", client.ttl(k));
+                } catch (Exception e) {
+                    r.put("ttlSeconds", null);
+                    r.put("ttlSecondsError", e.getClass().getSimpleName() + ": " + e.getMessage());
+                    // TTL 读失败 ⇒ 这一行不可信（无论原因是应答串台还是连接层出错）
+                    suspect = true;
+                    r.put("desyncReason", "TTL 读取失败：" + e.getClass().getSimpleName() + ": " + e.getMessage());
+                }
+            }
+            r.put("desyncSuspect", Boolean.valueOf(suspect));
+            if (suspect && !r.containsKey("desyncReason")) {
+                r.put("desyncReason", tr.desync
+                        ? "TYPE 应答与所发命令对不上（" + tr.note + "）"
+                        : tr.note);
+            }
+            if (suspect) {
+                // 不可信的行，type 一律不下结论（不许显示"看起来正常"的类型）
+                r.put("type", null);
+            }
+
+            r.put("byteLength", null);
+            r.put("byteLengthNote", "路 B 未发 STRLEN（本卡不为了填列而多发一条命令）");
+            r.put("authority", authority);
             rows.add(r);
         }
         return rows;

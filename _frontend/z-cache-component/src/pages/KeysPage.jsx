@@ -4,18 +4,23 @@ import {
     Radio, Select, Space, Table, Tag, Tooltip,
 } from 'antd'
 import {ReloadOutlined, SearchOutlined} from '@ant-design/icons'
-import {cacheApi, cacheErrorText, authorityTag, fmtBytes, fmtTtl, asText} from '../services/api'
+import {cacheApi, cacheErrorText, authorityTag, fmtBytes, fmtTtl} from '../services/api'
 import {PageHeader} from '@yuku123/z-frontend-common/ui'
 
-/** MemoryStore.DataType 的实际取值（z-cache-core 1.3.1 枚举：NONE/STRING/HASH/LIST/SET/ZSET） */
+/**
+ * type 的取值域（两路统一成**大写**枚举名）：
+ *   路 A = MemoryStore.DataType.name()（STRING/HASH/LIST/SET/ZSET，缺 key 为 NONE）
+ *   路 B = 后端把 RESP 应答归一后的同一个集合（D2）
+ * 旧版这里拿大写去比小写（server 回 "string"）⇒ 类型筛选永远 0 命中。
+ */
 const TYPE_COLOR = {
-    STRING: 'blue', HASH: 'purple', LIST: 'cyan', SET: 'orange', ZSET: 'magenta', none: 'default',
+    STRING: 'blue', HASH: 'purple', LIST: 'cyan', SET: 'orange', ZSET: 'magenta', NONE: 'default',
 }
 
 const TYPE_OPTIONS = [
     {value: 'STRING', label: 'STRING'}, {value: 'HASH', label: 'HASH'},
     {value: 'LIST', label: 'LIST'}, {value: 'SET', label: 'SET'},
-    {value: 'ZSET', label: 'ZSET'}, {value: 'none', label: 'NONE'},
+    {value: 'ZSET', label: 'ZSET'}, {value: 'NONE', label: 'NONE'},
 ]
 
 function renderCell(v) {
@@ -102,34 +107,82 @@ export default function KeysPage() {
 
     const shown = useMemo(() => (typeFilter ? rows.filter((r) => r.type === typeFilter) : rows), [rows, typeFilter])
 
+    /**
+     * 列定义。
+     *
+     * ⚠️ **`unmeasured` 字段是给假绿列探针（fake_green_column_probe.py）读的契约**，不是装饰：
+     * 探针现在把"这一列在实测响应里恒为 null"（= 后端**没测**这一列）与"这一列测过且有值"分成两类。
+     * 只有"页面显式声明了没测时显示什么"的列，才算"已声明降级"；没声明 ⇒ 探针判**嫌疑**，
+     * 因为那种列很可能正把"没测"渲染成一句正面断言（本卡 D4 的病灶：
+     * `v == null || v < 0 ? '非 string' : …` —— "这一路压根没测"被显示成"这个 key 不是 string"）。
+     * ⇒ 声明里的文字必须与 render 里真正渲染的文字一致。
+     */
     const columns = useMemo(() => [
         {
             title: 'key', dataIndex: 'key', key: 'key', ellipsis: true,
             render: (v) => <a onClick={() => openDetail(v)}><code>{v}</code></a>
         },
         {
-            title: '类型', dataIndex: 'type', key: 'type', width: 110,
-            // ⚠ 路 B 的 type 走 safeSend(client,"TYPE") —— 命令失败时后端回的是 {command,error} 对象，
-            //   直接塞进 React 会 "Objects are not valid as a React child" 崩表。这里必须先归一。
-            render: (v) => {
-                const t = asText(v)
-                const raw = (v && typeof v === 'object') ? JSON.stringify(v) : undefined
-                return <Tag color={TYPE_COLOR[t] || 'default'} title={raw}>{t ?? '-'}</Tag>
+            title: '类型', dataIndex: 'type', key: 'type', width: 150,
+            unmeasured: '未采信',
+            // 路 B 的 type 现在是后端归一后的**字符串**（大写枚举名）或 null（D2）。
+            // null 有两种来路，必须分开渲染：
+            //   desyncSuspect=true  ⇒ 这一行的应答与所发命令对不上（串台），**不采信**（D3）
+            //   其它 null            ⇒ 后端没给出类型
+            // 旧版这里用 asText() 兜底，把 {value:"string"} 这种 bean 兜成一段 JSON 原文。
+            render: (v, row) => {
+                if (row?.desyncSuspect) {
+                    return (
+                        <Tooltip title={row.desyncReason || '这一行的应答与所发命令对不上，不采信'}>
+                            <Tag color="red">应答错位·未采信</Tag>
+                        </Tooltip>
+                    )
+                }
+                if (v == null) return <span style={{color: '#94a3b8'}}>未采信</span>
+                return <Tag color={TYPE_COLOR[v] || 'default'}>{v}</Tag>
             },
             filters: TYPE_OPTIONS.map((o) => ({text: o.label, value: o.value})),
-            onFilter: (val, row) => asText(row.type) === val,
+            onFilter: (val, row) => row.type === val,
         },
         {
-            title: 'TTL', dataIndex: 'ttlSeconds', key: 'ttl', width: 150,
-            render: (v) => fmtTtl(v),
+            title: 'TTL', dataIndex: 'ttlSeconds', key: 'ttl', width: 170,
+            unmeasured: '未测',
+            render: (v, row) => {
+                if (row?.ttlSecondsError) {
+                    return (
+                        <Tooltip title={row.ttlSecondsError}>
+                            <Tag color="red">读数不可信</Tag>
+                        </Tooltip>
+                    )
+                }
+                if (v == null) {
+                    return <span style={{color: '#94a3b8'}} title={row?.ttlSecondsNote}>未测</span>
+                }
+                return fmtTtl(v)
+            },
         },
         {
-            title: '字节', dataIndex: 'byteLength', key: 'byteLength', width: 100,
-            render: (v) => (v == null || v < 0 ? <span style={{color: '#94a3b8'}}>非 string</span> : fmtBytes(v)),
+            title: '字节', dataIndex: 'byteLength', key: 'byteLength', width: 130,
+            unmeasured: '未测',
+            // ⚠️ 三个取值必须分开渲染（D4）：
+            //   null  ⇒ 后端**没测**这一列（路 B 不发 STRLEN）⇒ 显示"未测"
+            //   -1    ⇒ **测过**的结论：这个 key 不是 string
+            //   其它   ⇒ 真的字节数
+            // 旧版把 null 和 -1 合成一句"非 string" ⇒ 把"没测"渲染成了正面断言（最像假绿的一格）。
+            render: (v, row) => {
+                if (v == null) {
+                    return <span style={{color: '#94a3b8'}} title={row?.byteLengthNote}>未测</span>
+                }
+                if (v < 0) return <span style={{color: '#94a3b8'}}>非 string</span>
+                return fmtBytes(v)
+            },
         },
         {
             title: '数据源', dataIndex: 'authority', key: 'authority', width: 190,
-            render: (v) => <Tag color={authorityTag(v).color}>{v ?? '-'}</Tag>,
+            unmeasured: '未采信',
+            render: (v, row) => (
+                <Tag color={authorityTag(row?.authority ?? v).color}>{row?.authority ?? v ?? '-'}</Tag>
+            ),
         },
     ], [openDetail])
 
@@ -190,6 +243,11 @@ export default function KeysPage() {
                                  : `命中 ${meta.matchedTotal ?? rows.length} 条`}
                       />
                   </Space>}>
+                  {meta?.desyncRows > 0 && (
+                      <Alert type="warning" showIcon style={{marginBottom: 8}}
+                             message={`路 B 本次有 ${meta.desyncRows}/${meta.totalRows} 行的应答对不上，这些行的类型/TTL 不参与展示`}
+                             description={meta.desyncNote}/>
+                  )}
                   <Table size="small" rowKey={(r) => `${r.key}`} loading={loading} columns={columns}
                          dataSource={shown}
                          locale={{
@@ -219,7 +277,11 @@ export default function KeysPage() {
                                           {key: 'src', label: '取数路', children: <Tag>{detail.sourceUsed}</Tag>},
                                           {key: 'auth', label: '归属', children: <Tag color={authorityTag(detail.authority).color}>{detail.authority ?? '-'}</Tag>},
                                           {key: 'db', label: '库', children: detail.dbIgnoredForClientPath ? <span>db{detail.db}（<b>已忽略</b>，路 B 不切库）</span> : `db${detail.db ?? '-'}`},
-                                          {key: 'type', label: '类型', children: <Tag color={TYPE_COLOR[asText(detail.type)] || 'default'}>{asText(detail.type) ?? '-'}</Tag>},
+                                          {key: 'type', label: '类型', children: detail.desyncSuspect
+                                              ? <Tooltip title={detail.desyncReason || '应答与所发命令对不上'}>
+                                                  <Tag color="red">应答错位·未采信</Tag>
+                                              </Tooltip>
+                                              : <Tag color={TYPE_COLOR[detail.type] || 'default'}>{detail.type ?? '未采信'}</Tag>},
                                           {key: 'exists', label: '存在', children: detail.exists == null ? '-' : (detail.exists ? <Tag color="success">是</Tag> : <Tag>否</Tag>)},
                                           {key: 'ttl', label: 'TTL', children: fmtTtl(detail.ttlSeconds)},
                                           {key: 'pttl', label: 'PTTL(ms)', children: detail.pttlMillis ?? '-'},
