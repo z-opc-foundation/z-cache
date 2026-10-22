@@ -93,6 +93,20 @@
             <artifactId>spring-boot-autoconfigure</artifactId>
             <version>2.7.18</version>
         </dependency>
+        <!--
+          TASK-20260925-023: 具名 health 组件 zCacheEmbedded 需要 actuator 的 HealthIndicator。
+          **provided + optional**: 只供编译, 不进发布件的依赖树, 也不传递给消费者 ——
+          宿主有没有 actuator 由 @ConditionalOnClass(name=...) 在运行时判定
+          (宿主没有 actuator 时那个嵌套配置类根本不会被加载, 不会 NoClassDefFoundError)。
+          为什么不直接 compile: 会把一堆只想用 z-cache client 的消费者拖下水。
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-actuator</artifactId>
+            <version>2.7.18</version>
+            <scope>provided</scope>
+            <optional>true</optional>
+        </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-configuration-processor</artifactId>
