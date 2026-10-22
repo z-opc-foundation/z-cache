@@ -92,8 +92,10 @@ function te() {
       dataIndex: "ttlSeconds",
       key: "ttlSeconds",
       width: 100,
-      // ⚠️ 旧版这里写的是 dataIndex: 'ttl' —— 后端从来没给过 'ttl' 这个键（给的是 ttlSeconds）
+      // ⚠️ 旧版这一列的取键写的是 ttl（后端从来没给过 'ttl' 这个键，给的是 ttlSeconds）
       // ⇒ 这一列一直是空的（假绿列：键名对不上，列全是空）。TASK-20260925-041 由探针抓出并修掉。
+      // （注：探针是按字面量扫 dataIndex 的，所以这里**不能**把旧写法原样写进注释 ——
+      //  否则它会当成页面真有一个 ttl 列，造出一个查无此列的假红。）
       unmeasured: "未测",
       render: (t, r) => r != null && r.ttlSecondsError ? /* @__PURE__ */ e.jsx(b, { color: "red", children: "读数不可信" }) : t == null ? "未测" : t < 0 ? "永不过期" : `${t}s`
     },
