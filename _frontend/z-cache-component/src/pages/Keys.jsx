@@ -1,7 +1,8 @@
 /** 键浏览：/cache/keys 分页 + 单键详情 /cache/key。 */
 import {useEffect, useState} from 'react'
-import {Alert, Button, Card, Input, Modal, Space, Table, Tag, Typography} from 'antd'
+import {Alert, Button, Input, Modal, Space, Tag, Typography} from 'antd'
 import {ReloadOutlined, SearchOutlined} from '@ant-design/icons'
+import {ListTable} from '@yuku123/z-frontend-common/ui'
 import {cacheApi} from '../services/api'
 
 const {Title, Paragraph, Text} = Typography
@@ -80,10 +81,18 @@ export default function Keys() {
 
             {error && <Alert type="error" showIcon style={{marginBottom: 16}} message="后端未连接" description={error}/>}
 
-            <Card>
-                <Table rowKey="key" dataSource={rows} columns={columns} loading={loading} size="small"
-                       pagination={{pageSize: 20}}/>
-            </Card>
+            {/* 客户端整表：分页 / 空态三件套交给基座 ListTable。
+                这一页的「查询」是 pattern（Redis glob，**走后端** /cache/keys?pattern=），
+                页面上已经有一个查询框了 ⇒ 不传 searchKeys，否则会出现两个语义不同的搜索框。 */}
+            <ListTable
+                rows={rows}
+                columns={columns}
+                rowKey="key"
+                loading={loading}
+                emptyTitle="没有匹配的 key"
+                emptyDescription="换个 pattern 再查一次，或点「刷新」看全量键空间。"
+                cardExtra={<Button icon={<ReloadOutlined/>} onClick={fetch}>刷新</Button>}
+            />
 
             <Modal title={detail ? `键详情：${detail.name || detail.key}` : ''} open={!!detail} onCancel={() => setDetail(null)}
                    footer={<Button onClick={() => setDetail(null)}>关闭</Button>} width={700}>

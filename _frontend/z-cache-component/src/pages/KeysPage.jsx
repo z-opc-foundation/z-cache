@@ -1,11 +1,11 @@
 import {useCallback, useEffect, useMemo, useState} from 'react'
 import {
     Alert, Badge, Button, Card, Descriptions, Drawer, Empty, Input, InputNumber,
-    Radio, Select, Space, Table, Tag, Tooltip,
+    Radio, Select, Space, Tag, Tooltip,
 } from 'antd'
 import {ReloadOutlined, SearchOutlined} from '@ant-design/icons'
 import {cacheApi, cacheErrorText, authorityTag, fmtBytes, fmtTtl} from '../services/api'
-import {PageHeader} from '@yuku123/z-frontend-common/ui'
+import {PageHeader, ListTable} from '@yuku123/z-frontend-common/ui'
 
 /**
  * type 的取值域（两路统一成**大写**枚举名）：
@@ -234,35 +234,38 @@ export default function KeysPage() {
                        }/>
             )}
 
-            <Card title={<span>key 列表 {meta && <Tag color="blue">sourceUsed = {meta.sourceUsed}</Tag>}
-                {meta?.authority && <Tag color={authorityTag(meta.authority).color}>{meta.authority}</Tag>}</span>}
-                  extra={meta && <Space size={8}>
-                      <Badge status={meta.truncated ? 'warning' : 'default'}
-                             text={meta.truncated
-                                 ? `后端 KEYS 命中 ${meta.matchedTotal} 条，只取了前 ${meta.limit} 条（KEYS 是 O(N)，硬上限 1000）`
-                                 : `命中 ${meta.matchedTotal ?? rows.length} 条`}
-                      />
-                  </Space>}>
-                  {meta?.desyncRows > 0 && (
-                      <Alert type="warning" showIcon style={{marginBottom: 8}}
-                             message={`路 B 本次有 ${meta.desyncRows}/${meta.totalRows} 行的应答对不上，这些行的类型/TTL 不参与展示`}
-                             description={meta.desyncNote}/>
-                  )}
-                  <Table size="small" rowKey={(r) => `${r.key}`} loading={loading} columns={columns}
-                         dataSource={shown}
-                         locale={{
-                             emptyText: error
-                                 ? <Empty description="读取失败，见上方告警"/>
-                                 : <Empty description={
-                                     !meta
-                                         ? '还没取到数据'
-                                         : (meta.sourceUsed === 'embedded'
-                                             ? '路 A 的进程内 store 里这个 pattern 没有匹配项（本 JVM 自己那份，确定没跨进程）'
-                                             : '路 B 无应答或该库确实为空 —— 先看「实例与三态」确认应答者是不是本 JVM')
-                                 }/>
-                         }}
-                         pagination={{size: 'small', pageSize: 20, showSizeChanger: true}}/>
-            </Card>
+            {meta?.desyncRows > 0 && (
+                <Alert type="warning" showIcon style={{marginBottom: 8}}
+                       message={`路 B 本次有 ${meta.desyncRows}/${meta.totalRows} 行的应答对不上，这些行的类型/TTL 不参与展示`}
+                       description={meta.desyncNote}/>
+            )}
+            {/* 客户端整表：分页 / 空态三件套交给基座 ListTable。
+                这一页的查询条件（pattern / db / limit / source）**走后端**，上面已经有查询面板了
+                ⇒ 不传 searchKeys，否则页面上会出现两个语义不同的搜索框。 */}
+            <ListTable
+                cardTitle={<span>key 列表 {meta && <Tag color="blue">sourceUsed = {meta.sourceUsed}</Tag>}
+                    {meta?.authority && <Tag color={authorityTag(meta.authority).color}>{meta.authority}</Tag>}</span>}
+                cardExtra={meta && <Space size={8}>
+                    <Badge status={meta.truncated ? 'warning' : 'default'}
+                           text={meta.truncated
+                               ? `后端 KEYS 命中 ${meta.matchedTotal} 条，只取了前 ${meta.limit} 条（KEYS 是 O(N)，硬上限 1000）`
+                               : `命中 ${meta.matchedTotal ?? rows.length} 条`}
+                    />
+                </Space>}
+                rows={shown}
+                rowKey={(r) => `${r.key}`}
+                loading={loading}
+                columns={columns}
+                emptyTitle={error ? '读取失败' : (!meta ? '还没取到数据' : '没有匹配的 key')}
+                emptyDescription={error
+                    ? '见上方告警。'
+                    : (!meta
+                        ? '先点「查询」读一次。'
+                        : (meta.sourceUsed === 'embedded'
+                            ? '路 A 的进程内 store 里这个 pattern 没有匹配项（本 JVM 自己那份，确定没跨进程）'
+                            : '路 B 无应答或该库确实为空 —— 先看「实例与三态」确认应答者是不是本 JVM'))}
+                tableProps={{size: 'small'}}
+            />
 
             <Drawer width={720} open={!!detail} title={detail ? `key: ${detail.key}` : 'key 详情'}
                     onClose={() => setDetail(null)} destroyOnHidden>

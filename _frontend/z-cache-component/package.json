@@ -1,6 +1,6 @@
 {
   "name": "@yuku123/z-cache-component",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "z-cache 可复用前端组件：缓存中心（总览/键浏览；lead 005 §9）",
   "type": "module",
   "main": "./dist/index.js",
@@ -16,8 +16,8 @@
     "build": "vite build"
   },
   "dependencies": {
-    "@yuku123/z-frontend-common": "^1.1.1",
     "@ant-design/pro-components": "^3.1.12-0",
+    "@yuku123/z-frontend-common": "^1.1.4",
     "axios": "^1.16.1"
   },
   "peerDependencies": {
