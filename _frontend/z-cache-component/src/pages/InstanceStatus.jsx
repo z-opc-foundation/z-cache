@@ -1,5 +1,5 @@
 import {useCallback, useEffect, useState} from 'react'
-import {Alert, Button, Card, Descriptions, Space, Table, Tag} from 'antd'
+import {Alert, Button, Card, Descriptions, Input, Space, Table, Tag} from 'antd'
 import {ReloadOutlined} from '@ant-design/icons'
 import {cacheApi, cacheErrorText, authorityTag} from '../services/api'
 import {EmptyState} from '@yuku123/z-frontend-common/ui'
@@ -71,6 +71,17 @@ export default function InstanceStatus() {
 
     const foreign = !error && data && data.foreignListenerSuspected
     const notBound = !error && data && !data.embeddedRunning
+
+    const [keyword, setKeyword] = useState('')
+    const matchCommand = (list) => {
+        const rows = Array.isArray(list) ? list : []
+        const kw = keyword.trim().toLowerCase()
+        if (!kw) return rows
+        return rows.filter((r) => `${r?.command || ''} ${r?.note || ''}`.toLowerCase().includes(kw))
+    }
+    const issuedRows = matchCommand(catalog?.commandsActuallyIssued)
+    const whitelistRows = matchCommand(catalog?.readOnlyCommandsAllowedByWhitelist)
+    const neverIssuedRows = matchCommand(catalog?.neverIssuedDespiteBeingSupportedByServer)
 
     return (
         <div>
@@ -255,7 +266,11 @@ export default function InstanceStatus() {
 
             <Card title="本 controller 实际下发 / 白名单允许 / 永不下发的 RESP 命令"
                   style={{marginTop: 16}}
-                  extra={<Tag color="blue">命令名是代码常量，HTTP 侧无法指定</Tag>}>
+                  extra={<Space>
+                      <Input.Search allowClear placeholder="按 RESP 命令 / 说明过滤" style={{width: 220}}
+                                    onChange={(e) => setKeyword(e.target.value)}/>
+                      <Tag color="blue">命令名是代码常量，HTTP 侧无法指定</Tag>
+                  </Space>}>
                 {!catalog ? (
                     <Alert type="info" showIcon
                            message={data ? '命令目录读不到（不影响上面三态结论）' : '等自省接口回来再看'}/>
@@ -266,7 +281,7 @@ export default function InstanceStatus() {
                         <Table size="small" rowKey="command" pagination={false}
                                columns={CMD_COLUMNS}
                                locale={{emptyText: <EmptyState title="没有已下发命令" size="sm"/>}}
-                               dataSource={catalog.commandsActuallyIssued ?? []}
+                               dataSource={issuedRows}
                                title={() => <span><Tag color="success">只读 · 本 controller 真正会发的（{catalog.commandsActuallyIssued?.length ?? 0} 条）</Tag></span>}/>
                         {catalog.notCountedAsIssued ? (
                             <Alert style={{marginTop: 8}} type="warning" showIcon
@@ -277,7 +292,7 @@ export default function InstanceStatus() {
                         <Table style={{marginTop: 12}} size="small" rowKey="command" pagination={false}
                                columns={CMD_COLUMNS}
                                locale={{emptyText: <EmptyState title="只读白名单为空" size="sm"/>}}
-                               dataSource={catalog.readOnlyCommandsAllowedByWhitelist ?? []}
+                               dataSource={whitelistRows}
                                title={() => <span><Tag color="processing">只读白名单 = 上限集合（safeSend 入口校验用）</Tag></span>}/>
                         {catalog.whitelistSemantics ? (
                             <div style={{marginTop: 8, fontSize: 12, color: '#64748b'}}>{catalog.whitelistSemantics}</div>
@@ -286,7 +301,7 @@ export default function InstanceStatus() {
                         <Table style={{marginTop: 12}} size="small" rowKey="command" pagination={false}
                                columns={CMD_COLUMNS}
                                locale={{emptyText: <EmptyState title="没有此类命令" size="sm"/>}}
-                               dataSource={catalog.neverIssuedDespiteBeingSupportedByServer ?? []}
+                               dataSource={neverIssuedRows}
                                title={() => <span><Tag color="error">server 支持但本 controller 永不下发</Tag></span>}/>
                     </>
                 )}

@@ -1,10 +1,10 @@
-import { Routes as Pe, Route as W, Navigate as Ie } from "react-router-dom";
-import ze, { useState as x, useCallback as X, useEffect as ie, useMemo as Te } from "react";
-import { Alert as b, Row as Z, Col as A, Card as C, Statistic as F, Descriptions as U, Tag as o, Button as ce, Table as L, Tooltip as se, Space as oe, Input as Oe, Select as we, InputNumber as Ne, Radio as ne, Badge as Be, Drawer as Le, Empty as Se } from "antd";
+import { Routes as Ie, Route as W, Navigate as ze } from "react-router-dom";
+import Oe, { useState as x, useCallback as X, useEffect as ie, useMemo as Te } from "react";
+import { Alert as g, Row as Z, Col as z, Card as A, Statistic as F, Descriptions as U, Tag as o, Button as ce, Table as $, Tooltip as oe, Space as Q, Input as we, Select as Ae, InputNumber as Ne, Radio as te, Badge as Be, Drawer as Le, Empty as Se } from "antd";
 import { ReloadOutlined as ae, SearchOutlined as $e } from "@ant-design/icons";
 import D from "@yuku123/z-frontend-common";
 import { ListTable as Me, DEFAULT_PAGINATION as De, EmptyState as pe, ComponentDoc as Fe } from "@yuku123/z-frontend-common/ui";
-const N = {
+const B = {
   instance: () => D.get("/cache/__instance"),
   overview: () => D.get("/cache/overview"),
   keys: (r) => D.get("/cache/keys", { params: r }),
@@ -22,21 +22,21 @@ const N = {
   NO_ANSWER: { color: "warning", text: "没有任何 server 在应答" },
   UNKNOWN: { color: "warning", text: "连上了，但无法判定连的是谁" }
 };
-function $(r) {
+function M(r) {
   return Ue[r] || { color: "default", text: r || "-" };
 }
 function G(r) {
   var s;
   const t = (s = r == null ? void 0 : r.response) == null ? void 0 : s.data;
   if (t && typeof t == "object") {
-    const h = t.message || t.error, i = t.hint ? `｜${t.hint}` : "", y = t.source ? ` (${t.source})` : "";
-    if (h) return `${h}${y}${i}`;
+    const m = t.message || t.error, i = t.hint ? `｜${t.hint}` : "", y = t.source ? ` (${t.source})` : "";
+    if (m) return `${m}${y}${i}`;
   }
   return typeof t == "string" && t.trim() ? t.slice(0, 240) : (r == null ? void 0 : r.message) || String(r);
 }
 function hr(r) {
-  var h, i, y;
-  const t = (h = r == null ? void 0 : r.response) == null ? void 0 : h.status, s = (y = (i = r == null ? void 0 : r.response) == null ? void 0 : i.data) == null ? void 0 : y.source;
+  var m, i, y;
+  const t = (m = r == null ? void 0 : r.response) == null ? void 0 : m.status, s = (y = (i = r == null ? void 0 : r.response) == null ? void 0 : i.data) == null ? void 0 : y.source;
   return t === 503 && s === "z-opc-cache-read-api";
 }
 function le(r) {
@@ -44,15 +44,15 @@ function le(r) {
   const t = Number(r);
   return isFinite(t) ? t < 1024 ? `${t} B` : t < 1024 * 1024 ? `${(t / 1024).toFixed(1)} KiB` : t < 1024 * 1024 * 1024 ? `${(t / 1024 / 1024).toFixed(1)} MiB` : `${(t / 1024 / 1024 / 1024).toFixed(2)} GiB` : "-";
 }
-function Ee(r) {
+function ve(r) {
   if (r == null) return "-";
   const t = Number(r);
   return t === -2 ? "不存在（-2）" : t === -1 ? "常驻（无过期）" : t < 10 ? `${t} 秒` : t < 600 ? `${Math.floor(t / 60)} 分 ${t % 60} 秒` : `${Math.floor(t / 86400)} 天 ${Math.floor(t % 86400 / 3600)} 时`;
 }
 function Je(r) {
   if (r == null) return "-";
-  const t = Number(r), s = Math.floor(t / 86400), h = Math.floor(t % 86400 / 3600), i = Math.floor(t % 3600 / 60);
-  return s > 0 ? `${s} 天 ${h} 时 ${i} 分` : h > 0 ? `${h} 时 ${i} 分 ${t % 60} 秒` : `${i} 分 ${t % 60} 秒`;
+  const t = Number(r), s = Math.floor(t / 86400), m = Math.floor(t % 86400 / 3600), i = Math.floor(t % 3600 / 60);
+  return s > 0 ? `${s} 天 ${m} 时 ${i} 分` : m > 0 ? `${m} 时 ${i} 分 ${t % 60} 秒` : `${i} 分 ${t % 60} 秒`;
 }
 function Ve(r) {
   if (r == null) return null;
@@ -66,7 +66,7 @@ function Ve(r) {
     return String(r);
   }
 }
-var te = { exports: {} }, K = {};
+var se = { exports: {} }, K = {};
 /**
  * @license React
  * react-jsx-runtime.production.js
@@ -76,22 +76,22 @@ var te = { exports: {} }, K = {};
  * This source code is licensed under the MIT license found in the
  * LICENSE file in the root directory of this source tree.
  */
-var ve;
+var Ee;
 function He() {
-  if (ve) return K;
-  ve = 1;
+  if (Ee) return K;
+  Ee = 1;
   var r = Symbol.for("react.transitional.element"), t = Symbol.for("react.fragment");
-  function s(h, i, y) {
-    var g = null;
-    if (y !== void 0 && (g = "" + y), i.key !== void 0 && (g = "" + i.key), "key" in i) {
+  function s(m, i, y) {
+    var T = null;
+    if (y !== void 0 && (T = "" + y), i.key !== void 0 && (T = "" + i.key), "key" in i) {
       y = {};
-      for (var k in i)
-        k !== "key" && (y[k] = i[k]);
+      for (var R in i)
+        R !== "key" && (y[R] = i[R]);
     } else y = i;
     return i = y.ref, {
       $$typeof: r,
-      type: h,
-      key: g,
+      type: m,
+      key: T,
       ref: i !== void 0 ? i : null,
       props: y
     };
@@ -114,18 +114,18 @@ function Ge() {
     function r(n) {
       if (n == null) return null;
       if (typeof n == "function")
-        return n.$$typeof === re ? null : n.displayName || n.name || null;
+        return n.$$typeof === ne ? null : n.displayName || n.name || null;
       if (typeof n == "string") return n;
       switch (n) {
         case P:
           return "Fragment";
-        case m:
+        case h:
           return "Profiler";
-        case M:
+        case j:
           return "StrictMode";
         case Y:
           return "Suspense";
-        case ee:
+        case re:
           return "SuspenseList";
         case de:
           return "Activity";
@@ -136,13 +136,13 @@ function Ge() {
         switch (typeof n.tag == "number" && console.error(
           "Received an unexpected object in getComponentNameFromType(). This is likely a bug in React. Please file an issue."
         ), n.$$typeof) {
-          case v:
+          case S:
             return "Portal";
-          case I:
+          case w:
             return n.displayName || "Context";
-          case T:
+          case b:
             return (n._context.displayName || "Context") + ".Consumer";
-          case Q:
+          case ee:
             var a = n.render;
             return n = n.displayName, n || (n = a.displayName || a.name || "", n = n !== "" ? "ForwardRef(" + n + ")" : "ForwardRef"), n;
           case J:
@@ -168,15 +168,15 @@ function Ge() {
       }
       if (a) {
         a = console;
-        var j = a.error, S = typeof Symbol == "function" && Symbol.toStringTag && n[Symbol.toStringTag] || n.constructor.name || "Object";
-        return j.call(
+        var f = a.error, v = typeof Symbol == "function" && Symbol.toStringTag && n[Symbol.toStringTag] || n.constructor.name || "Object";
+        return f.call(
           a,
           "The provided key is an unsupported type %s. This value must be coerced to a string before using it here.",
-          S
+          v
         ), t(n);
       }
     }
-    function h(n) {
+    function m(n) {
       if (n === P) return "<>";
       if (typeof n == "object" && n !== null && n.$$typeof === V)
         return "<...>";
@@ -194,42 +194,42 @@ function Ge() {
     function y() {
       return Error("react-stack-top-frame");
     }
-    function g(n) {
+    function T(n) {
       if (d.call(n, "key")) {
         var a = Object.getOwnPropertyDescriptor(n, "key").get;
         if (a && a.isReactWarning) return !1;
       }
       return n.key !== void 0;
     }
-    function k(n, a) {
-      function j() {
+    function R(n, a) {
+      function f() {
         ye || (ye = !0, console.error(
           "%s: `key` is not a prop. Trying to access it will result in `undefined` being returned. If you need to access the same value within the child component, you should pass it as a different prop. (https://react.dev/link/special-props)",
           a
         ));
       }
-      j.isReactWarning = !0, Object.defineProperty(n, "key", {
-        get: j,
+      f.isReactWarning = !0, Object.defineProperty(n, "key", {
+        get: f,
         configurable: !0
       });
     }
-    function R() {
+    function C() {
       var n = r(this.type);
       return je[n] || (je[n] = !0, console.error(
         "Accessing element.ref was removed in React 19. ref is now a regular prop. It will be removed from the JSX Element type in a future release."
       )), n = this.props.ref, n !== void 0 ? n : null;
     }
-    function u(n, a, j, S, B, z) {
-      var E = j.ref;
+    function u(n, a, f, v, L, O) {
+      var E = f.ref;
       return n = {
         $$typeof: _,
         type: n,
         key: a,
-        props: j,
-        _owner: S
+        props: f,
+        _owner: v
       }, (E !== void 0 ? E : null) !== null ? Object.defineProperty(n, "ref", {
         enumerable: !1,
-        get: R
+        get: C
       }) : Object.defineProperty(n, "ref", { enumerable: !1, value: null }), n._store = {}, Object.defineProperty(n._store, "validated", {
         configurable: !1,
         enumerable: !1,
@@ -244,118 +244,118 @@ function Ge() {
         configurable: !1,
         enumerable: !1,
         writable: !0,
-        value: B
+        value: L
       }), Object.defineProperty(n, "_debugTask", {
         configurable: !1,
         enumerable: !1,
         writable: !0,
-        value: z
+        value: O
       }), Object.freeze && (Object.freeze(n.props), Object.freeze(n)), n;
     }
-    function p(n, a, j, S, B, z) {
+    function p(n, a, f, v, L, O) {
       var E = a.children;
       if (E !== void 0)
-        if (S)
+        if (v)
           if (_e(E)) {
-            for (S = 0; S < E.length; S++)
-              f(E[S]);
+            for (v = 0; v < E.length; v++)
+              I(E[v]);
             Object.freeze && Object.freeze(E);
           } else
             console.error(
               "React.jsx: Static children should always be an array. You are likely explicitly calling React.jsxs or React.jsxDEV. Use the Babel transform instead."
             );
-        else f(E);
+        else I(E);
       if (d.call(a, "key")) {
         E = r(n);
-        var H = Object.keys(a).filter(function(Ae) {
-          return Ae !== "key";
+        var H = Object.keys(a).filter(function(Pe) {
+          return Pe !== "key";
         });
-        S = 0 < H.length ? "{key: someKey, " + H.join(": ..., ") + ": ...}" : "{key: someKey}", fe[E + S] || (H = 0 < H.length ? "{" + H.join(": ..., ") + ": ...}" : "{}", console.error(
+        v = 0 < H.length ? "{key: someKey, " + H.join(": ..., ") + ": ...}" : "{key: someKey}", ge[E + v] || (H = 0 < H.length ? "{" + H.join(": ..., ") + ": ...}" : "{}", console.error(
           `A props object containing a "key" prop is being spread into JSX:
   let props = %s;
   <%s {...props} />
 React keys must be passed directly to JSX without using spread:
   let props = %s;
   <%s key={someKey} {...props} />`,
-          S,
+          v,
           E,
           H,
           E
-        ), fe[E + S] = !0);
+        ), ge[E + v] = !0);
       }
-      if (E = null, j !== void 0 && (s(j), E = "" + j), g(a) && (s(a.key), E = "" + a.key), "key" in a) {
-        j = {};
+      if (E = null, f !== void 0 && (s(f), E = "" + f), T(a) && (s(a.key), E = "" + a.key), "key" in a) {
+        f = {};
         for (var me in a)
-          me !== "key" && (j[me] = a[me]);
-      } else j = a;
-      return E && k(
-        j,
+          me !== "key" && (f[me] = a[me]);
+      } else f = a;
+      return E && R(
+        f,
         typeof n == "function" ? n.displayName || n.name || "Unknown" : n
       ), u(
         n,
         E,
-        j,
+        f,
         i(),
-        B,
-        z
+        L,
+        O
       );
     }
-    function f(n) {
+    function I(n) {
       c(n) ? n._store && (n._store.validated = 1) : typeof n == "object" && n !== null && n.$$typeof === V && (n._payload.status === "fulfilled" ? c(n._payload.value) && n._payload.value._store && (n._payload.value._store.validated = 1) : n._store && (n._store.validated = 1));
     }
     function c(n) {
       return typeof n == "object" && n !== null && n.$$typeof === _;
     }
-    var w = ze, _ = Symbol.for("react.transitional.element"), v = Symbol.for("react.portal"), P = Symbol.for("react.fragment"), M = Symbol.for("react.strict_mode"), m = Symbol.for("react.profiler"), T = Symbol.for("react.consumer"), I = Symbol.for("react.context"), Q = Symbol.for("react.forward_ref"), Y = Symbol.for("react.suspense"), ee = Symbol.for("react.suspense_list"), J = Symbol.for("react.memo"), V = Symbol.for("react.lazy"), de = Symbol.for("react.activity"), ue = Symbol.for("react.view_transition"), re = Symbol.for("react.client.reference"), l = w.__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE, d = Object.prototype.hasOwnProperty, _e = Array.isArray, he = console.createTask ? console.createTask : function() {
+    var k = Oe, _ = Symbol.for("react.transitional.element"), S = Symbol.for("react.portal"), P = Symbol.for("react.fragment"), j = Symbol.for("react.strict_mode"), h = Symbol.for("react.profiler"), b = Symbol.for("react.consumer"), w = Symbol.for("react.context"), ee = Symbol.for("react.forward_ref"), Y = Symbol.for("react.suspense"), re = Symbol.for("react.suspense_list"), J = Symbol.for("react.memo"), V = Symbol.for("react.lazy"), de = Symbol.for("react.activity"), ue = Symbol.for("react.view_transition"), ne = Symbol.for("react.client.reference"), l = k.__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE, d = Object.prototype.hasOwnProperty, _e = Array.isArray, he = console.createTask ? console.createTask : function() {
       return null;
     };
-    w = {
+    k = {
       react_stack_bottom_frame: function(n) {
         return n();
       }
     };
-    var ye, je = {}, be = w.react_stack_bottom_frame.bind(
-      w,
+    var ye, je = {}, be = k.react_stack_bottom_frame.bind(
+      k,
       y
-    )(), ge = he(h(y)), fe = {};
-    q.Fragment = P, q.jsx = function(n, a, j) {
-      var S = 1e4 > l.recentlyCreatedOwnerStacks++;
-      if (S) {
-        var B = Error.stackTraceLimit;
+    )(), fe = he(m(y)), ge = {};
+    q.Fragment = P, q.jsx = function(n, a, f) {
+      var v = 1e4 > l.recentlyCreatedOwnerStacks++;
+      if (v) {
+        var L = Error.stackTraceLimit;
         Error.stackTraceLimit = 10;
-        var z = Error("react-stack-top-frame");
-        Error.stackTraceLimit = B;
-      } else z = be;
+        var O = Error("react-stack-top-frame");
+        Error.stackTraceLimit = L;
+      } else O = be;
       return p(
         n,
         a,
-        j,
+        f,
         !1,
-        z,
-        S ? he(h(n)) : ge
+        O,
+        v ? he(m(n)) : fe
       );
-    }, q.jsxs = function(n, a, j) {
-      var S = 1e4 > l.recentlyCreatedOwnerStacks++;
-      if (S) {
-        var B = Error.stackTraceLimit;
+    }, q.jsxs = function(n, a, f) {
+      var v = 1e4 > l.recentlyCreatedOwnerStacks++;
+      if (v) {
+        var L = Error.stackTraceLimit;
         Error.stackTraceLimit = 10;
-        var z = Error("react-stack-top-frame");
-        Error.stackTraceLimit = B;
-      } else z = be;
+        var O = Error("react-stack-top-frame");
+        Error.stackTraceLimit = L;
+      } else O = be;
       return p(
         n,
         a,
-        j,
+        f,
         !0,
-        z,
-        S ? he(h(n)) : ge
+        O,
+        v ? he(m(n)) : fe
       );
     };
   })()), q;
 }
 var Re;
 function Ye() {
-  return Re || (Re = 1, process.env.NODE_ENV === "production" ? te.exports = He() : te.exports = Ge()), te.exports;
+  return Re || (Re = 1, process.env.NODE_ENV === "production" ? se.exports = He() : se.exports = Ge()), se.exports;
 }
 var e = Ye();
 const We = [
@@ -369,24 +369,24 @@ const We = [
   }
 ];
 function Ke() {
-  const [r, t] = x(null), [s, h] = x(null), [i, y] = x(null), [g, k] = x(!1), R = X(async () => {
-    k(!0);
+  const [r, t] = x(null), [s, m] = x(null), [i, y] = x(null), [T, R] = x(!1), C = X(async () => {
+    R(!0);
     try {
-      const [w, _] = await Promise.all([N.overview(), N.instance()]);
-      t(w), h(_), y(null);
-    } catch (w) {
-      t(null), y(w);
+      const [k, _] = await Promise.all([B.overview(), B.instance()]);
+      t(k), m(_), y(null);
+    } catch (k) {
+      t(null), y(k);
     } finally {
-      k(!1);
+      R(!1);
     }
   }, []);
   ie(() => {
-    R();
-  }, [R]);
-  const u = (r == null ? void 0 : r.embedded) ?? {}, p = (r == null ? void 0 : r.client) ?? {}, f = !!(r != null && r.foreignListenerSuspected || s != null && s.foreignListenerSuspected), c = !!(r != null && r.authorityDiverges);
+    C();
+  }, [C]);
+  const u = (r == null ? void 0 : r.embedded) ?? {}, p = (r == null ? void 0 : r.client) ?? {}, I = !!(r != null && r.foreignListenerSuspected || s != null && s.foreignListenerSuspected), c = !!(r != null && r.authorityDiverges);
   return /* @__PURE__ */ e.jsxs("div", { children: [
     i && /* @__PURE__ */ e.jsx(
-      b,
+      g,
       {
         type: "error",
         showIcon: !0,
@@ -395,8 +395,8 @@ function Ke() {
         description: "overview 与 __instance 一起失败 ⇒ 是 z-opc 侧路由/鉴权问题；只有 overview 失败而「实例与三态」能开，则是取数那一层的问题。"
       }
     ),
-    f && /* @__PURE__ */ e.jsx(
-      b,
+    I && /* @__PURE__ */ e.jsx(
+      g,
       {
         type: "error",
         showIcon: !0,
@@ -406,20 +406,20 @@ function Ke() {
       }
     ),
     /* @__PURE__ */ e.jsxs(Z, { gutter: 16, children: [
-      /* @__PURE__ */ e.jsx(A, { span: 12, children: /* @__PURE__ */ e.jsxs(
-        C,
+      /* @__PURE__ */ e.jsx(z, { span: 12, children: /* @__PURE__ */ e.jsxs(
+        A,
         {
           title: /* @__PURE__ */ e.jsxs("span", { children: [
             "路 A · 进程内 MemoryStore ",
             /* @__PURE__ */ e.jsx(o, { color: "blue", children: "不可能跨进程" })
           ] }),
           size: "small",
-          loading: g,
-          extra: /* @__PURE__ */ e.jsx(ce, { icon: /* @__PURE__ */ e.jsx(ae, {}), loading: g, onClick: R, children: "刷新" }),
+          loading: T,
+          extra: /* @__PURE__ */ e.jsx(ce, { icon: /* @__PURE__ */ e.jsx(ae, {}), loading: T, onClick: C, children: "刷新" }),
           children: [
             /* @__PURE__ */ e.jsxs(Z, { gutter: 8, children: [
-              /* @__PURE__ */ e.jsx(A, { span: 12, children: /* @__PURE__ */ e.jsx(F, { title: "dbsize（本 JVM 全部库）", value: u.dbsizeTotal ?? "-" }) }),
-              /* @__PURE__ */ e.jsx(A, { span: 12, children: /* @__PURE__ */ e.jsx(
+              /* @__PURE__ */ e.jsx(z, { span: 12, children: /* @__PURE__ */ e.jsx(F, { title: "dbsize（本 JVM 全部库）", value: u.dbsizeTotal ?? "-" }) }),
+              /* @__PURE__ */ e.jsx(z, { span: 12, children: /* @__PURE__ */ e.jsx(
                 F,
                 {
                   title: "内嵌 server 在跑",
@@ -460,19 +460,19 @@ function Ke() {
           ]
         }
       ) }),
-      /* @__PURE__ */ e.jsx(A, { span: 12, children: /* @__PURE__ */ e.jsxs(
-        C,
+      /* @__PURE__ */ e.jsx(z, { span: 12, children: /* @__PURE__ */ e.jsxs(
+        A,
         {
           title: /* @__PURE__ */ e.jsxs("span", { children: [
             "路 B · zCacheClient（RESP DBSIZE） ",
             /* @__PURE__ */ e.jsx(o, { color: "purple", children: "业务看到的数" })
           ] }),
           size: "small",
-          loading: g,
+          loading: T,
           children: [
             /* @__PURE__ */ e.jsxs(Z, { gutter: 8, children: [
-              /* @__PURE__ */ e.jsx(A, { span: 12, children: /* @__PURE__ */ e.jsx(F, { title: "dbsize", value: p.dbsize ?? "-" }) }),
-              /* @__PURE__ */ e.jsx(A, { span: 12, children: /* @__PURE__ */ e.jsx(
+              /* @__PURE__ */ e.jsx(z, { span: 12, children: /* @__PURE__ */ e.jsx(F, { title: "dbsize", value: p.dbsize ?? "-" }) }),
+              /* @__PURE__ */ e.jsx(z, { span: 12, children: /* @__PURE__ */ e.jsx(
                 F,
                 {
                   title: "RESP 已连接",
@@ -494,8 +494,8 @@ function Ke() {
                     key: "authority",
                     label: "应答者归属",
                     children: /* @__PURE__ */ e.jsxs("span", { children: [
-                      /* @__PURE__ */ e.jsx(o, { color: $(p.authority).color, children: p.authority ?? "-" }),
-                      /* @__PURE__ */ e.jsx("span", { style: { fontSize: 12, color: "#64748b" }, children: $(p.authority).text })
+                      /* @__PURE__ */ e.jsx(o, { color: M(p.authority).color, children: p.authority ?? "-" }),
+                      /* @__PURE__ */ e.jsx("span", { style: { fontSize: 12, color: "#64748b" }, children: M(p.authority).text })
                     ] })
                   },
                   { key: "dbsizeErr", label: "DBSIZE 报错", children: p.dbsizeError ? /* @__PURE__ */ e.jsx("code", { children: p.dbsizeError }) : "-" },
@@ -508,13 +508,13 @@ function Ke() {
       ) })
     ] }),
     /* @__PURE__ */ e.jsx(
-      C,
+      A,
       {
         style: { marginTop: 16 },
         title: "双路对账结论（这一格就是本卡的保真探针）",
         extra: c ? /* @__PURE__ */ e.jsx(o, { color: "error", children: "authorityDiverges = true" }) : /* @__PURE__ */ e.jsx(o, { color: "success", children: "authorityDiverges = false" }),
         children: /* @__PURE__ */ e.jsx(
-          b,
+          g,
           {
             showIcon: !0,
             type: c ? "error" : u.running ? "success" : "warning",
@@ -533,13 +533,13 @@ function Ke() {
       }
     ),
     /* @__PURE__ */ e.jsx(
-      C,
+      A,
       {
         title: "每库 key 数（只有路 A 能按库统计；路 B 不能发 SELECT）",
         style: { marginTop: 16 },
         extra: /* @__PURE__ */ e.jsx(o, { color: "blue", children: "embedded 侧，16 库" }),
         children: !u.perDb || !u.perDb.length ? /* @__PURE__ */ e.jsx(
-          b,
+          g,
           {
             type: "info",
             showIcon: !0,
@@ -547,22 +547,22 @@ function Ke() {
             description: "原因见上面「不可用原因」/「反射失败原因」两格。这不是「缓存被清空了」。"
           }
         ) : /* @__PURE__ */ e.jsx(
-          L,
+          $,
           {
             size: "small",
             rowKey: "db",
             columns: We,
             dataSource: u.perDb,
             pagination: !1,
-            summary: () => /* @__PURE__ */ e.jsxs(L.Summary.Row, { children: [
-              /* @__PURE__ */ e.jsx(L.Summary.Cell, { index: 0, children: "合计" }),
-              /* @__PURE__ */ e.jsx(L.Summary.Cell, { index: 1, children: u.dbsizeTotal })
+            summary: () => /* @__PURE__ */ e.jsxs($.Summary.Row, { children: [
+              /* @__PURE__ */ e.jsx($.Summary.Cell, { index: 0, children: "合计" }),
+              /* @__PURE__ */ e.jsx($.Summary.Cell, { index: 1, children: u.dbsizeTotal })
             ] })
           }
         )
       }
     ),
-    /* @__PURE__ */ e.jsx(C, { title: "口径说明", style: { marginTop: 16 }, children: /* @__PURE__ */ e.jsxs("div", { style: { fontSize: 12, color: "#64748b", lineHeight: 1.9 }, children: [
+    /* @__PURE__ */ e.jsx(A, { title: "口径说明", style: { marginTop: 16 }, children: /* @__PURE__ */ e.jsxs("div", { style: { fontSize: 12, color: "#64748b", lineHeight: 1.9 }, children: [
       "· 本页所有数字都无前端缓存、每次刷新重新读；后端不做任何聚合、补零或估算。",
       /* @__PURE__ */ e.jsx("br", {}),
       "· 内存 / 命中率 / 累计命令等运行指标在「统计与命令」页（路 A 走 Runtime+MemoryStore，路 B 走 INFO）。",
@@ -593,7 +593,7 @@ const Ce = {
   { value: "NONE", label: "NONE" }
 ];
 function Ze(r) {
-  return r == null ? /* @__PURE__ */ e.jsx("span", { style: { color: "#94a3b8" }, children: "nil" }) : typeof r == "object" ? r.notUtf8 ? /* @__PURE__ */ e.jsxs(se, { title: "非 UTF-8 字节（多半是序列化后的对象），这里给 base64", children: [
+  return r == null ? /* @__PURE__ */ e.jsx("span", { style: { color: "#94a3b8" }, children: "nil" }) : typeof r == "object" ? r.notUtf8 ? /* @__PURE__ */ e.jsxs(oe, { title: "非 UTF-8 字节（多半是序列化后的对象），这里给 base64", children: [
     /* @__PURE__ */ e.jsx(o, { color: "volcano", children: "binary" }),
     /* @__PURE__ */ e.jsxs("code", { style: { fontSize: 11 }, children: [
       String(r.base64).slice(0, 60),
@@ -602,31 +602,31 @@ function Ze(r) {
   ] }) : /* @__PURE__ */ e.jsx("pre", { style: { margin: 0, fontSize: 11, whiteSpace: "pre-wrap" }, children: JSON.stringify(r, null, 2) }) : /* @__PURE__ */ e.jsx("span", { style: { wordBreak: "break-all" }, children: String(r) });
 }
 function Xe() {
-  const [r, t] = x("auto"), [s, h] = x("*"), [i, y] = x(0), [g, k] = x(200), [R, u] = x(null), [p, f] = x([]), [c, w] = x(null), [_, v] = x(!1), [P, M] = x(null), [m, T] = x(null), [I, Q] = x(!1), [Y, ee] = x(null), J = X(async () => {
-    v(!0);
+  const [r, t] = x("auto"), [s, m] = x("*"), [i, y] = x(0), [T, R] = x(200), [C, u] = x(null), [p, I] = x([]), [c, k] = x(null), [_, S] = x(!1), [P, j] = x(null), [h, b] = x(null), [w, ee] = x(!1), [Y, re] = x(null), J = X(async () => {
+    S(!0);
     try {
-      const l = await N.keys({ pattern: s || "*", db: i, limit: g, source: r });
-      f(l.keys ?? []), w(l), M(null);
+      const l = await B.keys({ pattern: s || "*", db: i, limit: T, source: r });
+      I(l.keys ?? []), k(l), j(null);
     } catch (l) {
-      f([]), w(null), M(l);
+      I([]), k(null), j(l);
     } finally {
-      v(!1);
+      S(!1);
     }
-  }, [s, i, g, r]);
+  }, [s, i, T, r]);
   ie(() => {
     J();
   }, [J]);
   const V = X(async (l) => {
-    T({ key: l }), Q(!0), ee(null);
+    b({ key: l }), ee(!0), re(null);
     try {
-      const d = await N.key({ key: l, db: i, source: r, maxElements: 50 });
-      T(d);
+      const d = await B.key({ key: l, db: i, source: r, maxElements: 50 });
+      b(d);
     } catch (d) {
-      T(null), ee(d);
+      b(null), re(d);
     } finally {
-      Q(!1);
+      ee(!1);
     }
-  }, [i, r]), de = Te(() => R ? p.filter((l) => l.type === R) : p, [p, R]), ue = Te(() => [
+  }, [i, r]), de = Te(() => C ? p.filter((l) => l.type === C) : p, [p, C]), ue = Te(() => [
     {
       title: "key",
       dataIndex: "key",
@@ -645,7 +645,7 @@ function Xe() {
       //   desyncSuspect=true  ⇒ 这一行的应答与所发命令对不上（串台），**不采信**（D3）
       //   其它 null            ⇒ 后端没给出类型
       // 旧版这里用 asText() 兜底，把 {value:"string"} 这种 bean 兜成一段 JSON 原文。
-      render: (l, d) => d != null && d.desyncSuspect ? /* @__PURE__ */ e.jsx(se, { title: d.desyncReason || "这一行的应答与所发命令对不上，不采信", children: /* @__PURE__ */ e.jsx(o, { color: "red", children: "应答错位·未采信" }) }) : l == null ? /* @__PURE__ */ e.jsx("span", { style: { color: "#94a3b8" }, children: "未采信" }) : /* @__PURE__ */ e.jsx(o, { color: Ce[l] || "default", children: l }),
+      render: (l, d) => d != null && d.desyncSuspect ? /* @__PURE__ */ e.jsx(oe, { title: d.desyncReason || "这一行的应答与所发命令对不上，不采信", children: /* @__PURE__ */ e.jsx(o, { color: "red", children: "应答错位·未采信" }) }) : l == null ? /* @__PURE__ */ e.jsx("span", { style: { color: "#94a3b8" }, children: "未采信" }) : /* @__PURE__ */ e.jsx(o, { color: Ce[l] || "default", children: l }),
       filters: qe.map((l) => ({ text: l.label, value: l.value })),
       onFilter: (l, d) => d.type === l
     },
@@ -655,7 +655,7 @@ function Xe() {
       key: "ttl",
       width: 170,
       unmeasured: "未测",
-      render: (l, d) => d != null && d.ttlSecondsError ? /* @__PURE__ */ e.jsx(se, { title: d.ttlSecondsError, children: /* @__PURE__ */ e.jsx(o, { color: "red", children: "读数不可信" }) }) : l == null ? /* @__PURE__ */ e.jsx("span", { style: { color: "#94a3b8" }, title: d == null ? void 0 : d.ttlSecondsNote, children: "未测" }) : Ee(l)
+      render: (l, d) => d != null && d.ttlSecondsError ? /* @__PURE__ */ e.jsx(oe, { title: d.ttlSecondsError, children: /* @__PURE__ */ e.jsx(o, { color: "red", children: "读数不可信" }) }) : l == null ? /* @__PURE__ */ e.jsx("span", { style: { color: "#94a3b8" }, title: d == null ? void 0 : d.ttlSecondsNote, children: "未测" }) : ve(l)
     },
     {
       title: "字节",
@@ -676,47 +676,47 @@ function Xe() {
       key: "authority",
       width: 190,
       unmeasured: "未采信",
-      render: (l, d) => /* @__PURE__ */ e.jsx(o, { color: $((d == null ? void 0 : d.authority) ?? l).color, children: (d == null ? void 0 : d.authority) ?? l ?? "-" })
+      render: (l, d) => /* @__PURE__ */ e.jsx(o, { color: M((d == null ? void 0 : d.authority) ?? l).color, children: (d == null ? void 0 : d.authority) ?? l ?? "-" })
     }
-  ], [V]), re = (c == null ? void 0 : c.sourceUsed) === "client";
+  ], [V]), ne = (c == null ? void 0 : c.sourceUsed) === "client";
   return /* @__PURE__ */ e.jsxs("div", { children: [
-    /* @__PURE__ */ e.jsxs(C, { size: "small", style: { marginBottom: 12 }, children: [
-      /* @__PURE__ */ e.jsxs(oe, { wrap: !0, size: 8, children: [
+    /* @__PURE__ */ e.jsxs(A, { size: "small", style: { marginBottom: 12 }, children: [
+      /* @__PURE__ */ e.jsxs(Q, { wrap: !0, size: 8, children: [
         /* @__PURE__ */ e.jsx("span", { children: "pattern" }),
         /* @__PURE__ */ e.jsx(
-          Oe,
+          we,
           {
             style: { width: 240 },
             value: s,
             allowClear: !0,
             prefix: /* @__PURE__ */ e.jsx($e, {}),
             placeholder: "glob：* ? [] （默认 * = 全部）",
-            onChange: (l) => h(l.target.value),
+            onChange: (l) => m(l.target.value),
             onPressEnter: J
           }
         ),
         /* @__PURE__ */ e.jsx("span", { children: "db" }),
         /* @__PURE__ */ e.jsx(
-          we,
+          Ae,
           {
             style: { width: 100 },
             value: i,
             onChange: y,
-            disabled: re,
+            disabled: ne,
             options: Array.from({ length: 16 }, (l, d) => ({ value: d, label: `db${d}` }))
           }
         ),
         /* @__PURE__ */ e.jsx("span", { children: "limit" }),
-        /* @__PURE__ */ e.jsx(Ne, { style: { width: 90 }, min: 1, max: 1e3, value: g, onChange: k }),
+        /* @__PURE__ */ e.jsx(Ne, { style: { width: 90 }, min: 1, max: 1e3, value: T, onChange: R }),
         /* @__PURE__ */ e.jsx("span", { children: "source" }),
-        /* @__PURE__ */ e.jsxs(ne.Group, { value: r, onChange: (l) => t(l.target.value), children: [
-          /* @__PURE__ */ e.jsx(ne.Button, { value: "auto", children: "auto" }),
-          /* @__PURE__ */ e.jsx(ne.Button, { value: "embedded", children: "路 A 进程内" }),
-          /* @__PURE__ */ e.jsx(ne.Button, { value: "client", children: "路 B RESP" })
+        /* @__PURE__ */ e.jsxs(te.Group, { value: r, onChange: (l) => t(l.target.value), children: [
+          /* @__PURE__ */ e.jsx(te.Button, { value: "auto", children: "auto" }),
+          /* @__PURE__ */ e.jsx(te.Button, { value: "embedded", children: "路 A 进程内" }),
+          /* @__PURE__ */ e.jsx(te.Button, { value: "client", children: "路 B RESP" })
         ] }),
         /* @__PURE__ */ e.jsx(ce, { icon: /* @__PURE__ */ e.jsx(ae, {}), loading: _, onClick: J, children: "查询" })
       ] }),
-      re && /* @__PURE__ */ e.jsxs("div", { style: { marginTop: 8, fontSize: 12, color: "#b45309" }, children: [
+      ne && /* @__PURE__ */ e.jsxs("div", { style: { marginTop: 8, fontSize: 12, color: "#b45309" }, children: [
         "当前走路 B（RESP），",
         /* @__PURE__ */ e.jsx("b", { children: "db 选择器已被忽略" }),
         "：",
@@ -724,7 +724,7 @@ function Xe() {
       ] })
     ] }),
     P && /* @__PURE__ */ e.jsx(
-      b,
+      g,
       {
         type: "error",
         showIcon: !0,
@@ -738,7 +738,7 @@ function Xe() {
       }
     ),
     (c == null ? void 0 : c.desyncRows) > 0 && /* @__PURE__ */ e.jsx(
-      b,
+      g,
       {
         type: "warning",
         showIcon: !0,
@@ -756,9 +756,9 @@ function Xe() {
             "sourceUsed = ",
             c.sourceUsed
           ] }),
-          (c == null ? void 0 : c.authority) && /* @__PURE__ */ e.jsx(o, { color: $(c.authority).color, children: c.authority })
+          (c == null ? void 0 : c.authority) && /* @__PURE__ */ e.jsx(o, { color: M(c.authority).color, children: c.authority })
         ] }),
-        cardExtra: c && /* @__PURE__ */ e.jsx(oe, { size: 8, children: /* @__PURE__ */ e.jsx(
+        cardExtra: c && /* @__PURE__ */ e.jsx(Q, { size: 8, children: /* @__PURE__ */ e.jsx(
           Be,
           {
             status: c.truncated ? "warning" : "default",
@@ -778,14 +778,14 @@ function Xe() {
       Le,
       {
         width: 720,
-        open: !!m,
-        title: m ? `key: ${m.key}` : "key 详情",
-        onClose: () => T(null),
+        open: !!h,
+        title: h ? `key: ${h.key}` : "key 详情",
+        onClose: () => b(null),
         destroyOnHidden: !0,
         children: [
-          Y && /* @__PURE__ */ e.jsx(b, { type: "error", showIcon: !0, message: `读详情失败：${G(Y)}` }),
-          !m && !Y && /* @__PURE__ */ e.jsx(Se, { description: "载入中…" }),
-          m && /* @__PURE__ */ e.jsxs(e.Fragment, { children: [
+          Y && /* @__PURE__ */ e.jsx(g, { type: "error", showIcon: !0, message: `读详情失败：${G(Y)}` }),
+          !h && !Y && /* @__PURE__ */ e.jsx(Se, { description: "载入中…" }),
+          h && /* @__PURE__ */ e.jsxs(e.Fragment, { children: [
             /* @__PURE__ */ e.jsx(
               U,
               {
@@ -793,31 +793,31 @@ function Xe() {
                 size: "small",
                 column: 2,
                 items: [
-                  { key: "src", label: "取数路", children: /* @__PURE__ */ e.jsx(o, { children: m.sourceUsed }) },
-                  { key: "auth", label: "归属", children: /* @__PURE__ */ e.jsx(o, { color: $(m.authority).color, children: m.authority ?? "-" }) },
-                  { key: "db", label: "库", children: m.dbIgnoredForClientPath ? /* @__PURE__ */ e.jsxs("span", { children: [
+                  { key: "src", label: "取数路", children: /* @__PURE__ */ e.jsx(o, { children: h.sourceUsed }) },
+                  { key: "auth", label: "归属", children: /* @__PURE__ */ e.jsx(o, { color: M(h.authority).color, children: h.authority ?? "-" }) },
+                  { key: "db", label: "库", children: h.dbIgnoredForClientPath ? /* @__PURE__ */ e.jsxs("span", { children: [
                     "db",
-                    m.db,
+                    h.db,
                     "（",
                     /* @__PURE__ */ e.jsx("b", { children: "已忽略" }),
                     "，路 B 不切库）"
-                  ] }) : `db${m.db ?? "-"}` },
-                  { key: "type", label: "类型", children: m.desyncSuspect ? /* @__PURE__ */ e.jsx(se, { title: m.desyncReason || "应答与所发命令对不上", children: /* @__PURE__ */ e.jsx(o, { color: "red", children: "应答错位·未采信" }) }) : /* @__PURE__ */ e.jsx(o, { color: Ce[m.type] || "default", children: m.type ?? "未采信" }) },
-                  { key: "exists", label: "存在", children: m.exists == null ? "-" : m.exists ? /* @__PURE__ */ e.jsx(o, { color: "success", children: "是" }) : /* @__PURE__ */ e.jsx(o, { children: "否" }) },
-                  { key: "ttl", label: "TTL", children: Ee(m.ttlSeconds) },
-                  { key: "pttl", label: "PTTL(ms)", children: m.pttlMillis ?? "-" },
-                  { key: "ver", label: "keyVersion（路 A）", children: m.keyVersion ?? "-" },
-                  m.error && { key: "err", label: "读取错误", span: 2, children: /* @__PURE__ */ e.jsx("code", { children: m.error }) }
+                  ] }) : `db${h.db ?? "-"}` },
+                  { key: "type", label: "类型", children: h.desyncSuspect ? /* @__PURE__ */ e.jsx(oe, { title: h.desyncReason || "应答与所发命令对不上", children: /* @__PURE__ */ e.jsx(o, { color: "red", children: "应答错位·未采信" }) }) : /* @__PURE__ */ e.jsx(o, { color: Ce[h.type] || "default", children: h.type ?? "未采信" }) },
+                  { key: "exists", label: "存在", children: h.exists == null ? "-" : h.exists ? /* @__PURE__ */ e.jsx(o, { color: "success", children: "是" }) : /* @__PURE__ */ e.jsx(o, { children: "否" }) },
+                  { key: "ttl", label: "TTL", children: ve(h.ttlSeconds) },
+                  { key: "pttl", label: "PTTL(ms)", children: h.pttlMillis ?? "-" },
+                  { key: "ver", label: "keyVersion（路 A）", children: h.keyVersion ?? "-" },
+                  h.error && { key: "err", label: "读取错误", span: 2, children: /* @__PURE__ */ e.jsx("code", { children: h.error }) }
                 ].filter(Boolean)
               }
             ),
-            /* @__PURE__ */ e.jsx(C, { size: "small", title: "值（按类型取，非 UTF-8 会降级成 base64）", style: { marginTop: 12 }, children: !m.value || !Object.keys(m.value).length ? /* @__PURE__ */ e.jsx(Se, { description: "该类型没有可读的值，或路 A/B 都取不到" }) : /* @__PURE__ */ e.jsx(
+            /* @__PURE__ */ e.jsx(A, { size: "small", title: "值（按类型取，非 UTF-8 会降级成 base64）", style: { marginTop: 12 }, children: !h.value || !Object.keys(h.value).length ? /* @__PURE__ */ e.jsx(Se, { description: "该类型没有可读的值，或路 A/B 都取不到" }) : /* @__PURE__ */ e.jsx(
               U,
               {
                 size: "small",
                 column: 1,
                 bordered: !0,
-                items: Object.entries(m.value).map(([l, d]) => ({
+                items: Object.entries(h.value).map(([l, d]) => ({
                   key: l,
                   label: l,
                   children: Ze(d)
@@ -866,7 +866,7 @@ const Qe = [
   }
 ];
 function er({ name: r, fields: t }) {
-  return t ? /* @__PURE__ */ e.jsx(C, { size: "small", title: /* @__PURE__ */ e.jsxs("span", { children: [
+  return t ? /* @__PURE__ */ e.jsx(A, { size: "small", title: /* @__PURE__ */ e.jsxs("span", { children: [
     "# ",
     r
   ] }), style: { marginBottom: 12 }, children: /* @__PURE__ */ e.jsx(
@@ -875,15 +875,15 @@ function er({ name: r, fields: t }) {
       size: "small",
       column: 2,
       bordered: !0,
-      items: Object.entries(t).map(([s, h]) => ({ key: s, label: s, children: /* @__PURE__ */ e.jsx("code", { children: h }) }))
+      items: Object.entries(t).map(([s, m]) => ({ key: s, label: s, children: /* @__PURE__ */ e.jsx("code", { children: m }) }))
     }
   ) }) : null;
 }
 function rr({ fp: r }) {
-  var h, i;
+  var m, i;
   const t = r.verdict, s = t === "DIFFERENT_BUILD" ? "error" : t === "SAME_BUILD_CANDIDATE" ? "warning" : "info";
   return /* @__PURE__ */ e.jsx(
-    b,
+    g,
     {
       type: s,
       showIcon: !0,
@@ -894,7 +894,7 @@ function rr({ fp: r }) {
           "本次构建会印 ",
           /* @__PURE__ */ e.jsxs("code", { children: [
             "z-cache_version:",
-            ((h = r.ownBuildConstants) == null ? void 0 : h["z-cache_version"]) ?? "?"
+            ((m = r.ownBuildConstants) == null ? void 0 : m["z-cache_version"]) ?? "?"
           ] }),
           "／ 对面印 ",
           /* @__PURE__ */ e.jsxs("code", { children: [
@@ -915,38 +915,38 @@ function rr({ fp: r }) {
   );
 }
 function nr() {
-  const [r, t] = x(null), [s, h] = x(null), [i, y] = x(null), [g, k] = x(null), [R, u] = x(null), [p, f] = x(0), [c, w] = x(!1), _ = X(async () => {
-    w(!0);
+  const [r, t] = x(null), [s, m] = x(null), [i, y] = x(null), [T, R] = x(null), [C, u] = x(null), [p, I] = x(0), [c, k] = x(!1), _ = X(async () => {
+    k(!0);
     try {
-      const [T, I] = await Promise.all([N.info(), N.instance()]);
-      t(T), y(I), k(null);
-    } catch (T) {
-      t(null), k(T);
+      const [b, w] = await Promise.all([B.info(), B.instance()]);
+      t(b), y(w), R(null);
+    } catch (b) {
+      t(null), R(b);
     }
     try {
-      h(await N.hotkeys({ db: p, limit: 50 })), u(null);
-    } catch (T) {
-      h(null), u(T);
+      m(await B.hotkeys({ db: p, limit: 50 })), u(null);
+    } catch (b) {
+      m(null), u(b);
     } finally {
-      w(!1);
+      k(!1);
     }
   }, [p]);
   ie(() => {
     _();
   }, [_]);
-  const v = r == null ? void 0 : r.embedded, P = !!(i != null && i.foreignListenerSuspected), M = (r == null ? void 0 : r.sections) ?? {}, m = (r == null ? void 0 : r.responderVsOwnBuild) ?? null;
+  const S = r == null ? void 0 : r.embedded, P = !!(i != null && i.foreignListenerSuspected), j = (r == null ? void 0 : r.sections) ?? {}, h = (r == null ? void 0 : r.responderVsOwnBuild) ?? null;
   return /* @__PURE__ */ e.jsxs("div", { children: [
-    g && /* @__PURE__ */ e.jsx(
-      b,
+    T && /* @__PURE__ */ e.jsx(
+      g,
       {
         type: "error",
         showIcon: !0,
         style: { marginBottom: 12 },
-        message: `读不到统计：${G(g)}`
+        message: `读不到统计：${G(T)}`
       }
     ),
     P && /* @__PURE__ */ e.jsx(
-      b,
+      g,
       {
         type: "error",
         showIcon: !0,
@@ -956,8 +956,8 @@ function nr() {
       }
     ),
     /* @__PURE__ */ e.jsxs(Z, { gutter: 16, children: [
-      /* @__PURE__ */ e.jsx(A, { span: 12, children: /* @__PURE__ */ e.jsx(
-        C,
+      /* @__PURE__ */ e.jsx(z, { span: 12, children: /* @__PURE__ */ e.jsx(
+        A,
         {
           title: /* @__PURE__ */ e.jsxs("span", { children: [
             "路 A · 进程内计数 ",
@@ -965,17 +965,17 @@ function nr() {
           ] }),
           size: "small",
           loading: c,
-          children: v ? /* @__PURE__ */ e.jsxs(e.Fragment, { children: [
+          children: S ? /* @__PURE__ */ e.jsxs(e.Fragment, { children: [
             /* @__PURE__ */ e.jsxs(Z, { gutter: 8, children: [
-              /* @__PURE__ */ e.jsx(A, { span: 8, children: /* @__PURE__ */ e.jsx(F, { title: "dbsize", value: v.dbsizeTotal }) }),
-              /* @__PURE__ */ e.jsx(A, { span: 8, children: /* @__PURE__ */ e.jsx(
+              /* @__PURE__ */ e.jsx(z, { span: 8, children: /* @__PURE__ */ e.jsx(F, { title: "dbsize", value: S.dbsizeTotal }) }),
+              /* @__PURE__ */ e.jsx(z, { span: 8, children: /* @__PURE__ */ e.jsx(
                 F,
                 {
                   title: "命中率",
-                  value: `${(v.hitRate * 100).toFixed(2)}%`
+                  value: `${(S.hitRate * 100).toFixed(2)}%`
                 }
               ) }),
-              /* @__PURE__ */ e.jsx(A, { span: 8, children: /* @__PURE__ */ e.jsx(F, { title: "淘汰", value: v.evictions }) })
+              /* @__PURE__ */ e.jsx(z, { span: 8, children: /* @__PURE__ */ e.jsx(F, { title: "淘汰", value: S.evictions }) })
             ] }),
             /* @__PURE__ */ e.jsx(
               U,
@@ -985,17 +985,17 @@ function nr() {
                 style: { marginTop: 12 },
                 bordered: !0,
                 items: [
-                  { key: "hits", label: "hits / misses", children: `${v.hits} / ${v.misses}` },
-                  { key: "cmds", label: "累计命令", children: v.totalCommands },
-                  { key: "clients", label: "当前连接", children: v.connectedClients },
-                  { key: "max", label: "maxEntries", children: v.maxEntries },
-                  { key: "heap", label: "JVM 堆（已用/上限）", children: `${le(v.jvmHeapUsedBytes)} / ${le(v.jvmHeapMaxBytes)}` },
-                  { key: "cpu", label: "可用核数", children: v.jvmAvailableProcessors }
+                  { key: "hits", label: "hits / misses", children: `${S.hits} / ${S.misses}` },
+                  { key: "cmds", label: "累计命令", children: S.totalCommands },
+                  { key: "clients", label: "当前连接", children: S.connectedClients },
+                  { key: "max", label: "maxEntries", children: S.maxEntries },
+                  { key: "heap", label: "JVM 堆（已用/上限）", children: `${le(S.jvmHeapUsedBytes)} / ${le(S.jvmHeapMaxBytes)}` },
+                  { key: "cpu", label: "可用核数", children: S.jvmAvailableProcessors }
                 ]
               }
             )
           ] }) : /* @__PURE__ */ e.jsx(
-            b,
+            g,
             {
               type: "warning",
               showIcon: !0,
@@ -1005,64 +1005,64 @@ function nr() {
           )
         }
       ) }),
-      /* @__PURE__ */ e.jsx(A, { span: 12, children: /* @__PURE__ */ e.jsxs(
-        C,
+      /* @__PURE__ */ e.jsx(z, { span: 12, children: /* @__PURE__ */ e.jsxs(
+        A,
         {
           title: /* @__PURE__ */ e.jsxs("span", { children: [
             "路 B · 上游 INFO ",
-            /* @__PURE__ */ e.jsx(o, { color: $(r == null ? void 0 : r.authorityOfClient).color, children: (r == null ? void 0 : r.authorityOfClient) ?? "-" })
+            /* @__PURE__ */ e.jsx(o, { color: M(r == null ? void 0 : r.authorityOfClient).color, children: (r == null ? void 0 : r.authorityOfClient) ?? "-" })
           ] }),
           size: "small",
           loading: c,
           children: [
-            (r == null ? void 0 : r.clientError) && /* @__PURE__ */ e.jsx(b, { type: "error", showIcon: !0, style: { marginBottom: 8 }, message: r.clientError }),
-            (r == null ? void 0 : r.clientNote) && /* @__PURE__ */ e.jsx(b, { type: "warning", showIcon: !0, style: { marginBottom: 8 }, message: r.clientNote }),
-            Object.keys(M).length === 0 && !(r != null && r.clientError) && !(r != null && r.clientNote) && /* @__PURE__ */ e.jsx(b, { type: "info", showIcon: !0, message: "INFO 为空 —— 应答者没返回任何分节" }),
-            Object.entries(M).map(([T, I]) => /* @__PURE__ */ e.jsx(er, { name: T, fields: I }, T)),
+            (r == null ? void 0 : r.clientError) && /* @__PURE__ */ e.jsx(g, { type: "error", showIcon: !0, style: { marginBottom: 8 }, message: r.clientError }),
+            (r == null ? void 0 : r.clientNote) && /* @__PURE__ */ e.jsx(g, { type: "warning", showIcon: !0, style: { marginBottom: 8 }, message: r.clientNote }),
+            Object.keys(j).length === 0 && !(r != null && r.clientError) && !(r != null && r.clientNote) && /* @__PURE__ */ e.jsx(g, { type: "info", showIcon: !0, message: "INFO 为空 —— 应答者没返回任何分节" }),
+            Object.entries(j).map(([b, w]) => /* @__PURE__ */ e.jsx(er, { name: b, fields: w }, b)),
             (r == null ? void 0 : r.hardcodedInUpstream) && /* @__PURE__ */ e.jsx(
-              b,
+              g,
               {
                 type: "error",
                 showIcon: !0,
                 style: { marginTop: 4 },
                 message: "INFO 里这两个字段是写死的字面量，不要拿去对照 jar 版本或端口",
-                description: /* @__PURE__ */ e.jsx("ul", { style: { margin: 0, paddingLeft: 18 }, children: r.hardcodedInUpstream.map((T) => /* @__PURE__ */ e.jsx("li", { style: { fontSize: 12 }, children: T }, T)) })
+                description: /* @__PURE__ */ e.jsx("ul", { style: { margin: 0, paddingLeft: 18 }, children: r.hardcodedInUpstream.map((b) => /* @__PURE__ */ e.jsx("li", { style: { fontSize: 12 }, children: b }, b)) })
               }
             ),
-            m && /* @__PURE__ */ e.jsx(rr, { fp: m })
+            h && /* @__PURE__ */ e.jsx(rr, { fp: h })
           ]
         }
       ) })
     ] }),
-    (r == null ? void 0 : r.raw) && /* @__PURE__ */ e.jsx(C, { title: "INFO 原文（未加工，逐字符来自上游）", size: "small", style: { marginTop: 16 }, children: /* @__PURE__ */ e.jsx("pre", { style: { margin: 0, maxHeight: 260, overflow: "auto", fontSize: 12 }, children: r.raw }) }),
+    (r == null ? void 0 : r.raw) && /* @__PURE__ */ e.jsx(A, { title: "INFO 原文（未加工，逐字符来自上游）", size: "small", style: { marginTop: 16 }, children: /* @__PURE__ */ e.jsx("pre", { style: { margin: 0, maxHeight: 260, overflow: "auto", fontSize: 12 }, children: r.raw }) }),
     /* @__PURE__ */ e.jsxs(
-      C,
+      A,
       {
         title: "热 key（路 A 的 LFU 埋点，只覆盖 string 类型）",
         style: { marginTop: 16 },
         size: "small",
-        extra: /* @__PURE__ */ e.jsxs(oe, { children: [
+        extra: /* @__PURE__ */ e.jsxs(Q, { children: [
           /* @__PURE__ */ e.jsx("span", { style: { fontSize: 12, color: "#64748b" }, children: "库" }),
           /* @__PURE__ */ e.jsx(
-            we,
+            Ae,
             {
               size: "small",
               style: { width: 96 },
               value: p,
-              onChange: f,
-              options: Array.from({ length: 16 }, (T, I) => ({ value: I, label: `db${I}` }))
+              onChange: I,
+              options: Array.from({ length: 16 }, (b, w) => ({ value: w, label: `db${w}` }))
             }
           ),
           /* @__PURE__ */ e.jsx(ce, { icon: /* @__PURE__ */ e.jsx(ae, {}), loading: c, onClick: _, children: "刷新" })
         ] }),
         children: [
-          R && /* @__PURE__ */ e.jsx(
-            b,
+          C && /* @__PURE__ */ e.jsx(
+            g,
             {
               type: "warning",
               showIcon: !0,
               style: { marginBottom: 8 },
-              message: `读不到热 key：${G(R)}`,
+              message: `读不到热 key：${G(C)}`,
               description: "后端只有路 A 能出这个视图，所以「反射不到内嵌 RedisServer」= 503。这不是「没有热 key」。"
             }
           ),
@@ -1075,10 +1075,10 @@ function nr() {
               " 个",
               s.truncated ? "（只显示前 50，已截断）" : "",
               "· ",
-              /* @__PURE__ */ e.jsx(o, { color: $(s.authority).color, children: s.authority })
+              /* @__PURE__ */ e.jsx(o, { color: M(s.authority).color, children: s.authority })
             ] }),
             /* @__PURE__ */ e.jsx(
-              L,
+              $,
               {
                 size: "small",
                 rowKey: "key",
@@ -1103,37 +1103,40 @@ const xe = [
   { title: "RESP 命令", dataIndex: "command", key: "command", width: 140, render: (r) => /* @__PURE__ */ e.jsx("code", { children: r }) },
   { title: "说明", dataIndex: "note", key: "note", ellipsis: !0 }
 ];
-function O({ value: r, okText: t = "是", badText: s = "否", badColor: h = "error", unknown: i = "未探测" }) {
-  return r == null ? /* @__PURE__ */ e.jsx(o, { children: i }) : r ? /* @__PURE__ */ e.jsx(o, { color: "success", children: t }) : /* @__PURE__ */ e.jsx(o, { color: h, children: s });
+function N({ value: r, okText: t = "是", badText: s = "否", badColor: m = "error", unknown: i = "未探测" }) {
+  return r == null ? /* @__PURE__ */ e.jsx(o, { children: i }) : r ? /* @__PURE__ */ e.jsx(o, { color: "success", children: t }) : /* @__PURE__ */ e.jsx(o, { color: m, children: s });
 }
 function tr({ value: r }) {
-  const t = $(r);
+  const t = M(r);
   return /* @__PURE__ */ e.jsx(o, { color: t.color, children: r || "-" });
 }
 function sr() {
-  const [r, t] = x(null), [s, h] = x(null), [i, y] = x(null), [g, k] = x(!1), R = X(async () => {
-    k(!0);
+  const [r, t] = x(null), [s, m] = x(null), [i, y] = x(null), [T, R] = x(!1), C = X(async () => {
+    R(!0);
     try {
-      const f = await N.instance();
-      t(f), y(null);
+      const j = await B.instance();
+      t(j), y(null);
       try {
-        h(await N.commandCatalog());
+        m(await B.commandCatalog());
       } catch {
-        h(null);
+        m(null);
       }
-    } catch (f) {
-      t(null), y(f);
+    } catch (j) {
+      t(null), y(j);
     } finally {
-      k(!1);
+      R(!1);
     }
   }, []);
   ie(() => {
-    R();
-  }, [R]);
-  const u = !i && r && r.foreignListenerSuspected, p = !i && r && !r.embeddedRunning;
+    C();
+  }, [C]);
+  const u = !i && r && r.foreignListenerSuspected, p = !i && r && !r.embeddedRunning, [I, c] = x(""), k = (j) => {
+    const h = Array.isArray(j) ? j : [], b = I.trim().toLowerCase();
+    return b ? h.filter((w) => `${(w == null ? void 0 : w.command) || ""} ${(w == null ? void 0 : w.note) || ""}`.toLowerCase().includes(b)) : h;
+  }, _ = k(s == null ? void 0 : s.commandsActuallyIssued), S = k(s == null ? void 0 : s.readOnlyCommandsAllowedByWhitelist), P = k(s == null ? void 0 : s.neverIssuedDespiteBeingSupportedByServer);
   return /* @__PURE__ */ e.jsxs("div", { children: [
     i && /* @__PURE__ */ e.jsx(
-      b,
+      g,
       {
         type: "error",
         showIcon: !0,
@@ -1142,7 +1145,7 @@ function sr() {
       }
     ),
     p && !u && /* @__PURE__ */ e.jsx(
-      b,
+      g,
       {
         type: "warning",
         showIcon: !0,
@@ -1152,7 +1155,7 @@ function sr() {
       }
     ),
     u && /* @__PURE__ */ e.jsx(
-      b,
+      g,
       {
         type: "error",
         showIcon: !0,
@@ -1162,11 +1165,11 @@ function sr() {
       }
     ),
     /* @__PURE__ */ e.jsxs(
-      C,
+      A,
       {
         title: "这一路到底连的是谁",
-        loading: g,
-        extra: /* @__PURE__ */ e.jsx(oe, { children: /* @__PURE__ */ e.jsx(ce, { icon: /* @__PURE__ */ e.jsx(ae, {}), loading: g, onClick: R, children: "刷新" }) }),
+        loading: T,
+        extra: /* @__PURE__ */ e.jsx(Q, { children: /* @__PURE__ */ e.jsx(ce, { icon: /* @__PURE__ */ e.jsx(ae, {}), loading: T, onClick: C, children: "刷新" }) }),
         children: [
           /* @__PURE__ */ e.jsx(
             U,
@@ -1198,7 +1201,7 @@ function sr() {
                   label: "starter 自报 isServerStarted()",
                   children: /* @__PURE__ */ e.jsxs("span", { children: [
                     /* @__PURE__ */ e.jsx(
-                      O,
+                      N,
                       {
                         value: r == null ? void 0 : r.isServerStartedClaimedByStarter,
                         okText: "true",
@@ -1217,7 +1220,7 @@ function sr() {
                   label: "反射取到内嵌 RedisServer",
                   children: /* @__PURE__ */ e.jsxs("span", { children: [
                     /* @__PURE__ */ e.jsx(
-                      O,
+                      N,
                       {
                         value: r == null ? void 0 : r.serverFieldReflected,
                         okText: "是（路 A 可用）",
@@ -1230,7 +1233,7 @@ function sr() {
                 {
                   key: "running",
                   label: "内嵌 server 真在跑 (isRunning)",
-                  children: /* @__PURE__ */ e.jsx(O, { value: r == null ? void 0 : r.embeddedRunning, okText: "是", badText: "否" })
+                  children: /* @__PURE__ */ e.jsx(N, { value: r == null ? void 0 : r.embeddedRunning, okText: "是", badText: "否" })
                 },
                 {
                   key: "boundPort",
@@ -1241,7 +1244,7 @@ function sr() {
                   key: "store",
                   label: "进程内 store 可读（路 A）",
                   children: /* @__PURE__ */ e.jsx(
-                    O,
+                    N,
                     {
                       value: r == null ? void 0 : r.storeAvailable,
                       okText: "可用",
@@ -1259,7 +1262,7 @@ function sr() {
                   key: "accepting",
                   label: "该端口此刻 TCP 可连",
                   children: /* @__PURE__ */ e.jsx(
-                    O,
+                    N,
                     {
                       value: r == null ? void 0 : r.acceptingNow,
                       okText: "有人应答",
@@ -1271,7 +1274,7 @@ function sr() {
                 {
                   key: "owned",
                   label: "该端口的属主是本 JVM",
-                  children: /* @__PURE__ */ e.jsx(O, { value: r == null ? void 0 : r.embeddedPortOwnedByThisJvm, badColor: "error" })
+                  children: /* @__PURE__ */ e.jsx(N, { value: r == null ? void 0 : r.embeddedPortOwnedByThisJvm, badColor: "error" })
                 },
                 {
                   key: "foreign",
@@ -1281,13 +1284,13 @@ function sr() {
                 {
                   key: "clientBean",
                   label: "zCacheClient bean 存在（路 B）",
-                  children: /* @__PURE__ */ e.jsx(O, { value: r == null ? void 0 : r.clientBeanPresent, badColor: "warning" })
+                  children: /* @__PURE__ */ e.jsx(N, { value: r == null ? void 0 : r.clientBeanPresent, badColor: "warning" })
                 },
                 {
                   key: "clientConn",
                   label: "RESP 连接已建立",
                   children: /* @__PURE__ */ e.jsx(
-                    O,
+                    N,
                     {
                       value: r == null ? void 0 : r.clientTransportConnected,
                       okText: "已连",
@@ -1305,7 +1308,7 @@ function sr() {
                   key: "clientAuth",
                   label: "client 侧启用了密码",
                   children: /* @__PURE__ */ e.jsx(
-                    O,
+                    N,
                     {
                       value: r == null ? void 0 : r.clientTargetHasPassword,
                       okText: "有",
@@ -1377,47 +1380,58 @@ function sr() {
           ),
           /* @__PURE__ */ e.jsxs("div", { style: { marginTop: 12, fontSize: 12, color: "#64748b" }, children: [
             "只读端点清单：",
-            ((r == null ? void 0 : r.readEndpoints) ?? []).map((f) => /* @__PURE__ */ e.jsx(
+            ((r == null ? void 0 : r.readEndpoints) ?? []).map((j) => /* @__PURE__ */ e.jsx(
               "code",
               {
                 style: { marginRight: 6 },
-                children: f
+                children: j
               },
-              f
+              j
             ))
           ] })
         ]
       }
     ),
     /* @__PURE__ */ e.jsx(
-      C,
+      A,
       {
         title: "本 controller 实际下发 / 白名单允许 / 永不下发的 RESP 命令",
         style: { marginTop: 16 },
-        extra: /* @__PURE__ */ e.jsx(o, { color: "blue", children: "命令名是代码常量，HTTP 侧无法指定" }),
+        extra: /* @__PURE__ */ e.jsxs(Q, { children: [
+          /* @__PURE__ */ e.jsx(
+            we.Search,
+            {
+              allowClear: !0,
+              placeholder: "按 RESP 命令 / 说明过滤",
+              style: { width: 220 },
+              onChange: (j) => c(j.target.value)
+            }
+          ),
+          /* @__PURE__ */ e.jsx(o, { color: "blue", children: "命令名是代码常量，HTTP 侧无法指定" })
+        ] }),
         children: s ? /* @__PURE__ */ e.jsxs(e.Fragment, { children: [
           /* @__PURE__ */ e.jsx("div", { style: { fontSize: 12, color: "#64748b", marginBottom: 8 }, children: s.provenance }),
           /* @__PURE__ */ e.jsx(
-            L,
+            $,
             {
               size: "small",
               rowKey: "command",
               pagination: !1,
               columns: xe,
               locale: { emptyText: /* @__PURE__ */ e.jsx(pe, { title: "没有已下发命令", size: "sm" }) },
-              dataSource: s.commandsActuallyIssued ?? [],
+              dataSource: _,
               title: () => {
-                var f;
+                var j;
                 return /* @__PURE__ */ e.jsx("span", { children: /* @__PURE__ */ e.jsxs(o, { color: "success", children: [
                   "只读 · 本 controller 真正会发的（",
-                  ((f = s.commandsActuallyIssued) == null ? void 0 : f.length) ?? 0,
+                  ((j = s.commandsActuallyIssued) == null ? void 0 : j.length) ?? 0,
                   " 条）"
                 ] }) });
               }
             }
           ),
           s.notCountedAsIssued ? /* @__PURE__ */ e.jsx(
-            b,
+            g,
             {
               style: { marginTop: 8 },
               type: "warning",
@@ -1427,7 +1441,7 @@ function sr() {
             }
           ) : null,
           /* @__PURE__ */ e.jsx(
-            L,
+            $,
             {
               style: { marginTop: 12 },
               size: "small",
@@ -1435,13 +1449,13 @@ function sr() {
               pagination: !1,
               columns: xe,
               locale: { emptyText: /* @__PURE__ */ e.jsx(pe, { title: "只读白名单为空", size: "sm" }) },
-              dataSource: s.readOnlyCommandsAllowedByWhitelist ?? [],
+              dataSource: S,
               title: () => /* @__PURE__ */ e.jsx("span", { children: /* @__PURE__ */ e.jsx(o, { color: "processing", children: "只读白名单 = 上限集合（safeSend 入口校验用）" }) })
             }
           ),
           s.whitelistSemantics ? /* @__PURE__ */ e.jsx("div", { style: { marginTop: 8, fontSize: 12, color: "#64748b" }, children: s.whitelistSemantics }) : null,
           /* @__PURE__ */ e.jsx(
-            L,
+            $,
             {
               style: { marginTop: 12 },
               size: "small",
@@ -1449,12 +1463,12 @@ function sr() {
               pagination: !1,
               columns: xe,
               locale: { emptyText: /* @__PURE__ */ e.jsx(pe, { title: "没有此类命令", size: "sm" }) },
-              dataSource: s.neverIssuedDespiteBeingSupportedByServer ?? [],
+              dataSource: P,
               title: () => /* @__PURE__ */ e.jsx("span", { children: /* @__PURE__ */ e.jsx(o, { color: "error", children: "server 支持但本 controller 永不下发" }) })
             }
           )
         ] }) : /* @__PURE__ */ e.jsx(
-          b,
+          g,
           {
             type: "info",
             showIcon: !0,
@@ -1463,8 +1477,8 @@ function sr() {
         )
       }
     ),
-    /* @__PURE__ */ e.jsx(C, { title: "「上游自报存活时长」这一招在 z-cache 上不可用", style: { marginTop: 16 }, children: /* @__PURE__ */ e.jsx(
-      b,
+    /* @__PURE__ */ e.jsx(A, { title: "「上游自报存活时长」这一招在 z-cache 上不可用", style: { marginTop: 16 }, children: /* @__PURE__ */ e.jsx(
+      g,
       {
         type: "warning",
         showIcon: !0,
@@ -1483,8 +1497,8 @@ function sr() {
   ] });
 }
 function mr() {
-  return /* @__PURE__ */ e.jsxs(Pe, { children: [
-    /* @__PURE__ */ e.jsx(W, { index: !0, element: /* @__PURE__ */ e.jsx(Ie, { to: "overview", replace: !0 }) }),
+  return /* @__PURE__ */ e.jsxs(Ie, { children: [
+    /* @__PURE__ */ e.jsx(W, { index: !0, element: /* @__PURE__ */ e.jsx(ze, { to: "overview", replace: !0 }) }),
     /* @__PURE__ */ e.jsx(W, { path: "overview", element: /* @__PURE__ */ e.jsx(Ke, {}) }),
     /* @__PURE__ */ e.jsx(W, { path: "keys", element: /* @__PURE__ */ e.jsx(Xe, {}) }),
     /* @__PURE__ */ e.jsx(W, { path: "stats", element: /* @__PURE__ */ e.jsx(nr, {}) }),
@@ -1502,11 +1516,11 @@ export {
   nr as S,
   pr as a,
   Ve as b,
-  $ as c,
-  N as d,
+  M as c,
+  B as d,
   G as e,
   le as f,
-  Ee as g,
+  ve as g,
   Je as h,
   hr as i,
   e as j
