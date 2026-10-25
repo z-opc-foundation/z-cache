@@ -1,9 +1,9 @@
 import { Routes as Pe, Route as W, Navigate as Ie } from "react-router-dom";
 import ze, { useState as x, useCallback as X, useEffect as ie, useMemo as Te } from "react";
-import { Button as ce, Alert as b, Row as Z, Col as A, Card as C, Statistic as F, Descriptions as U, Tag as o, Table as L, Tooltip as se, Space as oe, Input as Oe, Select as we, InputNumber as Ne, Radio as ne, Badge as Be, Drawer as Le, Empty as Se } from "antd";
+import { Alert as b, Row as Z, Col as A, Card as C, Statistic as F, Descriptions as U, Tag as o, Button as ce, Table as L, Tooltip as se, Space as oe, Input as Oe, Select as we, InputNumber as Ne, Radio as ne, Badge as Be, Drawer as Le, Empty as Se } from "antd";
 import { ReloadOutlined as ae, SearchOutlined as $e } from "@ant-design/icons";
 import D from "@yuku123/z-frontend-common";
-import { PageHeader as de, ListTable as Me, ComponentDoc as De } from "@yuku123/z-frontend-common/ui";
+import { ListTable as Me, DEFAULT_PAGINATION as De, EmptyState as pe, ComponentDoc as Fe } from "@yuku123/z-frontend-common/ui";
 const N = {
   instance: () => D.get("/cache/__instance"),
   overview: () => D.get("/cache/overview"),
@@ -12,7 +12,7 @@ const N = {
   info: () => D.get("/cache/info"),
   hotkeys: (r) => D.get("/cache/hotkeys", { params: r }),
   commandCatalog: () => D.get("/cache/command-catalog")
-}, Fe = {
+}, Ue = {
   THIS_JVM_IN_PROCESS: { color: "success", text: "本 JVM 进程内对象（不可能跨进程）" },
   THIS_JVM_EMBEDDED: { color: "success", text: "本 JVM 内嵌 server 应答" },
   EXTERNAL_PROCESS: {
@@ -23,7 +23,7 @@ const N = {
   UNKNOWN: { color: "warning", text: "连上了，但无法判定连的是谁" }
 };
 function $(r) {
-  return Fe[r] || { color: "default", text: r || "-" };
+  return Ue[r] || { color: "default", text: r || "-" };
 }
 function G(r) {
   var s;
@@ -34,7 +34,7 @@ function G(r) {
   }
   return typeof t == "string" && t.trim() ? t.slice(0, 240) : (r == null ? void 0 : r.message) || String(r);
 }
-function ur(r) {
+function hr(r) {
   var h, i, y;
   const t = (h = r == null ? void 0 : r.response) == null ? void 0 : h.status, s = (y = (i = r == null ? void 0 : r.response) == null ? void 0 : i.data) == null ? void 0 : y.source;
   return t === 503 && s === "z-opc-cache-read-api";
@@ -49,16 +49,16 @@ function Ee(r) {
   const t = Number(r);
   return t === -2 ? "不存在（-2）" : t === -1 ? "常驻（无过期）" : t < 10 ? `${t} 秒` : t < 600 ? `${Math.floor(t / 60)} 分 ${t % 60} 秒` : `${Math.floor(t / 86400)} 天 ${Math.floor(t % 86400 / 3600)} 时`;
 }
-function Ue(r) {
+function Je(r) {
   if (r == null) return "-";
   const t = Number(r), s = Math.floor(t / 86400), h = Math.floor(t % 86400 / 3600), i = Math.floor(t % 3600 / 60);
   return s > 0 ? `${s} 天 ${h} 时 ${i} 分` : h > 0 ? `${h} 时 ${i} 分 ${t % 60} 秒` : `${i} 分 ${t % 60} 秒`;
 }
-function Je(r) {
+function Ve(r) {
   if (r == null) return null;
   if (typeof r == "string") return r;
   if (typeof r == "number" || typeof r == "boolean") return String(r);
-  if (Array.isArray(r)) return r.map(Je).filter((t) => t != null).join(", ");
+  if (Array.isArray(r)) return r.map(Ve).filter((t) => t != null).join(", ");
   if (typeof r.error == "string") return `命令失败：${r.command ?? "?"} → ${r.error}`;
   try {
     return JSON.stringify(r);
@@ -77,7 +77,7 @@ var te = { exports: {} }, K = {};
  * LICENSE file in the root directory of this source tree.
  */
 var ve;
-function Ve() {
+function He() {
   if (ve) return K;
   ve = 1;
   var r = Symbol.for("react.transitional.element"), t = Symbol.for("react.fragment");
@@ -109,7 +109,7 @@ var q = {};
  * LICENSE file in the root directory of this source tree.
  */
 var ke;
-function He() {
+function Ge() {
   return ke || (ke = 1, process.env.NODE_ENV !== "production" && (function() {
     function r(n) {
       if (n == null) return null;
@@ -119,7 +119,7 @@ function He() {
       switch (n) {
         case P:
           return "Fragment";
-        case p:
+        case m:
           return "Profiler";
         case M:
           return "StrictMode";
@@ -127,9 +127,9 @@ function He() {
           return "Suspense";
         case ee:
           return "SuspenseList";
-        case ue:
+        case de:
           return "Activity";
-        case he:
+        case ue:
           return "ViewTransition";
       }
       if (typeof n == "object")
@@ -252,7 +252,7 @@ function He() {
         value: z
       }), Object.freeze && (Object.freeze(n.props), Object.freeze(n)), n;
     }
-    function m(n, a, j, S, B, z) {
+    function p(n, a, j, S, B, z) {
       var E = a.children;
       if (E !== void 0)
         if (S)
@@ -306,7 +306,7 @@ React keys must be passed directly to JSX without using spread:
     function c(n) {
       return typeof n == "object" && n !== null && n.$$typeof === _;
     }
-    var w = ze, _ = Symbol.for("react.transitional.element"), v = Symbol.for("react.portal"), P = Symbol.for("react.fragment"), M = Symbol.for("react.strict_mode"), p = Symbol.for("react.profiler"), T = Symbol.for("react.consumer"), I = Symbol.for("react.context"), Q = Symbol.for("react.forward_ref"), Y = Symbol.for("react.suspense"), ee = Symbol.for("react.suspense_list"), J = Symbol.for("react.memo"), V = Symbol.for("react.lazy"), ue = Symbol.for("react.activity"), he = Symbol.for("react.view_transition"), re = Symbol.for("react.client.reference"), l = w.__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE, d = Object.prototype.hasOwnProperty, _e = Array.isArray, pe = console.createTask ? console.createTask : function() {
+    var w = ze, _ = Symbol.for("react.transitional.element"), v = Symbol.for("react.portal"), P = Symbol.for("react.fragment"), M = Symbol.for("react.strict_mode"), m = Symbol.for("react.profiler"), T = Symbol.for("react.consumer"), I = Symbol.for("react.context"), Q = Symbol.for("react.forward_ref"), Y = Symbol.for("react.suspense"), ee = Symbol.for("react.suspense_list"), J = Symbol.for("react.memo"), V = Symbol.for("react.lazy"), de = Symbol.for("react.activity"), ue = Symbol.for("react.view_transition"), re = Symbol.for("react.client.reference"), l = w.__CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE, d = Object.prototype.hasOwnProperty, _e = Array.isArray, he = console.createTask ? console.createTask : function() {
       return null;
     };
     w = {
@@ -317,7 +317,7 @@ React keys must be passed directly to JSX without using spread:
     var ye, je = {}, be = w.react_stack_bottom_frame.bind(
       w,
       y
-    )(), ge = pe(h(y)), fe = {};
+    )(), ge = he(h(y)), fe = {};
     q.Fragment = P, q.jsx = function(n, a, j) {
       var S = 1e4 > l.recentlyCreatedOwnerStacks++;
       if (S) {
@@ -326,13 +326,13 @@ React keys must be passed directly to JSX without using spread:
         var z = Error("react-stack-top-frame");
         Error.stackTraceLimit = B;
       } else z = be;
-      return m(
+      return p(
         n,
         a,
         j,
         !1,
         z,
-        S ? pe(h(n)) : ge
+        S ? he(h(n)) : ge
       );
     }, q.jsxs = function(n, a, j) {
       var S = 1e4 > l.recentlyCreatedOwnerStacks++;
@@ -342,23 +342,23 @@ React keys must be passed directly to JSX without using spread:
         var z = Error("react-stack-top-frame");
         Error.stackTraceLimit = B;
       } else z = be;
-      return m(
+      return p(
         n,
         a,
         j,
         !0,
         z,
-        S ? pe(h(n)) : ge
+        S ? he(h(n)) : ge
       );
     };
   })()), q;
 }
 var Re;
-function Ge() {
-  return Re || (Re = 1, process.env.NODE_ENV === "production" ? te.exports = Ve() : te.exports = He()), te.exports;
+function Ye() {
+  return Re || (Re = 1, process.env.NODE_ENV === "production" ? te.exports = He() : te.exports = Ge()), te.exports;
 }
-var e = Ge();
-const Ye = [
+var e = Ye();
+const We = [
   { title: "库", dataIndex: "db", key: "db", width: 70, render: (r) => `db${r}` },
   {
     title: "key 数",
@@ -368,7 +368,7 @@ const Ye = [
     render: (r) => r > 0 ? /* @__PURE__ */ e.jsx(o, { color: "blue", children: r }) : /* @__PURE__ */ e.jsx("span", { style: { color: "#94a3b8" }, children: "0" })
   }
 ];
-function We() {
+function Ke() {
   const [r, t] = x(null), [s, h] = x(null), [i, y] = x(null), [g, k] = x(!1), R = X(async () => {
     k(!0);
     try {
@@ -383,16 +383,8 @@ function We() {
   ie(() => {
     R();
   }, [R]);
-  const u = (r == null ? void 0 : r.embedded) ?? {}, m = (r == null ? void 0 : r.client) ?? {}, f = !!(r != null && r.foreignListenerSuspected || s != null && s.foreignListenerSuspected), c = !!(r != null && r.authorityDiverges);
+  const u = (r == null ? void 0 : r.embedded) ?? {}, p = (r == null ? void 0 : r.client) ?? {}, f = !!(r != null && r.foreignListenerSuspected || s != null && s.foreignListenerSuspected), c = !!(r != null && r.authorityDiverges);
   return /* @__PURE__ */ e.jsxs("div", { children: [
-    /* @__PURE__ */ e.jsx(
-      de,
-      {
-        title: "缓存总览",
-        subtitle: "双路对账：进程内 MemoryStore（路 A） vs zCacheClient 走 RESP（路 B）— GET /api/cache/overview",
-        extra: /* @__PURE__ */ e.jsx(ce, { icon: /* @__PURE__ */ e.jsx(ae, {}), loading: g, onClick: R, children: "刷新" })
-      }
-    ),
     i && /* @__PURE__ */ e.jsx(
       b,
       {
@@ -423,6 +415,7 @@ function We() {
           ] }),
           size: "small",
           loading: g,
+          extra: /* @__PURE__ */ e.jsx(ce, { icon: /* @__PURE__ */ e.jsx(ae, {}), loading: g, onClick: R, children: "刷新" }),
           children: [
             /* @__PURE__ */ e.jsxs(Z, { gutter: 8, children: [
               /* @__PURE__ */ e.jsx(A, { span: 12, children: /* @__PURE__ */ e.jsx(F, { title: "dbsize（本 JVM 全部库）", value: u.dbsizeTotal ?? "-" }) }),
@@ -456,7 +449,7 @@ function We() {
                     key: "uptime",
                     label: "store 存在时长",
                     children: /* @__PURE__ */ e.jsxs("span", { children: [
-                      Ue(u.storeUptimeSeconds),
+                      Je(u.storeUptimeSeconds),
                       /* @__PURE__ */ e.jsx("span", { style: { color: "#b45309" }, children: "（自构造起算，不代表在线时长）" })
                     ] })
                   },
@@ -478,13 +471,13 @@ function We() {
           loading: g,
           children: [
             /* @__PURE__ */ e.jsxs(Z, { gutter: 8, children: [
-              /* @__PURE__ */ e.jsx(A, { span: 12, children: /* @__PURE__ */ e.jsx(F, { title: "dbsize", value: m.dbsize ?? "-" }) }),
+              /* @__PURE__ */ e.jsx(A, { span: 12, children: /* @__PURE__ */ e.jsx(F, { title: "dbsize", value: p.dbsize ?? "-" }) }),
               /* @__PURE__ */ e.jsx(A, { span: 12, children: /* @__PURE__ */ e.jsx(
                 F,
                 {
                   title: "RESP 已连接",
-                  value: m.transportConnected ? "是" : "否",
-                  valueStyle: { color: m.transportConnected ? "#16a34a" : "#d97706", fontSize: 20 }
+                  value: p.transportConnected ? "是" : "否",
+                  valueStyle: { color: p.transportConnected ? "#16a34a" : "#d97706", fontSize: 20 }
                 }
               ) })
             ] }),
@@ -495,18 +488,18 @@ function We() {
                 column: 1,
                 style: { marginTop: 12 },
                 items: [
-                  { key: "present", label: "bean 存在", children: m.present ? /* @__PURE__ */ e.jsx(o, { color: "success", children: "是" }) : /* @__PURE__ */ e.jsx(o, { color: "warning", children: "否" }) },
-                  { key: "target", label: "连接目标 host:port/db", children: m.target ? /* @__PURE__ */ e.jsx("code", { children: m.target }) : "-" },
+                  { key: "present", label: "bean 存在", children: p.present ? /* @__PURE__ */ e.jsx(o, { color: "success", children: "是" }) : /* @__PURE__ */ e.jsx(o, { color: "warning", children: "否" }) },
+                  { key: "target", label: "连接目标 host:port/db", children: p.target ? /* @__PURE__ */ e.jsx("code", { children: p.target }) : "-" },
                   {
                     key: "authority",
                     label: "应答者归属",
                     children: /* @__PURE__ */ e.jsxs("span", { children: [
-                      /* @__PURE__ */ e.jsx(o, { color: $(m.authority).color, children: m.authority ?? "-" }),
-                      /* @__PURE__ */ e.jsx("span", { style: { fontSize: 12, color: "#64748b" }, children: $(m.authority).text })
+                      /* @__PURE__ */ e.jsx(o, { color: $(p.authority).color, children: p.authority ?? "-" }),
+                      /* @__PURE__ */ e.jsx("span", { style: { fontSize: 12, color: "#64748b" }, children: $(p.authority).text })
                     ] })
                   },
-                  { key: "dbsizeErr", label: "DBSIZE 报错", children: m.dbsizeError ? /* @__PURE__ */ e.jsx("code", { children: m.dbsizeError }) : "-" },
-                  { key: "probeErr", label: "连接探测报错", children: m.probeError ? /* @__PURE__ */ e.jsx("code", { children: m.probeError }) : "-" }
+                  { key: "dbsizeErr", label: "DBSIZE 报错", children: p.dbsizeError ? /* @__PURE__ */ e.jsx("code", { children: p.dbsizeError }) : "-" },
+                  { key: "probeErr", label: "连接探测报错", children: p.probeError ? /* @__PURE__ */ e.jsx("code", { children: p.probeError }) : "-" }
                 ]
               }
             )
@@ -525,7 +518,7 @@ function We() {
           {
             showIcon: !0,
             type: c ? "error" : u.running ? "success" : "warning",
-            message: c ? `路 A = ${u.dbsizeTotal ?? "-"}，路 B = ${m.dbsize ?? "-"} —— 两路不一致` : u.running ? `两路一致（都是 ${u.dbsizeTotal ?? "-"}）：内嵌 server 真在跑，且业务连的就是它` : '路 A 无数据可比（内嵌没 bind），所以现在还不能下"一致/不一致"的结论',
+            message: c ? `路 A = ${u.dbsizeTotal ?? "-"}，路 B = ${p.dbsize ?? "-"} —— 两路不一致` : u.running ? `两路一致（都是 ${u.dbsizeTotal ?? "-"}）：内嵌 server 真在跑，且业务连的就是它` : '路 A 无数据可比（内嵌没 bind），所以现在还不能下"一致/不一致"的结论',
             description: /* @__PURE__ */ e.jsxs("span", { children: [
               "判定式：",
               /* @__PURE__ */ e.jsx("code", { children: "路 A 可用(running) 且 路 B 有应答 且 A.dbsize != B.dbsize" }),
@@ -558,7 +551,7 @@ function We() {
           {
             size: "small",
             rowKey: "db",
-            columns: Ye,
+            columns: We,
             dataSource: u.perDb,
             pagination: !1,
             summary: () => /* @__PURE__ */ e.jsxs(L.Summary.Row, { children: [
@@ -591,7 +584,7 @@ const Ce = {
   SET: "orange",
   ZSET: "magenta",
   NONE: "default"
-}, Ke = [
+}, qe = [
   { value: "STRING", label: "STRING" },
   { value: "HASH", label: "HASH" },
   { value: "LIST", label: "LIST" },
@@ -599,7 +592,7 @@ const Ce = {
   { value: "ZSET", label: "ZSET" },
   { value: "NONE", label: "NONE" }
 ];
-function qe(r) {
+function Ze(r) {
   return r == null ? /* @__PURE__ */ e.jsx("span", { style: { color: "#94a3b8" }, children: "nil" }) : typeof r == "object" ? r.notUtf8 ? /* @__PURE__ */ e.jsxs(se, { title: "非 UTF-8 字节（多半是序列化后的对象），这里给 base64", children: [
     /* @__PURE__ */ e.jsx(o, { color: "volcano", children: "binary" }),
     /* @__PURE__ */ e.jsxs("code", { style: { fontSize: 11 }, children: [
@@ -608,8 +601,8 @@ function qe(r) {
     ] })
   ] }) : /* @__PURE__ */ e.jsx("pre", { style: { margin: 0, fontSize: 11, whiteSpace: "pre-wrap" }, children: JSON.stringify(r, null, 2) }) : /* @__PURE__ */ e.jsx("span", { style: { wordBreak: "break-all" }, children: String(r) });
 }
-function Ze() {
-  const [r, t] = x("auto"), [s, h] = x("*"), [i, y] = x(0), [g, k] = x(200), [R, u] = x(null), [m, f] = x([]), [c, w] = x(null), [_, v] = x(!1), [P, M] = x(null), [p, T] = x(null), [I, Q] = x(!1), [Y, ee] = x(null), J = X(async () => {
+function Xe() {
+  const [r, t] = x("auto"), [s, h] = x("*"), [i, y] = x(0), [g, k] = x(200), [R, u] = x(null), [p, f] = x([]), [c, w] = x(null), [_, v] = x(!1), [P, M] = x(null), [m, T] = x(null), [I, Q] = x(!1), [Y, ee] = x(null), J = X(async () => {
     v(!0);
     try {
       const l = await N.keys({ pattern: s || "*", db: i, limit: g, source: r });
@@ -633,7 +626,7 @@ function Ze() {
     } finally {
       Q(!1);
     }
-  }, [i, r]), ue = Te(() => R ? m.filter((l) => l.type === R) : m, [m, R]), he = Te(() => [
+  }, [i, r]), de = Te(() => R ? p.filter((l) => l.type === R) : p, [p, R]), ue = Te(() => [
     {
       title: "key",
       dataIndex: "key",
@@ -653,7 +646,7 @@ function Ze() {
       //   其它 null            ⇒ 后端没给出类型
       // 旧版这里用 asText() 兜底，把 {value:"string"} 这种 bean 兜成一段 JSON 原文。
       render: (l, d) => d != null && d.desyncSuspect ? /* @__PURE__ */ e.jsx(se, { title: d.desyncReason || "这一行的应答与所发命令对不上，不采信", children: /* @__PURE__ */ e.jsx(o, { color: "red", children: "应答错位·未采信" }) }) : l == null ? /* @__PURE__ */ e.jsx("span", { style: { color: "#94a3b8" }, children: "未采信" }) : /* @__PURE__ */ e.jsx(o, { color: Ce[l] || "default", children: l }),
-      filters: Ke.map((l) => ({ text: l.label, value: l.value })),
+      filters: qe.map((l) => ({ text: l.label, value: l.value })),
       onFilter: (l, d) => d.type === l
     },
     {
@@ -687,13 +680,6 @@ function Ze() {
     }
   ], [V]), re = (c == null ? void 0 : c.sourceUsed) === "client";
   return /* @__PURE__ */ e.jsxs("div", { children: [
-    /* @__PURE__ */ e.jsx(
-      de,
-      {
-        title: "键浏览",
-        subtitle: "只读：GET /api/cache/keys + /api/cache/key —— 无设值 / 无删除 / 无清空"
-      }
-    ),
     /* @__PURE__ */ e.jsxs(C, { size: "small", style: { marginBottom: 12 }, children: [
       /* @__PURE__ */ e.jsxs(oe, { wrap: !0, size: 8, children: [
         /* @__PURE__ */ e.jsx("span", { children: "pattern" }),
@@ -776,13 +762,13 @@ function Ze() {
           Be,
           {
             status: c.truncated ? "warning" : "default",
-            text: c.truncated ? `后端 KEYS 命中 ${c.matchedTotal} 条，只取了前 ${c.limit} 条（KEYS 是 O(N)，硬上限 1000）` : `命中 ${c.matchedTotal ?? m.length} 条`
+            text: c.truncated ? `后端 KEYS 命中 ${c.matchedTotal} 条，只取了前 ${c.limit} 条（KEYS 是 O(N)，硬上限 1000）` : `命中 ${c.matchedTotal ?? p.length} 条`
           }
         ) }),
-        rows: ue,
+        rows: de,
         rowKey: (l) => `${l.key}`,
         loading: _,
-        columns: he,
+        columns: ue,
         emptyTitle: P ? "读取失败" : c ? "没有匹配的 key" : "还没取到数据",
         emptyDescription: P ? "见上方告警。" : c ? c.sourceUsed === "embedded" ? "路 A 的进程内 store 里这个 pattern 没有匹配项（本 JVM 自己那份，确定没跨进程）" : "路 B 无应答或该库确实为空 —— 先看「实例与三态」确认应答者是不是本 JVM" : "先点「查询」读一次。",
         tableProps: { size: "small" }
@@ -792,14 +778,14 @@ function Ze() {
       Le,
       {
         width: 720,
-        open: !!p,
-        title: p ? `key: ${p.key}` : "key 详情",
+        open: !!m,
+        title: m ? `key: ${m.key}` : "key 详情",
         onClose: () => T(null),
         destroyOnHidden: !0,
         children: [
           Y && /* @__PURE__ */ e.jsx(b, { type: "error", showIcon: !0, message: `读详情失败：${G(Y)}` }),
-          !p && !Y && /* @__PURE__ */ e.jsx(Se, { description: "载入中…" }),
-          p && /* @__PURE__ */ e.jsxs(e.Fragment, { children: [
+          !m && !Y && /* @__PURE__ */ e.jsx(Se, { description: "载入中…" }),
+          m && /* @__PURE__ */ e.jsxs(e.Fragment, { children: [
             /* @__PURE__ */ e.jsx(
               U,
               {
@@ -807,34 +793,34 @@ function Ze() {
                 size: "small",
                 column: 2,
                 items: [
-                  { key: "src", label: "取数路", children: /* @__PURE__ */ e.jsx(o, { children: p.sourceUsed }) },
-                  { key: "auth", label: "归属", children: /* @__PURE__ */ e.jsx(o, { color: $(p.authority).color, children: p.authority ?? "-" }) },
-                  { key: "db", label: "库", children: p.dbIgnoredForClientPath ? /* @__PURE__ */ e.jsxs("span", { children: [
+                  { key: "src", label: "取数路", children: /* @__PURE__ */ e.jsx(o, { children: m.sourceUsed }) },
+                  { key: "auth", label: "归属", children: /* @__PURE__ */ e.jsx(o, { color: $(m.authority).color, children: m.authority ?? "-" }) },
+                  { key: "db", label: "库", children: m.dbIgnoredForClientPath ? /* @__PURE__ */ e.jsxs("span", { children: [
                     "db",
-                    p.db,
+                    m.db,
                     "（",
                     /* @__PURE__ */ e.jsx("b", { children: "已忽略" }),
                     "，路 B 不切库）"
-                  ] }) : `db${p.db ?? "-"}` },
-                  { key: "type", label: "类型", children: p.desyncSuspect ? /* @__PURE__ */ e.jsx(se, { title: p.desyncReason || "应答与所发命令对不上", children: /* @__PURE__ */ e.jsx(o, { color: "red", children: "应答错位·未采信" }) }) : /* @__PURE__ */ e.jsx(o, { color: Ce[p.type] || "default", children: p.type ?? "未采信" }) },
-                  { key: "exists", label: "存在", children: p.exists == null ? "-" : p.exists ? /* @__PURE__ */ e.jsx(o, { color: "success", children: "是" }) : /* @__PURE__ */ e.jsx(o, { children: "否" }) },
-                  { key: "ttl", label: "TTL", children: Ee(p.ttlSeconds) },
-                  { key: "pttl", label: "PTTL(ms)", children: p.pttlMillis ?? "-" },
-                  { key: "ver", label: "keyVersion（路 A）", children: p.keyVersion ?? "-" },
-                  p.error && { key: "err", label: "读取错误", span: 2, children: /* @__PURE__ */ e.jsx("code", { children: p.error }) }
+                  ] }) : `db${m.db ?? "-"}` },
+                  { key: "type", label: "类型", children: m.desyncSuspect ? /* @__PURE__ */ e.jsx(se, { title: m.desyncReason || "应答与所发命令对不上", children: /* @__PURE__ */ e.jsx(o, { color: "red", children: "应答错位·未采信" }) }) : /* @__PURE__ */ e.jsx(o, { color: Ce[m.type] || "default", children: m.type ?? "未采信" }) },
+                  { key: "exists", label: "存在", children: m.exists == null ? "-" : m.exists ? /* @__PURE__ */ e.jsx(o, { color: "success", children: "是" }) : /* @__PURE__ */ e.jsx(o, { children: "否" }) },
+                  { key: "ttl", label: "TTL", children: Ee(m.ttlSeconds) },
+                  { key: "pttl", label: "PTTL(ms)", children: m.pttlMillis ?? "-" },
+                  { key: "ver", label: "keyVersion（路 A）", children: m.keyVersion ?? "-" },
+                  m.error && { key: "err", label: "读取错误", span: 2, children: /* @__PURE__ */ e.jsx("code", { children: m.error }) }
                 ].filter(Boolean)
               }
             ),
-            /* @__PURE__ */ e.jsx(C, { size: "small", title: "值（按类型取，非 UTF-8 会降级成 base64）", style: { marginTop: 12 }, children: !p.value || !Object.keys(p.value).length ? /* @__PURE__ */ e.jsx(Se, { description: "该类型没有可读的值，或路 A/B 都取不到" }) : /* @__PURE__ */ e.jsx(
+            /* @__PURE__ */ e.jsx(C, { size: "small", title: "值（按类型取，非 UTF-8 会降级成 base64）", style: { marginTop: 12 }, children: !m.value || !Object.keys(m.value).length ? /* @__PURE__ */ e.jsx(Se, { description: "该类型没有可读的值，或路 A/B 都取不到" }) : /* @__PURE__ */ e.jsx(
               U,
               {
                 size: "small",
                 column: 1,
                 bordered: !0,
-                items: Object.entries(p.value).map(([l, d]) => ({
+                items: Object.entries(m.value).map(([l, d]) => ({
                   key: l,
                   label: l,
-                  children: qe(d)
+                  children: Ze(d)
                 }))
               }
             ) }),
@@ -845,7 +831,7 @@ function Ze() {
     )
   ] });
 }
-const Xe = [
+const Qe = [
   { title: "key", dataIndex: "key", key: "key", ellipsis: !0, render: (r) => /* @__PURE__ */ e.jsx("code", { children: r }) },
   {
     title: "访问次数",
@@ -879,7 +865,7 @@ const Xe = [
     render: (r) => r ? new Date(r).toLocaleString() : "-"
   }
 ];
-function Qe({ name: r, fields: t }) {
+function er({ name: r, fields: t }) {
   return t ? /* @__PURE__ */ e.jsx(C, { size: "small", title: /* @__PURE__ */ e.jsxs("span", { children: [
     "# ",
     r
@@ -893,7 +879,7 @@ function Qe({ name: r, fields: t }) {
     }
   ) }) : null;
 }
-function er({ fp: r }) {
+function rr({ fp: r }) {
   var h, i;
   const t = r.verdict, s = t === "DIFFERENT_BUILD" ? "error" : t === "SAME_BUILD_CANDIDATE" ? "warning" : "info";
   return /* @__PURE__ */ e.jsx(
@@ -928,8 +914,8 @@ function er({ fp: r }) {
     }
   );
 }
-function rr() {
-  const [r, t] = x(null), [s, h] = x(null), [i, y] = x(null), [g, k] = x(null), [R, u] = x(null), [m, f] = x(0), [c, w] = x(!1), _ = X(async () => {
+function nr() {
+  const [r, t] = x(null), [s, h] = x(null), [i, y] = x(null), [g, k] = x(null), [R, u] = x(null), [p, f] = x(0), [c, w] = x(!1), _ = X(async () => {
     w(!0);
     try {
       const [T, I] = await Promise.all([N.info(), N.instance()]);
@@ -938,25 +924,18 @@ function rr() {
       t(null), k(T);
     }
     try {
-      h(await N.hotkeys({ db: m, limit: 50 })), u(null);
+      h(await N.hotkeys({ db: p, limit: 50 })), u(null);
     } catch (T) {
       h(null), u(T);
     } finally {
       w(!1);
     }
-  }, [m]);
+  }, [p]);
   ie(() => {
     _();
   }, [_]);
-  const v = r == null ? void 0 : r.embedded, P = !!(i != null && i.foreignListenerSuspected), M = (r == null ? void 0 : r.sections) ?? {}, p = (r == null ? void 0 : r.responderVsOwnBuild) ?? null;
+  const v = r == null ? void 0 : r.embedded, P = !!(i != null && i.foreignListenerSuspected), M = (r == null ? void 0 : r.sections) ?? {}, m = (r == null ? void 0 : r.responderVsOwnBuild) ?? null;
   return /* @__PURE__ */ e.jsxs("div", { children: [
-    /* @__PURE__ */ e.jsx(
-      de,
-      {
-        title: "统计与热 key",
-        subtitle: "GET /api/cache/info（路 B 的 INFO 原文 + 分节）与 /api/cache/hotkeys（路 A 的 LFU 埋点）"
-      }
-    ),
     g && /* @__PURE__ */ e.jsx(
       b,
       {
@@ -1039,7 +1018,7 @@ function rr() {
             (r == null ? void 0 : r.clientError) && /* @__PURE__ */ e.jsx(b, { type: "error", showIcon: !0, style: { marginBottom: 8 }, message: r.clientError }),
             (r == null ? void 0 : r.clientNote) && /* @__PURE__ */ e.jsx(b, { type: "warning", showIcon: !0, style: { marginBottom: 8 }, message: r.clientNote }),
             Object.keys(M).length === 0 && !(r != null && r.clientError) && !(r != null && r.clientNote) && /* @__PURE__ */ e.jsx(b, { type: "info", showIcon: !0, message: "INFO 为空 —— 应答者没返回任何分节" }),
-            Object.entries(M).map(([T, I]) => /* @__PURE__ */ e.jsx(Qe, { name: T, fields: I }, T)),
+            Object.entries(M).map(([T, I]) => /* @__PURE__ */ e.jsx(er, { name: T, fields: I }, T)),
             (r == null ? void 0 : r.hardcodedInUpstream) && /* @__PURE__ */ e.jsx(
               b,
               {
@@ -1050,7 +1029,7 @@ function rr() {
                 description: /* @__PURE__ */ e.jsx("ul", { style: { margin: 0, paddingLeft: 18 }, children: r.hardcodedInUpstream.map((T) => /* @__PURE__ */ e.jsx("li", { style: { fontSize: 12 }, children: T }, T)) })
               }
             ),
-            p && /* @__PURE__ */ e.jsx(er, { fp: p })
+            m && /* @__PURE__ */ e.jsx(rr, { fp: m })
           ]
         }
       ) })
@@ -1069,7 +1048,7 @@ function rr() {
             {
               size: "small",
               style: { width: 96 },
-              value: m,
+              value: p,
               onChange: f,
               options: Array.from({ length: 16 }, (T, I) => ({ value: I, label: `db${I}` }))
             }
@@ -1103,10 +1082,10 @@ function rr() {
               {
                 size: "small",
                 rowKey: "key",
-                columns: Xe,
+                columns: Qe,
                 dataSource: s.rows ?? [],
-                pagination: { size: "small", pageSize: 20 },
-                locale: { emptyText: `db${m} 的 string store 里一个 key 都没有（路 A 口径，确定没跨进程）` }
+                pagination: De,
+                locale: { emptyText: `db${p} 的 string store 里一个 key 都没有（路 A 口径，确定没跨进程）` }
               }
             ),
             /* @__PURE__ */ e.jsxs("div", { style: { marginTop: 8, fontSize: 12, color: "#94a3b8" }, children: [
@@ -1127,11 +1106,11 @@ const xe = [
 function O({ value: r, okText: t = "是", badText: s = "否", badColor: h = "error", unknown: i = "未探测" }) {
   return r == null ? /* @__PURE__ */ e.jsx(o, { children: i }) : r ? /* @__PURE__ */ e.jsx(o, { color: "success", children: t }) : /* @__PURE__ */ e.jsx(o, { color: h, children: s });
 }
-function nr({ value: r }) {
+function tr({ value: r }) {
   const t = $(r);
   return /* @__PURE__ */ e.jsx(o, { color: t.color, children: r || "-" });
 }
-function tr() {
+function sr() {
   const [r, t] = x(null), [s, h] = x(null), [i, y] = x(null), [g, k] = x(!1), R = X(async () => {
     k(!0);
     try {
@@ -1151,15 +1130,8 @@ function tr() {
   ie(() => {
     R();
   }, [R]);
-  const u = !i && r && r.foreignListenerSuspected, m = !i && r && !r.embeddedRunning;
+  const u = !i && r && r.foreignListenerSuspected, p = !i && r && !r.embeddedRunning;
   return /* @__PURE__ */ e.jsxs("div", { children: [
-    /* @__PURE__ */ e.jsx(
-      de,
-      {
-        title: "实例与三态",
-        subtitle: "只读 controller 自省接口 GET /api/cache/__instance —— 先证明应答者是谁，再谈数据"
-      }
-    ),
     i && /* @__PURE__ */ e.jsx(
       b,
       {
@@ -1169,7 +1141,7 @@ function tr() {
         description: "/api/cache/__instance 由 z-opc 自己的 controller 直接应答，不经过任何 RESP 连接；它都不通说明是 z-opc 侧的路由/鉴权问题（302 到登录页 = 没带会话 Cookie）。"
       }
     ),
-    m && !u && /* @__PURE__ */ e.jsx(
+    p && !u && /* @__PURE__ */ e.jsx(
       b,
       {
         type: "warning",
@@ -1346,7 +1318,7 @@ function tr() {
                   key: "authority",
                   label: "路 B 应答者的归属",
                   children: /* @__PURE__ */ e.jsxs("span", { children: [
-                    /* @__PURE__ */ e.jsx(nr, { value: r == null ? void 0 : r.authorityOfClient }),
+                    /* @__PURE__ */ e.jsx(tr, { value: r == null ? void 0 : r.authorityOfClient }),
                     /* @__PURE__ */ e.jsx("div", { style: { fontSize: 12, color: "#64748b" }, children: "THIS_JVM_EMBEDDED 才算孵化成功；EXTERNAL_PROCESS = 读到的是别人的实例" })
                   ] })
                 },
@@ -1432,6 +1404,7 @@ function tr() {
               rowKey: "command",
               pagination: !1,
               columns: xe,
+              locale: { emptyText: /* @__PURE__ */ e.jsx(pe, { title: "没有已下发命令", size: "sm" }) },
               dataSource: s.commandsActuallyIssued ?? [],
               title: () => {
                 var f;
@@ -1461,6 +1434,7 @@ function tr() {
               rowKey: "command",
               pagination: !1,
               columns: xe,
+              locale: { emptyText: /* @__PURE__ */ e.jsx(pe, { title: "只读白名单为空", size: "sm" }) },
               dataSource: s.readOnlyCommandsAllowedByWhitelist ?? [],
               title: () => /* @__PURE__ */ e.jsx("span", { children: /* @__PURE__ */ e.jsx(o, { color: "processing", children: "只读白名单 = 上限集合（safeSend 入口校验用）" }) })
             }
@@ -1474,6 +1448,7 @@ function tr() {
               rowKey: "command",
               pagination: !1,
               columns: xe,
+              locale: { emptyText: /* @__PURE__ */ e.jsx(pe, { title: "没有此类命令", size: "sm" }) },
               dataSource: s.neverIssuedDespiteBeingSupportedByServer ?? [],
               title: () => /* @__PURE__ */ e.jsx("span", { children: /* @__PURE__ */ e.jsx(o, { color: "error", children: "server 支持但本 controller 永不下发" }) })
             }
@@ -1507,30 +1482,32 @@ function tr() {
     ) })
   ] });
 }
-function hr() {
+function mr() {
   return /* @__PURE__ */ e.jsxs(Pe, { children: [
     /* @__PURE__ */ e.jsx(W, { index: !0, element: /* @__PURE__ */ e.jsx(Ie, { to: "overview", replace: !0 }) }),
-    /* @__PURE__ */ e.jsx(W, { path: "overview", element: /* @__PURE__ */ e.jsx(We, {}) }),
-    /* @__PURE__ */ e.jsx(W, { path: "keys", element: /* @__PURE__ */ e.jsx(Ze, {}) }),
-    /* @__PURE__ */ e.jsx(W, { path: "stats", element: /* @__PURE__ */ e.jsx(rr, {}) }),
-    /* @__PURE__ */ e.jsx(W, { path: "instance", element: /* @__PURE__ */ e.jsx(tr, {}) })
+    /* @__PURE__ */ e.jsx(W, { path: "overview", element: /* @__PURE__ */ e.jsx(Ke, {}) }),
+    /* @__PURE__ */ e.jsx(W, { path: "keys", element: /* @__PURE__ */ e.jsx(Xe, {}) }),
+    /* @__PURE__ */ e.jsx(W, { path: "stats", element: /* @__PURE__ */ e.jsx(nr, {}) }),
+    /* @__PURE__ */ e.jsx(W, { path: "instance", element: /* @__PURE__ */ e.jsx(sr, {}) })
   ] });
 }
-const sr = "# z-cache-component\n\nz-cache（Redis 兼容缓存，自研）跨仓唯一前端面：把「缓存总览 / 键浏览 / 统计 / 实例自省」\n这一组**只读**的缓存运维视图收敛成一个可复用的 React 组件包，由 `z-cache-suit` 独立壳、\nz-team 的 OpsWorkbench（`/cache/*` 通配挂载）或 z-opc 主壳挂载。\n\n- **npm 包名**：`@yuku123/z-cache-component`\n- **宿主接入**：`@yuku123/z-cache-component/pages`（manifest + 页面组件），主壳可只取 `ComponentDocPage`\n- **后端**：z-opc 侧的 `CacheProxyController`（`GET /api/cache/**`）—— **它不是转发代理**，\n  而是用 z-cache 自己的 Java API 现读现拼\n- **技术栈**：React 19 + antd 6 + react-router-dom 7 + vite（library mode，双入口 `.` / `./pages`）\n\n---\n\n## 一、能力概览\n\n包里有**两套**页面入口，路由前缀不同，别混：\n\n### 1.1 manifest 面（`/z-cache/*`，`src/pages-manifest.jsx`）\n\n| 页面 | 路由（相对 `/z-cache/*`） | 源文件 | 能力 |\n|------|--------------------------|--------|------|\n| 首页 | `home` | `pages/HomePage.jsx` | 读 `userInfo` 显示登录人，按 `menuItems` 渲染功能入口卡片 |\n| 总览 | `overview` | `pages/Overview.jsx` | 缓存总览（`/cache/overview` + `/cache/info`） |\n| 键浏览 | `keys` | `pages/Keys.jsx` | 键浏览（`/cache/keys`）+ 单键详情（`/cache/key`） |\n| 登录 | （不在菜单内） | `pages/LoginPage.jsx` | mock 登录，写 `token` / `userInfo` 后跳 `/z-cache/home` |\n| 组件文档 | `docs` | `pages/ComponentDoc.jsx` | 本文件渲染页（左侧 240px TOC + 右侧正文） |\n\n### 1.2 CacheApp 面（`/cache/*`，`src/pages/CacheApp.jsx`）\n\n`CacheApp` 是给 OpsWorkbench 通配挂载用的**子路由集合**，入口重定向到 `overview`：\n\n| 子路由 | 源文件 | 能力 |\n|--------|--------|------|\n| `overview` | `pages/OverviewPage.jsx` | 缓存总览 —— 双路对账（路 A 进程内 MemoryStore vs 路 B zCacheClient） |\n| `keys` | `pages/KeysPage.jsx` | 键浏览（支持切库 / 切数据源 / 类型筛选 / 详情抽屉） |\n| `stats` | `pages/StatsPage.jsx` | 热点 key 统计（`/cache/hotkeys`）+ 实例自省 |\n| `instance` | `pages/InstanceStatus.jsx` | 实例自省（`/cache/__instance`）+ 命令目录（`/cache/command-catalog`） |\n\n## 二、导出面\n\n```js\n// 主入口（. 桶）：数据源 + 域挂载点\nimport {cacheApi, AUTHORITY_META, authorityTag, cacheErrorText, isNotBoundError,\n        fmtBytes, fmtTtl, fmtUptime, asText, CacheApp} from '@yuku123/z-cache-component'\n\n// 宿主组装面（./pages 桶）：manifest + 页面组件\nimport {menuItems, routes, HomePage, LoginPage, Overview, Keys, ComponentDocPage} from '@yuku123/z-cache-component/pages'\n\n// 组件文档页（主壳接线用，名字全仓统一）\nimport {ComponentDocPage} from '@yuku123/z-cache-component'\n```\n\n## 三、API 端点\n\n请求实例是基座的默认 `request`（`@yuku123/z-frontend-common` 的 `createRequest()` 预建实例，\n`baseURL` 默认 `/api`），token 走 `Authorization: Bearer`。\n下表路径是 `src/services/api.js` 里 `cacheApi` 定义的**实际路径**（拼上 baseURL 即 `/api/cache/**`）。\n\n| 方法 | 路径 | 说明 |\n|---|---|---|\n| GET | `/api/cache/__instance` | 实例自省（是否 bind 上、store 是否可用、client 是否连上、authority 判定） |\n| GET | `/api/cache/overview` | 缓存总览（路 A / 路 B 双路数据 + `authorityDiverges`） |\n| GET | `/api/cache/keys` | 键浏览（query：`pattern` / `limit` / `db` / `source`） |\n| GET | `/api/cache/key` | 单键详情（query：`key` / `db` / `source` / `maxElements`） |\n| GET | `/api/cache/info` | 服务端 INFO（`Server` / `Clients` / `Memory` / `Stats` / `Keyspace` 五段） |\n| GET | `/api/cache/hotkeys` | 热点 key（query：`db` / `limit`） |\n| GET | `/api/cache/command-catalog` | RESP 命令目录（实际发过哪些命令 / 白名单语义） |\n\n### 3.1 两条取数路（这是本包最需要先讲清楚的一件事）\n\nz-cache 的上游**根本没有 HTTP 面** —— 全仓 grep `HttpServer|RestController|createContext`\n在 `z-cache` 下零命中，唯一的 server 是 `RedisServer` 的 Netty `ServerBootstrap`，\n讲的是 **RESP2 over TCP**。⇒ `CacheProxyController`（文件名沿用需求指定，但它不是 proxy）\n不转发任何 HTTP。\n\n同一个 JVM 内有两条**互不相关**的取数路：\n\n- **路 A = 反射** `ZCacheEmbeddedServerConfig.SHARED_SERVER` → `RedisServer.getStore()` → `MemoryStore`\n  只读方法。不开 socket、不碰端口，**物理上不可能读到别的进程** ⇒「本 JVM 自己那份」的权威。\n- **路 B = 容器里已存在的 `zCacheClient` bean**（starter 自动装配，业务代码用的就是它）\n  ⇒「业务此刻真正看到的那份」。\n\n页面首屏就是把 A 和 B 并排 + 显式比对（`authorityDiverges`）。\n\n### 3.2 authority 三态\n\n| 取值 | 含义 |\n|------|------|\n| `THIS_JVM_IN_PROCESS` | 本 JVM 进程内对象（不可能跨进程） |\n| `THIS_JVM_EMBEDDED` | 本 JVM 内嵌 server 应答 |\n| `EXTERNAL_PROCESS` | 外部进程应答 —— 6379 的属主不是本 JVM，这一路读到的是别的进程的缓存 |\n| `NO_ANSWER` | 没有任何 server 在应答 |\n| `UNKNOWN` | 连上了，但无法判定连的是谁 |\n\n## 四、页面说明\n\n### 4.1 首页\n\n登录后的着陆页。读 `localStorage.userInfo` 显示欢迎语与角色标签，再把 `menuItems`（去掉首页自身）\n渲染成入口卡片 —— 菜单加一项，首页卡片自动多一张，不用改页面代码。\n\n### 4.2 总览\n\n`pages/Overview.jsx`：`/cache/overview` + `/cache/info` 两个接口并排渲染，\n其中 `/cache/info` 失败时降级为 `null`，不拖垮主表。\n\n`pages/OverviewPage.jsx`（CacheApp 版）：双路对账，逐库列出 key 数、命中率等。\n\n### 4.3 键浏览\n\n`pages/Keys.jsx`：`/cache/keys` 分页 + 点行开 `/cache/key` 详情。\n\n`pages/KeysPage.jsx`（CacheApp 版）：在此基础上支持切库（`db`）、切数据源（`source`）、\n类型筛选（`type`）、详情抽屉。\n\n⚠ 类型取值域两路统一成**大写**枚举名（`STRING` / `HASH` / `LIST` / `SET` / `ZSET` / `NONE`）——\n旧版拿大写去比小写（server 回 `\"string\"`）⇒ 类型筛选永远 0 命中。\n\n### 4.4 统计\n\n`pages/StatsPage.jsx`：热点 key 表（key / 访问次数 / LFU 计数 / 是否已过期）+ 实例自省。\n热点表默认取 `db` 下 `limit: 50`。\n\n### 4.5 实例自省\n\n`pages/InstanceStatus.jsx`：`/cache/__instance` + `/cache/command-catalog`。\n把「自省接口本身不通」（z-opc 侧路由/鉴权问题）与「自省通了但内嵌没起」\n（中间件问题）分成两套提示，判据是 HTTP 503 且 `source === 'z-opc-cache-read-api'`。\n\n### 4.6 登录\n\n当前是 **mock 模式**：比对一对写死在 `src/pages/LoginPage.jsx` 里的管理员凭据\n（明文口令不在本文复述，见源码），成功后写 `localStorage.token` 与 `localStorage.userInfo`，\n再 `window.location.href = '/z-cache/home'`。CTC/SSO 尚未接入。\n\n### 4.7 组件文档\n\n本文件。内容以 `?raw` 在编译期内联，零额外请求；左侧 240px TOC 随滚动联动。\n\n## 五、配置\n\n| 配置项 | 默认值 | 说明 |\n|---|---|---|\n| 请求实例 | 基座默认 `request` | `baseURL` 默认 `/api`，token 走 `Authorization: Bearer`（读 `localStorage.token`） |\n| 热点 key 条数 | `50` | `hotkeys` 的 `limit` |\n| 详情元素上限 | `50` | `KeysPage` 调 `key` 时传的 `maxElements` |\n\n## 六、已知限制\n\n- **本卡是只读的**：后端只有 `@GetMapping`，前端也就不会有「清空 / 批量删除 / 设值」这类按钮。\n  写面单独立卡，不在本包范围内。\n- **切库（SELECT）被刻意禁用**：`zCacheClient` 是**业务共用连接**，发一次 SELECT 会把它永久留在 n 库，\n  之后所有业务的 SET/GET 都写错库。所以路 B 的接口一律忽略 `db` 参数\n  （响应里 `dbIgnoredForClientPath=true` 就是这个意思）；要按库浏览请用 `source=embedded`。\n- **路 B 的 `byteLength` 恒为 null**（路 B 不发 `STRLEN`）⇒ 页面显示「未测」，\n  不是「非 string」—— 后者会把「没测」渲染成否定结论。\n- **路 B 的 `type` 可能为 null**：null 且 `desyncSuspect=true` ⇒ 这一行的应答与所发命令对不上（串台），\n  **不采信**，原始应答留在 `rawReply`、判据在 `desyncReason`。\n- **TTL 语义**：`-1` = 常驻、`-2` = 不存在，直接显示成「负数秒」会被读成 bug，所以 `fmtTtl` 单独翻译。\n- **没有任何页面调用的接口**：无（`cacheApi` 的 7 个方法都有页面在用）。\n- 直达 / 刷新需要四处接线都齐（大需求 004 的四级路由契约）：MENU_GROUPS「缓存」组 ↔\n  OPS_ROUTES 的 `/cache` + `/cache/*` ↔ main.jsx 顶层 `<Route path=\"/cache/*\">` ↔\n  `MainWebConfig.spaPaths` 的 `/cache/**`。缺 main.jsx 那条 = 白屏，缺 spaPaths 那条 = 直达 404。\n- z-cache 已被 z-opc 主壳的 `domainRoutes.ts` 与 z-team 的 OpsWorkbench 引用\n  ⇒ `/z-cache/docs` 在平台主壳里**可达**。\n\n## 七、变更记录\n\n| 版本 | 变更 |\n|---|---|\n| 0.1.2 | 新增组件文档页 `ComponentDocPage`（lead 008 §7）：`src/DOC.md` + 基座 `ComponentDoc` 薄包装 |\n| 0.1.2 | 首版：缓存总览 / 键浏览 / 统计 / 实例自省 + manifest + CacheApp 挂载点 |\n";
+const or = "# z-cache-component\n\nz-cache（Redis 兼容缓存，自研）跨仓唯一前端面：把「缓存总览 / 键浏览 / 统计 / 实例自省」\n这一组**只读**的缓存运维视图收敛成一个可复用的 React 组件包，由 `z-cache-suit` 独立壳、\nz-team 的 OpsWorkbench（`/cache/*` 通配挂载）或 z-opc 主壳挂载。\n\n- **npm 包名**：`@yuku123/z-cache-component`\n- **宿主接入**：`@yuku123/z-cache-component/pages`（manifest + 页面组件），主壳可只取 `ComponentDocPage`\n- **后端**：z-opc 侧的 `CacheProxyController`（`GET /api/cache/**`）—— **它不是转发代理**，\n  而是用 z-cache 自己的 Java API 现读现拼\n- **技术栈**：React 19 + antd 6 + react-router-dom 7 + vite（library mode，双入口 `.` / `./pages`）\n\n---\n\n## 一、能力概览\n\n包里有**两套**页面入口，路由前缀不同，别混：\n\n### 1.1 manifest 面（`/z-cache/*`，`src/pages-manifest.jsx`）\n\n| 页面 | 路由（相对 `/z-cache/*`） | 源文件 | 能力 |\n|------|--------------------------|--------|------|\n| 首页 | `home` | `pages/HomePage.jsx` | 读 `userInfo` 显示登录人，按 `menuItems` 渲染功能入口卡片 |\n| 总览 | `overview` | `pages/Overview.jsx` | 缓存总览（`/cache/overview` + `/cache/info`） |\n| 键浏览 | `keys` | `pages/Keys.jsx` | 键浏览（`/cache/keys`）+ 单键详情（`/cache/key`） |\n| 登录 | （不在菜单内） | `pages/LoginPage.jsx` | mock 登录，写 `token` / `userInfo` 后跳 `/z-cache/home` |\n| 组件文档 | `docs` | `pages/ComponentDoc.jsx` | 本文件渲染页（左侧 240px TOC + 右侧正文） |\n\n### 1.2 CacheApp 面（`/cache/*`，`src/pages/CacheApp.jsx`）\n\n`CacheApp` 是给 OpsWorkbench 通配挂载用的**子路由集合**，入口重定向到 `overview`：\n\n| 子路由 | 源文件 | 能力 |\n|--------|--------|------|\n| `overview` | `pages/OverviewPage.jsx` | 缓存总览 —— 双路对账（路 A 进程内 MemoryStore vs 路 B zCacheClient） |\n| `keys` | `pages/KeysPage.jsx` | 键浏览（支持切库 / 切数据源 / 类型筛选 / 详情抽屉） |\n| `stats` | `pages/StatsPage.jsx` | 热点 key 统计（`/cache/hotkeys`）+ 实例自省 |\n| `instance` | `pages/InstanceStatus.jsx` | 实例自省（`/cache/__instance`）+ 命令目录（`/cache/command-catalog`） |\n\n## 二、导出面\n\n```js\n// 主入口（. 桶）：数据源 + 域挂载点\nimport {cacheApi, AUTHORITY_META, authorityTag, cacheErrorText, isNotBoundError,\n        fmtBytes, fmtTtl, fmtUptime, asText, CacheApp} from '@yuku123/z-cache-component'\n\n// 宿主组装面（./pages 桶）：manifest + 页面组件\nimport {menuItems, routes, HomePage, LoginPage, Overview, Keys, ComponentDocPage} from '@yuku123/z-cache-component/pages'\n\n// 组件文档页（主壳接线用，名字全仓统一）\nimport {ComponentDocPage} from '@yuku123/z-cache-component'\n```\n\n## 三、API 端点\n\n请求实例是基座的默认 `request`（`@yuku123/z-frontend-common` 的 `createRequest()` 预建实例，\n`baseURL` 默认 `/api`），token 走 `Authorization: Bearer`。\n下表路径是 `src/services/api.js` 里 `cacheApi` 定义的**实际路径**（拼上 baseURL 即 `/api/cache/**`）。\n\n| 方法 | 路径 | 说明 |\n|---|---|---|\n| GET | `/api/cache/__instance` | 实例自省（是否 bind 上、store 是否可用、client 是否连上、authority 判定） |\n| GET | `/api/cache/overview` | 缓存总览（路 A / 路 B 双路数据 + `authorityDiverges`） |\n| GET | `/api/cache/keys` | 键浏览（query：`pattern` / `limit` / `db` / `source`） |\n| GET | `/api/cache/key` | 单键详情（query：`key` / `db` / `source` / `maxElements`） |\n| GET | `/api/cache/info` | 服务端 INFO（`Server` / `Clients` / `Memory` / `Stats` / `Keyspace` 五段） |\n| GET | `/api/cache/hotkeys` | 热点 key（query：`db` / `limit`） |\n| GET | `/api/cache/command-catalog` | RESP 命令目录（实际发过哪些命令 / 白名单语义） |\n\n### 3.1 两条取数路（这是本包最需要先讲清楚的一件事）\n\nz-cache 的上游**根本没有 HTTP 面** —— 全仓 grep `HttpServer|RestController|createContext`\n在 `z-cache` 下零命中，唯一的 server 是 `RedisServer` 的 Netty `ServerBootstrap`，\n讲的是 **RESP2 over TCP**。⇒ `CacheProxyController`（文件名沿用需求指定，但它不是 proxy）\n不转发任何 HTTP。\n\n同一个 JVM 内有两条**互不相关**的取数路：\n\n- **路 A = 反射** `ZCacheEmbeddedServerConfig.SHARED_SERVER` → `RedisServer.getStore()` → `MemoryStore`\n  只读方法。不开 socket、不碰端口，**物理上不可能读到别的进程** ⇒「本 JVM 自己那份」的权威。\n- **路 B = 容器里已存在的 `zCacheClient` bean**（starter 自动装配，业务代码用的就是它）\n  ⇒「业务此刻真正看到的那份」。\n\n页面首屏就是把 A 和 B 并排 + 显式比对（`authorityDiverges`）。\n\n### 3.2 authority 三态\n\n| 取值 | 含义 |\n|------|------|\n| `THIS_JVM_IN_PROCESS` | 本 JVM 进程内对象（不可能跨进程） |\n| `THIS_JVM_EMBEDDED` | 本 JVM 内嵌 server 应答 |\n| `EXTERNAL_PROCESS` | 外部进程应答 —— 6379 的属主不是本 JVM，这一路读到的是别的进程的缓存 |\n| `NO_ANSWER` | 没有任何 server 在应答 |\n| `UNKNOWN` | 连上了，但无法判定连的是谁 |\n\n## 四、页面说明\n\n### 4.1 首页\n\n登录后的着陆页。读 `localStorage.userInfo` 显示欢迎语与角色标签，再把 `menuItems`（去掉首页自身）\n渲染成入口卡片 —— 菜单加一项，首页卡片自动多一张，不用改页面代码。\n\n### 4.2 总览\n\n`pages/Overview.jsx`：`/cache/overview` + `/cache/info` 两个接口并排渲染，\n其中 `/cache/info` 失败时降级为 `null`，不拖垮主表。\n\n`pages/OverviewPage.jsx`（CacheApp 版）：双路对账，逐库列出 key 数、命中率等。\n\n### 4.3 键浏览\n\n`pages/Keys.jsx`：`/cache/keys` 分页 + 点行开 `/cache/key` 详情。\n\n`pages/KeysPage.jsx`（CacheApp 版）：在此基础上支持切库（`db`）、切数据源（`source`）、\n类型筛选（`type`）、详情抽屉。\n\n⚠ 类型取值域两路统一成**大写**枚举名（`STRING` / `HASH` / `LIST` / `SET` / `ZSET` / `NONE`）——\n旧版拿大写去比小写（server 回 `\"string\"`）⇒ 类型筛选永远 0 命中。\n\n### 4.4 统计\n\n`pages/StatsPage.jsx`：热点 key 表（key / 访问次数 / LFU 计数 / 是否已过期）+ 实例自省。\n热点表默认取 `db` 下 `limit: 50`。\n\n### 4.5 实例自省\n\n`pages/InstanceStatus.jsx`：`/cache/__instance` + `/cache/command-catalog`。\n把「自省接口本身不通」（z-opc 侧路由/鉴权问题）与「自省通了但内嵌没起」\n（中间件问题）分成两套提示，判据是 HTTP 503 且 `source === 'z-opc-cache-read-api'`。\n\n### 4.6 登录\n\n当前是 **mock 模式**：比对一对写死在 `src/pages/LoginPage.jsx` 里的管理员凭据\n（明文口令不在本文复述，见源码），成功后写 `localStorage.token` 与 `localStorage.userInfo`，\n再 `window.location.href = '/z-cache/home'`。CTC/SSO 尚未接入。\n\n### 4.7 组件文档\n\n本文件。内容以 `?raw` 在编译期内联，零额外请求；左侧 240px TOC 随滚动联动。\n\n## 五、配置\n\n| 配置项 | 默认值 | 说明 |\n|---|---|---|\n| 请求实例 | 基座默认 `request` | `baseURL` 默认 `/api`，token 走 `Authorization: Bearer`（读 `localStorage.token`） |\n| 热点 key 条数 | `50` | `hotkeys` 的 `limit` |\n| 详情元素上限 | `50` | `KeysPage` 调 `key` 时传的 `maxElements` |\n\n## 六、已知限制\n\n- **本卡是只读的**：后端只有 `@GetMapping`，前端也就不会有「清空 / 批量删除 / 设值」这类按钮。\n  写面单独立卡，不在本包范围内。\n- **切库（SELECT）被刻意禁用**：`zCacheClient` 是**业务共用连接**，发一次 SELECT 会把它永久留在 n 库，\n  之后所有业务的 SET/GET 都写错库。所以路 B 的接口一律忽略 `db` 参数\n  （响应里 `dbIgnoredForClientPath=true` 就是这个意思）；要按库浏览请用 `source=embedded`。\n- **路 B 的 `byteLength` 恒为 null**（路 B 不发 `STRLEN`）⇒ 页面显示「未测」，\n  不是「非 string」—— 后者会把「没测」渲染成否定结论。\n- **路 B 的 `type` 可能为 null**：null 且 `desyncSuspect=true` ⇒ 这一行的应答与所发命令对不上（串台），\n  **不采信**，原始应答留在 `rawReply`、判据在 `desyncReason`。\n- **TTL 语义**：`-1` = 常驻、`-2` = 不存在，直接显示成「负数秒」会被读成 bug，所以 `fmtTtl` 单独翻译。\n- **没有任何页面调用的接口**：无（`cacheApi` 的 7 个方法都有页面在用）。\n- 直达 / 刷新需要四处接线都齐（大需求 004 的四级路由契约）：MENU_GROUPS「缓存」组 ↔\n  OPS_ROUTES 的 `/cache` + `/cache/*` ↔ main.jsx 顶层 `<Route path=\"/cache/*\">` ↔\n  `MainWebConfig.spaPaths` 的 `/cache/**`。缺 main.jsx 那条 = 白屏，缺 spaPaths 那条 = 直达 404。\n- z-cache 已被 z-opc 主壳的 `domainRoutes.ts` 与 z-team 的 OpsWorkbench 引用\n  ⇒ `/z-cache/docs` 在平台主壳里**可达**。\n\n## 七、变更记录\n\n| 版本 | 变更 |\n|---|---|\n| 0.1.2 | 新增组件文档页 `ComponentDocPage`（lead 008 §7）：`src/DOC.md` + 基座 `ComponentDoc` 薄包装 |\n| 0.1.2 | 首版：缓存总览 / 键浏览 / 统计 / 实例自省 + manifest + CacheApp 挂载点 |\n";
 function pr() {
-  return /* @__PURE__ */ e.jsx(De, { markdown: sr, title: "组件文档 — z-cache" });
+  return /* @__PURE__ */ e.jsx(Fe, { markdown: or, title: "组件文档 — z-cache" });
 }
 export {
-  Fe as A,
-  hr as C,
+  Ue as A,
+  mr as C,
+  sr as I,
+  nr as S,
   pr as a,
-  Je as b,
+  Ve as b,
   $ as c,
   N as d,
   G as e,
   le as f,
   Ee as g,
-  Ue as h,
-  ur as i,
+  Je as h,
+  hr as i,
   e as j
 };
