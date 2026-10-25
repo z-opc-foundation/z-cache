@@ -170,7 +170,7 @@ export default function OverviewPage() {
                            description="原因见上面「不可用原因」/「反射失败原因」两格。这不是「缓存被清空了」。"/>
                 ) : (
                     <Table size="small" rowKey="db" columns={DB_COLUMNS} dataSource={emb.perDb}
-                           pagination={false}
+                           pagination={false /* §2 规则 2 豁免：按库统计：Redis 库数固定（默认 16），且本表带「合计」汇总行，分页会把合计切碎 */}
                            summary={() => <Table.Summary.Row>
                                <Table.Summary.Cell index={0}>合计</Table.Summary.Cell>
                                <Table.Summary.Cell index={1}>{emb.dbsizeTotal}</Table.Summary.Cell>
