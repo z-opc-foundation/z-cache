@@ -5,7 +5,7 @@ import {
 } from 'antd'
 import {ReloadOutlined, SearchOutlined} from '@ant-design/icons'
 import {cacheApi, cacheErrorText, authorityTag, fmtBytes, fmtTtl} from '../services/api'
-import {PageHeader, ListTable} from '@yuku123/z-frontend-common/ui'
+import {ListTable} from '@yuku123/z-frontend-common/ui'
 
 /**
  * type 的取值域（两路统一成**大写**枚举名）：
@@ -190,9 +190,6 @@ export default function KeysPage() {
 
     return (
         <div>
-            <PageHeader title="键浏览"
-                        subtitle="只读：GET /api/cache/keys + /api/cache/key —— 无设值 / 无删除 / 无清空"/>
-
             <Card size="small" style={{marginBottom: 12}}>
                 <Space wrap size={8}>
                     <span>pattern</span>

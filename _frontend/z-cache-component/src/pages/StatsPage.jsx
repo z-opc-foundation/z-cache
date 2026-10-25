@@ -2,7 +2,7 @@ import {useCallback, useEffect, useState} from 'react'
 import {Alert, Button, Card, Col, Descriptions, Row, Select, Space, Statistic, Table, Tag} from 'antd'
 import {ReloadOutlined} from '@ant-design/icons'
 import {cacheApi, cacheErrorText, authorityTag, fmtBytes} from '../services/api'
-import {PageHeader} from '@yuku123/z-frontend-common/ui'
+import {DEFAULT_PAGINATION} from '@yuku123/z-frontend-common/ui'
 
 const HOT_COLUMNS = [
     {title: 'key', dataIndex: 'key', key: 'key', ellipsis: true, render: (v) => <code>{v}</code>},
@@ -124,8 +124,6 @@ export default function StatsPage() {
 
     return (
         <div>
-            <PageHeader title="统计与热 key"
-                        subtitle="GET /api/cache/info（路 B 的 INFO 原文 + 分节）与 /api/cache/hotkeys（路 A 的 LFU 埋点）"/>
 
             {error && (
                 <Alert type="error" showIcon style={{marginBottom: 12}}
@@ -221,7 +219,7 @@ export default function StatsPage() {
                             · <Tag color={authorityTag(hot.authority).color}>{hot.authority}</Tag>
                         </div>
                         <Table size="small" rowKey="key" columns={HOT_COLUMNS} dataSource={hot.rows ?? []}
-                               pagination={{size: 'small', pageSize: 20}}
+                               pagination={DEFAULT_PAGINATION}
                                locale={{emptyText: `db${db} 的 string store 里一个 key 都没有（路 A 口径，确定没跨进程）`}}/>
                         <div style={{marginTop: 8, fontSize: 12, color: '#94a3b8'}}>
                             {hot.scopeNote} ／ {hot.sourceNote}

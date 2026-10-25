@@ -2,7 +2,6 @@ import {useCallback, useEffect, useState} from 'react'
 import {Alert, Button, Card, Col, Descriptions, Row, Statistic, Table, Tag} from 'antd'
 import {ReloadOutlined} from '@ant-design/icons'
 import {cacheApi, cacheErrorText, authorityTag, fmtUptime} from '../services/api'
-import {PageHeader} from '@yuku123/z-frontend-common/ui'
 
 const DB_COLUMNS = [
     {title: '库', dataIndex: 'db', key: 'db', width: 70, render: (v) => `db${v}`},
@@ -58,9 +57,6 @@ export default function OverviewPage() {
 
     return (
         <div>
-            <PageHeader title="缓存总览"
-                        subtitle="双路对账：进程内 MemoryStore（路 A） vs zCacheClient 走 RESP（路 B）— GET /api/cache/overview"
-                        extra={<Button icon={<ReloadOutlined/>} loading={loading} onClick={load}>刷新</Button>}/>
 
             {error && (
                 <Alert type="error" showIcon style={{marginBottom: 12}}
@@ -77,7 +73,8 @@ export default function OverviewPage() {
             <Row gutter={16}>
                 <Col span={12}>
                     <Card title={<span>路 A · 进程内 MemoryStore <Tag color="blue">不可能跨进程</Tag></span>}
-                          size="small" loading={loading}>
+                          size="small" loading={loading}
+                          extra={<Button icon={<ReloadOutlined/>} loading={loading} onClick={load}>刷新</Button>}>
                         <Row gutter={8}>
                             <Col span={12}>
                                 <Statistic title="dbsize（本 JVM 全部库）" value={emb.dbsizeTotal ?? '-'}/>

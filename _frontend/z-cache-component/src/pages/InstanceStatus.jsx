@@ -2,7 +2,7 @@ import {useCallback, useEffect, useState} from 'react'
 import {Alert, Button, Card, Descriptions, Space, Table, Tag} from 'antd'
 import {ReloadOutlined} from '@ant-design/icons'
 import {cacheApi, cacheErrorText, authorityTag} from '../services/api'
-import {PageHeader} from '@yuku123/z-frontend-common/ui'
+import {EmptyState} from '@yuku123/z-frontend-common/ui'
 
 const CMD_COLUMNS = [
     {title: 'RESP 命令', dataIndex: 'command', key: 'command', width: 140, render: (v) => <code>{v}</code>},
@@ -74,9 +74,6 @@ export default function InstanceStatus() {
 
     return (
         <div>
-            <PageHeader title="实例与三态"
-                        subtitle="只读 controller 自省接口 GET /api/cache/__instance —— 先证明应答者是谁，再谈数据"/>
-
             {error && (
                 <Alert type="error" showIcon
                        message={`自省接口调用失败：${cacheErrorText(error)}`}
@@ -265,8 +262,10 @@ export default function InstanceStatus() {
                 ) : (
                     <>
                         <div style={{fontSize: 12, color: '#64748b', marginBottom: 8}}>{catalog.provenance}</div>
+                        {/* §2 规则 2 豁免：命令目录是 controller 的固定常量集合（发/不发两张表），行数不随业务增长 */}
                         <Table size="small" rowKey="command" pagination={false}
                                columns={CMD_COLUMNS}
+                               locale={{emptyText: <EmptyState title="没有已下发命令" size="sm"/>}}
                                dataSource={catalog.commandsActuallyIssued ?? []}
                                title={() => <span><Tag color="success">只读 · 本 controller 真正会发的（{catalog.commandsActuallyIssued?.length ?? 0} 条）</Tag></span>}/>
                         {catalog.notCountedAsIssued ? (
@@ -274,15 +273,19 @@ export default function InstanceStatus() {
                                    message="为什么 PING 不算「已下发」"
                                    description={catalog.notCountedAsIssued}/>
                         ) : null}
+                        {/* §2 规则 2 豁免：同上的只读白名单固定集合 */}
                         <Table style={{marginTop: 12}} size="small" rowKey="command" pagination={false}
                                columns={CMD_COLUMNS}
+                               locale={{emptyText: <EmptyState title="只读白名单为空" size="sm"/>}}
                                dataSource={catalog.readOnlyCommandsAllowedByWhitelist ?? []}
                                title={() => <span><Tag color="processing">只读白名单 = 上限集合（safeSend 入口校验用）</Tag></span>}/>
                         {catalog.whitelistSemantics ? (
                             <div style={{marginTop: 8, fontSize: 12, color: '#64748b'}}>{catalog.whitelistSemantics}</div>
                         ) : null}
+                        {/* §2 规则 2 豁免：同上，server 支持但永不下发的固定集合 */}
                         <Table style={{marginTop: 12}} size="small" rowKey="command" pagination={false}
                                columns={CMD_COLUMNS}
+                               locale={{emptyText: <EmptyState title="没有此类命令" size="sm"/>}}
                                dataSource={catalog.neverIssuedDespiteBeingSupportedByServer ?? []}
                                title={() => <span><Tag color="error">server 支持但本 controller 永不下发</Tag></span>}/>
                     </>

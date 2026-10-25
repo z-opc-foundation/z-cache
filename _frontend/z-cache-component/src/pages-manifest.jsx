@@ -1,6 +1,8 @@
-import { HomeOutlined, KeyOutlined, PieChartOutlined, ReadOutlined } from '@ant-design/icons'
+import { BarChartOutlined, HomeOutlined, KeyOutlined, MonitorOutlined, PieChartOutlined, ReadOutlined } from '@ant-design/icons'
 import Overview from './pages/Overview'
 import Keys from './pages/Keys'
+import StatsPage from './pages/StatsPage'
+import InstanceStatus from './pages/InstanceStatus'
 
 
 export {default as Overview} from './pages/Overview'
@@ -16,6 +18,8 @@ export const menuItems = [
     { key: '/z-cache/home', label: '首页', icon: <HomeOutlined /> },
     { key: '/z-cache/overview', label: '总览', icon: <PieChartOutlined /> },
     { key: '/z-cache/keys', label: '键浏览', icon: <KeyOutlined /> },
+    { key: '/z-cache/stats', label: '统计与热 key', icon: <BarChartOutlined /> },
+    { key: '/z-cache/instance', label: '实例与三态', icon: <MonitorOutlined /> },
     { key: '/z-cache/docs', label: '组件文档', icon: <ReadOutlined /> },
 ]
 
@@ -23,6 +27,8 @@ export const routes = [
     { path: '/z-cache/home', Component: HomePage },
     { path: '/z-cache/overview', Component: Overview },
     { path: '/z-cache/keys', Component: Keys },
+    { path: '/z-cache/stats', Component: StatsPage },
+    { path: '/z-cache/instance', Component: InstanceStatus },
     { path: '/z-cache/docs', Component: ComponentDocPage },
     { path: '/z-cache/:rest*', Component: CacheApp },
 ]
