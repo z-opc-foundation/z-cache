@@ -1,4 +1,4 @@
-import { j as e, d as S, S as B, I as K, a as L, C as M } from "./ComponentDoc-IUoI2Iuk.js";
+import { j as e, d as S, S as B, I as K, a as L, C as M } from "./ComponentDoc-BRTTpMBf.js";
 import { ReloadOutlined as I, SearchOutlined as $, UserOutlined as D, LockOutlined as H, HomeOutlined as U, PieChartOutlined as W, KeyOutlined as J, BarChartOutlined as F, MonitorOutlined as V, ReadOutlined as q } from "@ant-design/icons";
 import { useState as c, useEffect as T } from "react";
 import { Typography as b, Space as k, Button as m, Alert as P, Spin as G, Row as N, Col as g, Card as y, Statistic as f, Descriptions as E, Input as O, Modal as Z, Tag as v, Form as j, message as w } from "antd";
@@ -196,7 +196,7 @@ function ce() {
       }, children: i.icon }),
       /* @__PURE__ */ e.jsxs("div", { style: { minWidth: 0 }, children: [
         /* @__PURE__ */ e.jsx("div", { style: { fontSize: 15, fontWeight: 600, color: "#0f172a" }, children: i.label }),
-        /* @__PURE__ */ e.jsx("div", { style: { fontSize: 12, color: "#94a3b8", marginTop: 2 }, children: i.key })
+        i.desc && /* @__PURE__ */ e.jsx("div", { style: { fontSize: 12, color: "#94a3b8", marginTop: 2 }, children: i.desc })
       ] })
     ] }) }) }, i.key)) })
   ] });

@@ -1,4 +1,4 @@
-import request from '@yuku123/z-frontend-common'
+import {request} from '@yuku123/z-frontend-common'
 
 /**
  * z-cache（Redis 兼容缓存，自研）管理面数据源。

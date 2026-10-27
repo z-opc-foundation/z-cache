@@ -2,7 +2,7 @@ import { Routes as Ie, Route as W, Navigate as ze } from "react-router-dom";
 import Oe, { useState as x, useCallback as X, useEffect as ie, useMemo as Te } from "react";
 import { Alert as g, Row as Z, Col as z, Card as A, Statistic as F, Descriptions as U, Tag as o, Button as ce, Table as $, Tooltip as oe, Space as Q, Input as we, Select as Ae, InputNumber as Ne, Radio as te, Badge as Be, Drawer as Le, Empty as Se } from "antd";
 import { ReloadOutlined as ae, SearchOutlined as $e } from "@ant-design/icons";
-import D from "@yuku123/z-frontend-common";
+import { request as D } from "@yuku123/z-frontend-common";
 import { ListTable as Me, DEFAULT_PAGINATION as De, EmptyState as pe, ComponentDoc as Fe } from "@yuku123/z-frontend-common/ui";
 const B = {
   instance: () => D.get("/cache/__instance"),
