@@ -1,6 +1,7 @@
 import {defineConfig} from 'vite'
 import react from '@vitejs/plugin-react'
 import {fileURLToPath} from 'node:url'
+import {safeEmptyOutDir} from '../../build-tools/safe-vite-plugin.mjs'
 
 /**
  * 后端地址：默认打真的 z-opc（:8888），可用 ZCACHE_API_TARGET 指到别的读数台
@@ -29,7 +30,7 @@ const LOCAL_COMPONENT_SRC = fileURLToPath(new URL('../z-cache-component/src', im
 const WORKSPACE_FRONTEND_COMMON = fileURLToPath(new URL('../../../z-frontend-common/src', import.meta.url))
 
 export default defineConfig({
-    plugins: [react()],
+    plugins: [safeEmptyOutDir(), react()],
   resolve: { dedupe: ['react', 'react-dom', 'react-router-dom', 'antd', '@ant-design/icons', 'axios'] ,
         alias: process.env.LOCAL_SIBLINGS === '1' ? [
             {find: '@yuku123/z-frontend-common/ui', replacement: WORKSPACE_FRONTEND_COMMON + '/components/ui/index.js'},

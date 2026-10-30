@@ -17,11 +17,11 @@ redis-cli / GUI）零修改即可连。它要解决的不是"再造一个 Redis 
 | **仓库** | `z-cache` |
 | **Maven 坐标** | `io.github.yuku123:z-cache`（根聚合 POM，`packaging=pom`） |
 | **当前版本** | `1.3.6`（根 POM 用直接 `<version>`，**不是** `${revision}` CI-friendly 占位） |
-| **父项目** | `io.github.yuku123:z-boot-parent:1.1.0`（`<relativePath/>` 留空：parent 在 repo1，不在磁盘） |
+| **父项目** | `io.github.yuku123:z-boot-parent:1.2.0`（`<relativePath/>` 留空：parent 在 repo1，不在磁盘） |
 | **Maven Central** | 实测 `z-cache` 及 5 个子件在 `1.3.6` 与 `1.3.5` 均可从 repo1 取到（`.pom` HTTP 200；不存在版本回 404）。见下方「版本链」关于 CHANGELOG 仍标 Unreleased 的账目漂移 |
 | **默认端口** | `6379`（`RedisServer.DEFAULT_PORT`）；默认**只 bind `127.0.0.1`**，对外服务需显式 `--host 0.0.0.0` |
 | **数据库数** | 16（`MemoryStore.DEFAULT_DB_COUNT`） |
-| **运行口径** | Java 8（`maven.compiler.release=8`，JDK9+ 强制；Docker 用 `eclipse-temurin:8`）· Spring Boot 2.7.18 · Netty 4.1.138.Final |
+| **运行口径** | Java 17（`maven.compiler.release=17`，JDK9+ 强制；Docker 用 `eclipse-temurin:8`）· Spring Boot 3.3.13 · Netty 4.1.138.Final |
 | **最近更新** | 2026-09-30 |
 
 ---
@@ -30,7 +30,7 @@ redis-cli / GUI）零修改即可连。它要解决的不是"再造一个 Redis 
 
 本仓是全组织迁移到 `z-boot-parent` 消费入口的试点，版本链三层，逐层实测：
 
-- **parent**：`io.github.yuku123:z-boot-parent:1.1.0`（repo1 可读，实测 200）。它负责 Java 8 的
+- **parent**：`io.github.yuku123:z-boot-parent:1.2.0`（repo1 可读，实测 200）。它负责 Java 8 的
   pluginManagement、第三方地板与兄弟仓权威表。
 - **floor（地板）**：第三方版本口径已并进 `z-boot-parent` 自身（`z-boot-dependencies` 文件夹随 2026-10-08 火车制拓扑退役）。
 - **fleet（舰队表）**：兄弟仓对外版本权威表也已并进 `z-boot-parent` 的 `dependencyManagement`（`z-boot-fleet` 文件夹同期退役）。
@@ -76,7 +76,7 @@ redis-cli / GUI）零修改即可连。它要解决的不是"再造一个 Redis 
 
 ```
 z-cache/
-├── pom.xml                     # 根聚合 POM：继承 z-boot-parent:1.1.0，版本 1.3.6，log4j2 压回 2.17.2
+├── pom.xml                     # 根聚合 POM：继承 z-boot-parent:1.2.0，版本 1.3.6，log4j2 压回 2.17.2
 ├── z-cache-common/             # 14 个 src/main 类：协议编解码、RedisGlob、共享类型（不引日志实现）
 ├── z-cache-core/               # 27 个类：存储引擎 MemoryStore、RESP 服务端 RedisServer/ZCacheServerMain、
 │                               #   命令处理 CommandHandler、持久化 RdbPersistence/AofPersistence
@@ -99,7 +99,7 @@ z-cache/
 
 | 层级 | 技术（来自 pom 实测） |
 |------|------|
-| 语言 / 运行时 | Java 8（全组织口径；JDK9+ 用 `release 8` 卡死，Docker 基镜像 `eclipse-temurin:8-jre`） |
+| 语言 / 运行时 | Java 17（全组织口径；JDK9+ 用 `release 8` 卡死，Docker 基镜像 `eclipse-temurin:8-jre`） |
 | 网络 | Netty 4.1.138.Final（版本走 `z-boot-parent` 自带地板，本仓不再自钉） |
 | 日志 | Log4j2 **2.17.2**（本仓有意压回，理由见「版本链」；只有一个日志家族，`logback`/`slf4j` 已整批撤出） |
 | 序列化 | `z-util-serialize-core` / `z-util-serialize-schema`（版本走 fleet） |
@@ -117,8 +117,8 @@ z-cache/
 mvn clean install -DskipTests
 ```
 
-第三方版本一律由 `z-boot-parent:1.1.0` 供给（第三方地板与兄弟仓权威表均已并入 parent 自身），
-模块 POM 不应再出现字面版本钉；若报找不到版本，先确认本地/镜像能解析到 `io.github.yuku123:z-boot-parent:1.1.0`。
+第三方版本一律由 `z-boot-parent:1.2.0` 供给（第三方地板与兄弟仓权威表均已并入 parent 自身），
+模块 POM 不应再出现字面版本钉；若报找不到版本，先确认本地/镜像能解析到 `io.github.yuku123:z-boot-parent:1.2.0`。
 
 ### 起一台服务端（RESP over TCP）
 

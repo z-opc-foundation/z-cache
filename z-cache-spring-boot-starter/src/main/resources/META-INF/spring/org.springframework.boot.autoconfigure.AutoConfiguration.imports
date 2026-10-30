@@ -1,0 +1,2 @@
+com.zifang.z.cache.spring.ZCacheAutoConfiguration
+com.zifang.z.cache.spring.host.CacheHostAutoConfiguration
