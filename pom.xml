@@ -28,7 +28,7 @@
         <module>z-cache-spring-boot-starter</module>
     </modules>
 
-    <name>z-cache</name>
+    <name>z-cache :: root</name>
     <description>Zero-copy 二进制编解码 + Netty RPC + Spring Boot Starter 的分布式缓存基础设施</description>
     <url>https://github.com/yuku123/z-cache</url>
     <licenses>

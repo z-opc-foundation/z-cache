@@ -15,7 +15,7 @@
     <artifactId>z-cache-client</artifactId>
     <packaging>jar</packaging>
 
-    <name>z-cache-client</name>
+    <name>z-cache :: client</name>
     <description>Java client SDK for z-cache server</description>
 
     <properties>
