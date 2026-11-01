@@ -1,11 +1,11 @@
-import { j as e, d as S, S as B, I as K, a as L, C as M } from "./ComponentDoc-BRTTpMBf.js";
+import { j as e, d as S, S as B, I as K, a as M, C as L } from "./ComponentDoc-BRTTpMBf.js";
 import { ReloadOutlined as I, SearchOutlined as $, UserOutlined as D, LockOutlined as H, HomeOutlined as U, PieChartOutlined as W, KeyOutlined as J, BarChartOutlined as F, MonitorOutlined as V, ReadOutlined as q } from "@ant-design/icons";
 import { useState as c, useEffect as T } from "react";
-import { Typography as b, Space as k, Button as m, Alert as P, Spin as G, Row as N, Col as g, Card as y, Statistic as f, Descriptions as E, Input as O, Modal as Z, Tag as v, Form as j, message as w } from "antd";
+import { Typography as b, Space as k, Button as m, Alert as P, Spin as G, Row as N, Col as g, Card as y, Statistic as f, Descriptions as E, Input as O, Modal as Z, Tag as v, Form as j, message as z } from "antd";
 import { ListTable as Q } from "@yuku123/z-frontend-common/ui";
 import { useNavigate as X } from "react-router-dom";
 const { Title: Y, Paragraph: ee } = b;
-function z(n) {
+function w(n) {
   return n == null ? "—" : typeof n == "number" ? n.toLocaleString("zh-CN") : String(n);
 }
 function te() {
@@ -37,10 +37,10 @@ function te() {
     x && /* @__PURE__ */ e.jsx(P, { type: "error", showIcon: !0, style: { marginBottom: 16 }, message: "后端未连接", description: x }),
     i && !n && /* @__PURE__ */ e.jsx(G, {}),
     n && /* @__PURE__ */ e.jsxs(N, { gutter: 16, style: { marginBottom: 16 }, children: [
-      /* @__PURE__ */ e.jsx(g, { span: 6, children: /* @__PURE__ */ e.jsx(y, { children: /* @__PURE__ */ e.jsx(f, { title: "键总数", value: z(n.keyCount ?? n.totalKeys) }) }) }),
-      /* @__PURE__ */ e.jsx(g, { span: 6, children: /* @__PURE__ */ e.jsx(y, { children: /* @__PURE__ */ e.jsx(f, { title: "内存使用", value: z(n.usedMemory ?? n.memoryUsed) }) }) }),
+      /* @__PURE__ */ e.jsx(g, { span: 6, children: /* @__PURE__ */ e.jsx(y, { children: /* @__PURE__ */ e.jsx(f, { title: "键总数", value: w(n.keyCount ?? n.totalKeys) }) }) }),
+      /* @__PURE__ */ e.jsx(g, { span: 6, children: /* @__PURE__ */ e.jsx(y, { children: /* @__PURE__ */ e.jsx(f, { title: "内存使用", value: w(n.usedMemory ?? n.memoryUsed) }) }) }),
       /* @__PURE__ */ e.jsx(g, { span: 6, children: /* @__PURE__ */ e.jsx(y, { children: /* @__PURE__ */ e.jsx(f, { title: "命中率", value: n.hitRate != null ? `${(n.hitRate * 100).toFixed(1)}%` : "—" }) }) }),
-      /* @__PURE__ */ e.jsx(g, { span: 6, children: /* @__PURE__ */ e.jsx(y, { children: /* @__PURE__ */ e.jsx(f, { title: "过期键", value: z(n.expiredKeys) }) }) })
+      /* @__PURE__ */ e.jsx(g, { span: 6, children: /* @__PURE__ */ e.jsx(y, { children: /* @__PURE__ */ e.jsx(f, { title: "过期键", value: w(n.expiredKeys) }) }) })
     ] }),
     d && /* @__PURE__ */ e.jsx(y, { title: "Redis INFO", children: /* @__PURE__ */ e.jsx(E, { column: 2, bordered: !0, size: "small", children: Object.entries(d).slice(0, 20).map(([l, a]) => /* @__PURE__ */ e.jsx(E.Item, { label: l, children: typeof a == "object" ? JSON.stringify(a) : String(a) }, l)) }) })
   ] });
@@ -210,10 +210,10 @@ function ge({ mockAuth: n } = {}) {
     h(!0);
     try {
       if (!r.username || !r.password) {
-        w.error("未配置 mock 账号（VITE_MOCK_USER / VITE_MOCK_PASSWORD）");
+        z.error("未配置 mock 账号（VITE_MOCK_USER / VITE_MOCK_PASSWORD）");
         return;
       }
-      u.username === r.username && u.password === r.password ? (localStorage.setItem("token", "mock-" + r.username), localStorage.setItem("userInfo", JSON.stringify(r.user)), w.success("登录成功（mock 模式，待 CTC/SSO 接入）"), window.location.href = "/z-cache/home") : w.error("用户名或密码错误");
+      u.username === r.username && u.password === r.password ? (localStorage.setItem("token", "mock-" + r.username), localStorage.setItem("userInfo", JSON.stringify(r.user)), z.success("登录成功（mock 模式，待 CTC/SSO 接入）"), window.location.href = "/z-cache/home") : z.error("用户名或密码错误");
     } finally {
       h(!1);
     }
@@ -259,28 +259,29 @@ function ge({ mockAuth: n } = {}) {
     ] })
   ] }) });
 }
-const de = [
+const fe = { title: "z-cache 缓存中心", short: "z-cache" }, de = [
   { key: "/z-cache/home", label: "首页", icon: /* @__PURE__ */ e.jsx(U, {}) },
   { key: "/z-cache/overview", label: "总览", icon: /* @__PURE__ */ e.jsx(W, {}) },
   { key: "/z-cache/keys", label: "键浏览", icon: /* @__PURE__ */ e.jsx(J, {}) },
   { key: "/z-cache/stats", label: "统计与热 key", icon: /* @__PURE__ */ e.jsx(F, {}) },
   { key: "/z-cache/instance", label: "实例与三态", icon: /* @__PURE__ */ e.jsx(V, {}) },
   { key: "/z-cache/docs", label: "组件文档", icon: /* @__PURE__ */ e.jsx(q, {}) }
-], fe = [
+], je = [
   { path: "/z-cache/home", Component: ce },
   { path: "/z-cache/overview", Component: te },
   { path: "/z-cache/keys", Component: le },
   { path: "/z-cache/stats", Component: B },
   { path: "/z-cache/instance", Component: K },
-  { path: "/z-cache/docs", Component: L },
-  { path: "/z-cache/:rest*", Component: M }
+  { path: "/z-cache/docs", Component: M },
+  { path: "/z-cache/:rest*", Component: L }
 ];
 export {
-  L as ComponentDocPage,
+  M as ComponentDocPage,
   ce as HomePage,
   le as Keys,
   ge as LoginPage,
   te as Overview,
+  fe as appMeta,
   de as menuItems,
-  fe as routes
+  je as routes
 };
