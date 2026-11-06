@@ -8,7 +8,7 @@ RUN --mount=type=bind,from=maven-m2,source=/repository,target=/root/.m2/reposito
     mvn -s /tmp/settings.xml -f z-cache/pom.xml -N install -DskipTests && \
     mvn -s /tmp/settings.xml -f z-cache/pom.xml -pl z-cache-server -am clean package -DskipTests
 
-FROM eclipse-temurin:8-jre
+FROM eclipse-temurin:17-jre
 RUN useradd --system --uid 10001 zcache
 WORKDIR /app
 COPY --from=builder /build/z-cache/z-cache-server/target/z-cache-server.jar /app/z-cache-server.jar
