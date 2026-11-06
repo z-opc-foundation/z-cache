@@ -16,9 +16,9 @@ redis-cli / GUI）零修改即可连。它要解决的不是"再造一个 Redis 
 |------|------|
 | **仓库** | `z-cache` |
 | **Maven 坐标** | `io.github.yuku123:z-cache`（根聚合 POM，`packaging=pom`） |
-| **当前版本** | `1.3.6`（根 POM 用直接 `<version>`，**不是** `${revision}` CI-friendly 占位） |
+| **当前版本** | `1.3.7`（根 POM 用直接 `<version>`，**不是** `${revision}` CI-friendly 占位） |
 | **父项目** | `io.github.yuku123:z-boot-parent:1.2.2`（`<relativePath/>` 留空：parent 在 repo1，不在磁盘） |
-| **Maven Central** | 实测 `z-cache` 及 5 个子件在 `1.3.6` 与 `1.3.5` 均可从 repo1 取到（`.pom` HTTP 200；不存在版本回 404）。见下方「版本链」关于 CHANGELOG 仍标 Unreleased 的账目漂移 |
+| **Maven Central** | 实测 `z-cache` 及 5 个子件在 `1.3.7` 与 `1.3.5` 均可从 repo1 取到（`.pom` HTTP 200；不存在版本回 404）。见下方「版本链」关于 CHANGELOG 仍标 Unreleased 的账目漂移 |
 | **默认端口** | `6379`（`RedisServer.DEFAULT_PORT`）；默认**只 bind `127.0.0.1`**，对外服务需显式 `--host 0.0.0.0` |
 | **数据库数** | 16（`MemoryStore.DEFAULT_DB_COUNT`） |
 | **运行口径** | Java 17（`maven.compiler.release=17`，JDK9+ 强制；Docker 用 `eclipse-temurin:8`）· Spring Boot 3.3.13 · Netty 4.1.138.Final |
@@ -41,11 +41,11 @@ redis-cli / GUI）零修改即可连。它要解决的不是"再造一个 Redis 
 `z-util`（1.0.13）的属性已删除，改由 parent 的 `dependencyManagement` 供给。
 
 一个坑（已在本 POM 注释钉死）：fleet 里 `z-cache` 那一格钉的是 repo1 上最新的 **1.3.5**，继承来的 DM 会
-改写**传递依赖**，导致 `z-cache-server` 的 shade fat jar 把 1.3.5 的 `z-cache-common` 字节码打进 1.3.6 包里。
+改写**传递依赖**，导致 `z-cache-server` 的 shade fat jar 把 1.3.5 的 `z-cache-common` 字节码打进 1.3.7 包里。
 修法是在根 POM 的 `dependencyManagement` 把 5 个自家模块逐个钉 `${project.version}`。
 
-> 账目漂移提示：`CHANGELOG.md` 顶部仍写 `## [1.3.6] - Unreleased`，而 repo1 实测已能取到 1.3.6 的 pom。
-> 本 README 只陈述**实测到的 Central 状态**（1.3.6 在架），不沿用 CHANGELOG 那句过期标签。
+> 账目漂移提示：`CHANGELOG.md` 顶部仍写 `## [1.3.7] - Unreleased`，而 repo1 实测已能取到 1.3.7 的 pom。
+> 本 README 只陈述**实测到的 Central 状态**（1.3.7 在架），不沿用 CHANGELOG 那句过期标签。
 
 ---
 
@@ -76,7 +76,7 @@ redis-cli / GUI）零修改即可连。它要解决的不是"再造一个 Redis 
 
 ```
 z-cache/
-├── pom.xml                     # 根聚合 POM：继承 z-boot-parent:1.2.2，版本 1.3.6，log4j2 压回 2.17.2
+├── pom.xml                     # 根聚合 POM：继承 z-boot-parent:1.2.2，版本 1.3.7，log4j2 压回 2.17.2
 ├── z-cache-common/             # 14 个 src/main 类：协议编解码、RedisGlob、共享类型（不引日志实现）
 ├── z-cache-core/               # 27 个类：存储引擎 MemoryStore、RESP 服务端 RedisServer/ZCacheServerMain、
 │                               #   命令处理 CommandHandler、持久化 RdbPersistence/AofPersistence
@@ -90,7 +90,7 @@ z-cache/
 ```
 
 5 个模块**都在 reactor、都没有 `maven.deploy.skip`**，因此都会随 `-P central` 发布到 Maven Central
-（与上面 Central 实测一致：6 个坐标 1.3.6 全在架）。`z-cache-server` 是 `maven-shade-plugin` 打出的
+（与上面 Central 实测一致：6 个坐标 1.3.7 全在架）。`z-cache-server` 是 `maven-shade-plugin` 打出的
 可执行 fat jar，`<finalName>` 固定为 `z-cache-server`，产物是 `target/z-cache-server.jar`（**不带版本号后缀**）。
 
 ---
@@ -145,7 +145,7 @@ redis-cli -h 127.0.0.1 -p 6379 GET hello          # "world"
 <dependency>
     <groupId>io.github.yuku123</groupId>
     <artifactId>z-cache-spring-boot-starter</artifactId>
-    <version>1.3.6</version>
+    <version>1.3.7</version>
 </dependency>
 ```
 
