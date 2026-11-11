@@ -65,7 +65,7 @@ export default function Keys() {
                 ? <Tag color="red">读数不可信</Tag>
                 : (v == null ? '未测' : (v < 0 ? '永不过期' : `${v}s`)))},
         {title: '操作', key: 'op', width: 100,
-            render: (_, r) => <Button size="small" onClick={() => openDetail(r)}>详情</Button>},
+            render: (_, r) => <Button type="link" size="small" onClick={() => openDetail(r)}>详情</Button>},
     ]
 
     return (
