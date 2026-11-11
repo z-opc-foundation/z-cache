@@ -17,11 +17,11 @@
 #   redis 没有 HTTP 面。
 #
 # 【数据盘】
-#   volumeClaimTemplates: data（2Gi，RWO，Filesystem）⇒ StatefulSet 自己的 PVC
-#   模板，**不需要**独立的 04-pvc.yaml。线上对应 PVC 是 data-redis-0
-#   （storageClass local-path，绑在 zifang002）。
-#   persistentVolumeClaimRetentionPolicy: Retain/Retain ⇒ 缩容/删除 StatefulSet
-#   时**不删**数据盘（线上就是这个值，保持数据）。
+#   不再用 volumeClaimTemplates（2026-11-11 持久化规范）：真源目录 = 节点
+#   zifang002 的 /home/zifang/data/redis，由下方 hostPath + nodeSelector 成对钉住。
+#   迁移实录：PV 数据（dump.rdb + appendonlydir，属主 uid 999）已拷入，
+#   原 PVC data-redis-0 成为孤儿（另议清理）。
+#   ⚠ 节点侧目录属主须为 redis 运行 uid(999)，否则 dump.rdb 写入 Permission denied。
 #
 # 【secret 从哪来】
 #   本域**无 secret**（基线导出里没有 secretKeyRef）。
@@ -45,10 +45,6 @@ spec:
     type: RollingUpdate
     rollingUpdate:
       partition: 0
-  # 缩容/删除时不回收数据盘（线上同值）。
-  persistentVolumeClaimRetentionPolicy:
-    whenDeleted: Retain
-    whenScaled: Retain
   selector:
     matchLabels:
       app: redis
@@ -57,6 +53,9 @@ spec:
       labels:
         app: redis
     spec:
+      # ⚠ 与 hostPath 成对钉节点（「注意分布式」）：数据在节点本地盘 ⇒ pod 漂到别的节点即丢数据。
+      nodeSelector:
+        kubernetes.io/hostname: zifang002
       containers:
         - name: redis
           image: redis:7-alpine
@@ -93,13 +92,9 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
-  volumeClaimTemplates:
-    - metadata:
-        name: data
-      spec:
-        accessModes:
-          - ReadWriteOnce
-        volumeMode: Filesystem
-        resources:
-          requests:
-            storage: 2Gi
+      volumes:
+        # redis 真源 = zifang002:/home/zifang/data/redis（2026-11-11 自 volumeClaimTemplates 迁入）
+        - name: data
+          hostPath:
+            path: /home/zifang/data/redis
+            type: Directory
