@@ -221,14 +221,7 @@ export default function KeysPage() {
 
             {error && (
                 <Alert type="error" showIcon style={{marginBottom: 12}}
-                       message={`读不到 key 列表：${cacheErrorText(error)}`}
-                       description={
-                           <span>
-                               后端 503 的含义是"这条路取不到数"，不是"缓存是空的"。
-                               {source === 'embedded' && ' 你强制了路 A，而本 JVM 的内嵌 server 没 bind ⇒ 必然 503；'}
-                               换 source=client 或直接看「实例与三态」页确认归属。
-                           </span>
-                       }/>
+                       message={`读不到 key 列表：${cacheErrorText(error)}`}/>
             )}
 
             {meta?.desyncRows > 0 && (
@@ -258,9 +251,7 @@ export default function KeysPage() {
                     ? '见上方告警。'
                     : (!meta
                         ? '先点「查询」读一次。'
-                        : (meta.sourceUsed === 'embedded'
-                            ? '路 A 的进程内 store 里这个 pattern 没有匹配项（本 JVM 自己那份，确定没跨进程）'
-                            : '路 B 无应答或该库确实为空 —— 先看「实例与三态」确认应答者是不是本 JVM'))}
+                        : '没有匹配的 key')}
                 tableProps={{size: 'small'}}
             />
 
@@ -288,9 +279,9 @@ export default function KeysPage() {
                                           {key: 'ver', label: 'keyVersion（路 A）', children: detail.keyVersion ?? '-'},
                                           detail.error && {key: 'err', label: '读取错误', span: 2, children: <code>{detail.error}</code>},
                                       ].filter(Boolean)}/>
-                        <Card size="small" title="值（按类型取，非 UTF-8 会降级成 base64）" style={{marginTop: 12}}>
+                        <Card size="small" title="值" style={{marginTop: 12}}>
                             {!detail.value || !Object.keys(detail.value).length
-                                ? <Empty description="该类型没有可读的值，或路 A/B 都取不到"/>
+                                ? <Empty description="没有可读的值"/>
                                 : (
                                     <Descriptions size="small" column={1} bordered
                                                   items={Object.entries(detail.value).map(([k, v]) => ({
@@ -298,11 +289,6 @@ export default function KeysPage() {
                                                   }))}/>
                                 )}
                         </Card>
-                        <div style={{marginTop: 12, fontSize: 12, color: '#64748b'}}>
-                            值渲染不改变任何后端状态：路 A 只调 MemoryStore 的读方法，
-                            路 B 只发 TYPE/TTL/PTTL/GET/HGETALL/LRANGE/LLEN/SMEMBERS/SCARD/ZCARD/ZRANGE，
-                            全部在 Java 侧白名单里，HTTP 无法指定命令名。
-                        </div>
                     </>
                 )}
             </Drawer>

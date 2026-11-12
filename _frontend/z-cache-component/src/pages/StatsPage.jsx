@@ -54,17 +54,7 @@ function BuildFingerprintAlert({fp}) {
         <Alert type={color} showIcon style={{marginTop: 4}}
                message={`构建指纹：${verdict === 'DIFFERENT_BUILD' ? '应答者不是本次构建的产物'
                        : verdict === 'SAME_BUILD_CANDIDATE' ? '版本号一致，但不足以定身份'
-                       : '指纹不可用（一边取不到值，页面不猜）'}`}
-               description={<>
-                   <div style={{fontSize: 12}}>
-                       本次构建会印 <code>z-cache_version:{fp.ownBuildConstants?.['z-cache_version'] ?? '?'}</code>
-                       ／ 对面印 <code>z-cache_version:{fp.responderVersion ?? '?'}</code>
-                       ；<code>tcp_port</code>：本次 <code>{fp.ownBuildConstants?.tcp_port ?? '?'}</code>
-                       ／ 对面 <code>{fp.responderTcpPort ?? '?'}</code>
-                   </div>
-                   <div style={{fontSize: 12, color: '#64748b', marginTop: 4}}>{fp.note}</div>
-                   <div style={{fontSize: 11, color: '#94a3b8', marginTop: 2}}>{fp.ownConstantsSource}</div>
-               </>}/>
+                       : '指纹不可用'}`}/>
     )
 }
 
@@ -132,8 +122,7 @@ export default function StatsPage() {
 
             {foreign && (
                 <Alert type="error" showIcon style={{marginBottom: 12}}
-                       message="下面 INFO 一栏是外部进程自报的，不是本 JVM 的运行时指标"
-                       description="authorityOfClient = EXTERNAL_PROCESS。要看本 JVM 的数，只有路 A 那一栏（它现在可能是空的，因为内嵌没 bind）。"/>
+                       message="下面 INFO 一栏是外部进程自报的，不是本 JVM 的运行时指标"/>
             )}
 
             <Row gutter={16}>
@@ -142,8 +131,7 @@ export default function StatsPage() {
                           loading={loading}>
                         {!emb ? (
                             <Alert type="warning" showIcon
-                                   message="路 A 的 store 拿不到 ⇒ 没有进程内运行指标"
-                                   description="内嵌 RedisServer 没 bind 成功（或反射失败）。这里显示为空是对的，显示 0 才是错的。"/>
+                                   message="内嵌服务未启动，无进程内运行指标"/>
                         ) : (
                             <>
                                 <Row gutter={8}>
@@ -179,11 +167,8 @@ export default function StatsPage() {
                             <InfoSection key={name} name={name} fields={fields}/>
                         ))}
                         {info?.hardcodedInUpstream && (
-                            <Alert type="error" showIcon style={{marginTop: 4}}
-                                   message="INFO 里这两个字段是写死的字面量，不要拿去对照 jar 版本或端口"
-                                   description={<ul style={{margin: 0, paddingLeft: 18}}>
-                                       {info.hardcodedInUpstream.map((t) => <li key={t} style={{fontSize: 12}}>{t}</li>)}
-                                   </ul>}/>
+                            <Alert type="warning" showIcon style={{marginTop: 4}}
+                                   message="INFO 中以下字段为上游硬编码值"/>
                         )}
                         {buildFingerprint && <BuildFingerprintAlert fp={buildFingerprint}/>}
                     </Card>
@@ -196,7 +181,7 @@ export default function StatsPage() {
                 </Card>
             )}
 
-            <Card title="热 key（路 A 的 LFU 埋点，只覆盖 string 类型）"
+            <Card title="热 key"
                   style={{marginTop: 16}}
                   size="small"
                   extra={<Space>
@@ -209,21 +194,16 @@ export default function StatsPage() {
                   </Space>}>
                 {hotError && (
                     <Alert type="warning" showIcon style={{marginBottom: 8}}
-                           message={`读不到热 key：${cacheErrorText(hotError)}`}
-                           description="后端只有路 A 能出这个视图，所以「反射不到内嵌 RedisServer」= 503。这不是「没有热 key」。"/>
+                           message={`读不到热 key：${cacheErrorText(hotError)}`}/>
                 )}
                 {hot && (
                     <>
                         <div style={{fontSize: 12, color: '#64748b', marginBottom: 8}}>
                             db{hot.db} · string key 共 {hot.stringKeyTotal} 个{hot.truncated ? `（只显示前 50，已截断）` : ''}
-                            · <Tag color={authorityTag(hot.authority).color}>{hot.authority}</Tag>
                         </div>
                         <Table size="small" rowKey="key" columns={HOT_COLUMNS} dataSource={hot.rows ?? []}
                                pagination={DEFAULT_PAGINATION}
-                               locale={{emptyText: `db${db} 的 string store 里一个 key 都没有（路 A 口径，确定没跨进程）`}}/>
-                        <div style={{marginTop: 8, fontSize: 12, color: '#94a3b8'}}>
-                            {hot.scopeNote} ／ {hot.sourceNote}
-                        </div>
+                               locale={{emptyText: '没有匹配的 key'}}/>
                     </>
                 )}
             </Card>
