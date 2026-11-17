@@ -13,7 +13,7 @@
     <parent>
         <groupId>io.github.yuku123</groupId>
         <artifactId>z-boot-parent</artifactId>
-        <version>1.2.2</version>
+        <version>1.2.3</version>
         <relativePath/>
     </parent>
     <groupId>io.github.yuku123</groupId>
@@ -63,7 +63,7 @@
              netty 4.1.138.Final / z-util 1.0.13 与 floor+fleet 面值一致 ⇒ 属性删掉，
              由 parent 的 dependencyManagement 供（曾经这里自己钉一份，就是"每个仓自己起名字"的账）。
              log4j2 反过来必须留着：地板是 2.25.4，本仓要 2.17.2，理由是下面这段零漂移判断。 -->
-        <log4j2.version>2.17.2</log4j2.version>
+        <log4j2.version>2.26.1</log4j2.version>
     </properties>
 
     <dependencyManagement>
