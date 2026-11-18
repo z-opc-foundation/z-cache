@@ -14,7 +14,7 @@ z-cache 是一个 **RESP2 兼容的分布式内存缓存服务**：用 Java + Ne
 
 ```
 z-cache/
-├── pom.xml                        # 根聚合 POM：z-cache:1.3.6，parent = z-boot-parent:1.1.0（relativePath 留空）
+├── pom.xml                        # 根聚合 POM：z-cache:1.3.6，parent = z-boot-parent:1.2.4（relativePath 留空）
 │                                  #   5 个 <module> 全部在 reactor、无 maven.deploy.skip
 ├── z-cache-common/                # 14 个类：RESP 协议编解码 + RedisGlob + 共享类型（不引日志实现）
 │   └── com.zifang.z.cache.common.{protocol,exception}
@@ -76,7 +76,7 @@ z-cache/
 
 ## 4. 对外集成 / 上下游
 
-**上游依赖：** 父链 `z-boot-parent:1.1.0`（`relativePath` 留空 —— parent 在 repo1 不在磁盘）；其下是第三方地板（Netty 4.1.138.Final、Spring Boot 2.7.18）与兄弟仓 fleet（`z-util-serialize-core` / `z-util-serialize-schema`）。本仓 POM 只保留一处与地板**有意不同**的钉子：`<log4j2.version>2.17.2</log4j2.version>`（地板给 2.25.4，但 `spring-boot-starter-log4j2` 带的 `log4j-core` / `slf4j-impl` / `jul` 全是 2.17.2，于是把 `log4j-api` / `log4j-core` / `log4j-jul` / `log4j-slf4j-impl` 四条按坐标逐个压回 2.17.2 求零漂移）。
+**上游依赖：** 父链 `z-boot-parent:1.2.4`（`relativePath` 留空 —— parent 在 repo1 不在磁盘）；其下是第三方地板（Netty 4.1.138.Final、Spring Boot 2.7.18）与兄弟仓 fleet（`z-util-serialize-core` / `z-util-serialize-schema`）。本仓 POM 只保留一处与地板**有意不同**的钉子：`<log4j2.version>2.17.2</log4j2.version>`（地板给 2.25.4，但 `spring-boot-starter-log4j2` 带的 `log4j-core` / `slf4j-impl` / `jul` 全是 2.17.2，于是把 `log4j-api` / `log4j-core` / `log4j-jul` / `log4j-slf4j-impl` 四条按坐标逐个压回 2.17.2 求零漂移）。
 
 **下游消费方：** 两种形态 —— ① 起一台 RESP 服务端（Jedis / Lettuce / redis-cli 直连）；② 引入 `z-cache-spring-boot-starter` 走 Spring 装配。
 

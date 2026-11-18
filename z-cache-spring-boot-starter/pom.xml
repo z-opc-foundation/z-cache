@@ -69,7 +69,6 @@
         <dependency>
             <groupId>org.springframework</groupId>
             <artifactId>spring-webmvc</artifactId>
-            <version>5.3.31</version>
             <scope>provided</scope>
         </dependency>
         <!-- 这里原来还有一条 jackson-databind（provided，给 CacheProxyController 的 ObjectMapper 用）。
@@ -91,7 +90,6 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-autoconfigure</artifactId>
-            <version>2.7.18</version>
         </dependency>
         <!--
           TASK-20260925-023: 具名 health 组件 zCacheEmbedded 需要 actuator 的 HealthIndicator。
@@ -103,20 +101,17 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-actuator</artifactId>
-            <version>2.7.18</version>
             <scope>provided</scope>
             <optional>true</optional>
         </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-configuration-processor</artifactId>
-            <version>2.7.18</version>
             <optional>true</optional>
         </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>
-            <version>2.7.18</version>
             <scope>test</scope>
             <exclusions>
                 <!-- spring 容器的默认日志那一族整条拔掉：它带的是
@@ -133,7 +128,6 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-log4j2</artifactId>
-            <version>2.7.18</version>
             <scope>test</scope>
         </dependency>
     
