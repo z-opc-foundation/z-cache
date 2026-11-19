@@ -47,6 +47,11 @@
     <dependencies>
         <dependency>
             <groupId>io.github.yuku123</groupId>
+            <artifactId>z-ext-spring-boot-starter</artifactId>
+            <version>1.2.1</version>
+        </dependency>
+        <dependency>
+            <groupId>io.github.yuku123</groupId>
             <artifactId>z-cache-client</artifactId>
             <version>${project.version}</version>
         </dependency>

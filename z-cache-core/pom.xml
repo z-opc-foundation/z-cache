@@ -45,6 +45,11 @@
     </scm>
 
     <dependencies>
+        <dependency>
+            <groupId>io.github.yuku123</groupId>
+            <artifactId>z-ext-core</artifactId>
+            <version>1.2.1</version>
+        </dependency>
         <!-- Common module -->
         <dependency>
             <groupId>io.github.yuku123</groupId>
