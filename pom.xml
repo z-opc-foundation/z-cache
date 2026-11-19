@@ -59,6 +59,7 @@
     </scm>
 
     <properties>
+        <z-meta.version>1.0.2</z-meta.version>
         <!-- 版本口径全部由 parent 下发，这里只留**本仓有意与地板不同**的那一格：
              netty 4.1.138.Final / z-util 1.0.13 与 floor+fleet 面值一致 ⇒ 属性删掉，
              由 parent 的 dependencyManagement 供（曾经这里自己钉一份，就是"每个仓自己起名字"的账）。
@@ -185,6 +186,11 @@
                  而 JUL 的 LogManager 与 log4j2 的同名不同物，按 import 数出来的是 16。
                  留着它们＝留着一个"谁都能误引"的入口，而误引的代价要到运行时才现形
                  （两条 binding 同时在类路径上时，输出走哪家取决于加载顺序）。 -->
+            <dependency>
+                <groupId>io.github.yuku123</groupId>
+                <artifactId>z-meta-api</artifactId>
+                <version>${z-meta.version}</version>
+            </dependency>
         </dependencies>
     </dependencyManagement>
     <dependencies>

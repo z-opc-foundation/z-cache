@@ -9,6 +9,10 @@ import com.zifang.z.cache.common.protocol.RespInteger;
 import com.zifang.z.cache.common.protocol.RespSimpleString;
 import com.zifang.z.cache.core.server.RedisServer;
 import com.zifang.z.cache.core.storage.MemoryStore;
+import com.zifang.z.meta.api.annotation.BizApi;
+import com.zifang.z.meta.api.annotation.BizField;
+import com.zifang.z.meta.api.annotation.BizParam;
+import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -16,16 +20,15 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
-import jakarta.servlet.http.HttpServletResponse;
-import java.nio.charset.StandardCharsets;
+import java.io.InputStream;
 import java.lang.management.ManagementFactory;
 import java.lang.reflect.Field;
-import java.io.InputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.Charset;
 import java.nio.charset.CodingErrorAction;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
@@ -152,6 +155,7 @@ public class CacheProxyController {
      * 自省接口：这一路到底连的是谁。返回三态，缺任何一格都会导致后来的人误判。
      */
     @GetMapping(PREFIX + "/__instance")
+    @BizApi(summary = "自省接口：这一路到底连的是谁。返回三态，缺任何一格都会导致后来的人误判", description = "自省接口：这一路到底连的是谁。返回三态，缺任何一格都会导致后来的人误判。", tags = { "z-cache" })
     public void instance(HttpServletResponse resp) throws Exception {
         Map<String, Object> out = new LinkedHashMap<String, Object>();
         out.put("jvm", ManagementFactory.getRuntimeMXBean().getName());
@@ -252,6 +256,7 @@ public class CacheProxyController {
 
     /** 双路对账总览：路 A 与路 B 并排 + 分歧位。页面首屏就是它。 */
     @GetMapping(PREFIX + "/overview")
+    @BizApi(summary = "双路对账总览：路 A 与路 B 并排 + 分歧位。页面首屏就是它", description = "双路对账总览：路 A 与路 B 并排 + 分歧位。页面首屏就是它。", tags = { "z-cache" })
     public void overview(HttpServletResponse resp) throws Exception {
         RedisServer server = resolveEmbeddedServer();
         MemoryStore store = server == null ? null : server.getStore();
@@ -335,10 +340,14 @@ public class CacheProxyController {
      * 路 B 会忽略 {@code db} —— 见类注释第 2 条约束。
      */
     @GetMapping(PREFIX + "/keys")
-    public void keys(@RequestParam(value = "pattern", required = false, defaultValue = "*") String pattern,
-                     @RequestParam(value = "db", required = false, defaultValue = "0") int db,
-                     @RequestParam(value = "limit", required = false, defaultValue = "200") int limit,
-                     @RequestParam(value = "source", required = false, defaultValue = "auto") String source,
+    @BizApi(summary = "key 列表。source 只接受 embedded|client|auto（默认 auto：路 A 可用就走 A）", description = "key 列表。source 只接受 embedded|client|auto（默认 auto：路 A 可用就走 A）。 路 B 会忽略 db —— 见类注释第 2 条约束。", tags = { "z-cache" })
+    public void keys(@RequestParam(value = "pattern", required = false, defaultValue = "*") @BizParam(name = "pattern", type = BizField.FieldType.STRING, description = "", position = BizParam.Position.QUERY) String pattern,
+                     @RequestParam(value = "db", required = false, defaultValue = "0")
+                     @BizParam(name = "db", type = BizField.FieldType.INTEGER, description = "", position = BizParam.Position.QUERY) int db,
+                     @RequestParam(value = "limit", required = false, defaultValue = "200")
+                     @BizParam(name = "limit", type = BizField.FieldType.INTEGER, description = "", position = BizParam.Position.QUERY) int limit,
+                     @RequestParam(value = "source", required = false, defaultValue = "auto")
+                     @BizParam(name = "source", type = BizField.FieldType.STRING, description = "", position = BizParam.Position.QUERY) String source,
                      HttpServletResponse resp) throws Exception {
         if (!SAFE_PATTERN.matcher(pattern).matches()) {
             writeJson(resp, 400, err("bad pattern", "只允许字母/数字/_ . - : 以及 glob 的 * ? []"));
@@ -423,10 +432,14 @@ public class CacheProxyController {
 
     /** 单个 key 的详情：类型 / TTL / 版本 / 值（按类型取，全部走白名单读命令）。 */
     @GetMapping(PREFIX + "/key")
-    public void key(@RequestParam("key") String key,
-                    @RequestParam(value = "db", required = false, defaultValue = "0") int db,
-                    @RequestParam(value = "maxElements", required = false, defaultValue = "50") int maxElements,
-                    @RequestParam(value = "source", required = false, defaultValue = "auto") String source,
+    @BizApi(summary = "单个 key 的详情：类型 / TTL / 版本 / 值（按类型取，全部走白名单读命令）", description = "单个 key 的详情：类型 / TTL / 版本 / 值（按类型取，全部走白名单读命令）。", tags = { "z-cache" })
+    public void key(@RequestParam("key") @BizParam(name = "key", type = BizField.FieldType.STRING, description = "", position = BizParam.Position.QUERY) String key,
+                    @RequestParam(value = "db", required = false, defaultValue = "0")
+                    @BizParam(name = "db", type = BizField.FieldType.INTEGER, description = "", position = BizParam.Position.QUERY) int db,
+                    @RequestParam(value = "maxElements", required = false, defaultValue = "50")
+                    @BizParam(name = "maxElements", type = BizField.FieldType.INTEGER, description = "", position = BizParam.Position.QUERY) int maxElements,
+                    @RequestParam(value = "source", required = false, defaultValue = "auto")
+                    @BizParam(name = "source", type = BizField.FieldType.STRING, description = "", position = BizParam.Position.QUERY) String source,
                     HttpServletResponse resp) throws Exception {
         if (key == null || key.isEmpty() || !SAFE_PATTERN.matcher(key).matches()) {
             writeJson(resp, 400, err("bad key", "字符白名单不通过"));
@@ -541,6 +554,7 @@ public class CacheProxyController {
 
     /** INFO（路 B 原文 + 分节解析）与进程内计数（路 A）并排；把硬编码字段标出来防误读。 */
     @GetMapping(PREFIX + "/info")
+    @BizApi(summary = "INFO（路 B 原文 + 分节解析）与进程内计数（路 A）并排；把硬编码字段标出来防误读", description = "INFO（路 B 原文 + 分节解析）与进程内计数（路 A）并排；把硬编码字段标出来防误读。", tags = { "z-cache" })
     public void info(HttpServletResponse resp) throws Exception {
         Map<String, Object> out = new LinkedHashMap<String, Object>();
         ZCacheClient client = clientProvider.getIfAvailable();
@@ -584,8 +598,10 @@ public class CacheProxyController {
 
     /** 热 key 视图：只有路 A 有（MemoryStore.ValueWrapper 自带 accessCount / lastAccessTime / lfuCounter）。 */
     @GetMapping(PREFIX + "/hotkeys")
-    public void hotkeys(@RequestParam(value = "db", required = false, defaultValue = "0") int db,
-                        @RequestParam(value = "limit", required = false, defaultValue = "50") int limit,
+    @BizApi(summary = "热 key 视图：只有路 A 有（MemoryStore.ValueWrapper 自带 accessCount / lastAccessTime / lfuCounter）", description = "热 key 视图：只有路 A 有（MemoryStore.ValueWrapper 自带 accessCount / lastAccessTime / lfuCounter）。", tags = { "z-cache" })
+    public void hotkeys(@RequestParam(value = "db", required = false, defaultValue = "0") @BizParam(name = "db", type = BizField.FieldType.INTEGER, description = "", position = BizParam.Position.QUERY) int db,
+                        @RequestParam(value = "limit", required = false, defaultValue = "50")
+                        @BizParam(name = "limit", type = BizField.FieldType.INTEGER, description = "", position = BizParam.Position.QUERY) int limit,
                         HttpServletResponse resp) throws Exception {
         MemoryStore store = storeOrNull();
         if (store == null) {
@@ -647,6 +663,7 @@ public class CacheProxyController {
      * 它存在的意义是把"哪些命令本 controller 永远不会发"变成机器可读的事实。
      */
     @GetMapping(PREFIX + "/command-catalog")
+    @BizApi(summary = "命令目录 —— <b>静态常量</b>，来源是 z-cache 源码行号，页面上明确标注\"代码常量，非实测应答\"", description = "命令目录 —— 静态常量 ，来源是 z-cache 源码行号，页面上明确标注\"代码常量，非实测应答\"。 它存在的意义是把\"哪些命令本 controller 永远不会发\"变成机器可读的事实。", tags = { "z-cache" })
     public void commandCatalog(HttpServletResponse resp) throws Exception {
         Map<String, Object> out = new LinkedHashMap<String, Object>();
         out.put("provenance", "代码常量（抄自 z-cache-core 1.3.1 CommandHandler 的 switch 行号），"
@@ -695,6 +712,7 @@ public class CacheProxyController {
 
     /** 兜底：/api/cache 下未注册的子路径。回 404 + 可读端点清单，绝不回 HTML（免得 SPA fallback 把它变成 200 页面）。 */
     @RequestMapping(PREFIX + "/**")
+    @BizApi(summary = "兜底：/api/cache 下未注册的子路径。回 404 + 可读端点清单，绝不回 HTML（免得 SPA fallback 把它变成 200 页面）", description = "兜底：/api/cache 下未注册的子路径。回 404 + 可读端点清单，绝不回 HTML（免得 SPA fallback 把它变成 200 页面）。", tags = { "z-cache" })
     public void unknown(HttpServletResponse resp) throws Exception {
         Map<String, Object> m = err("unknown read endpoint",
                 "GET 支持：__instance / overview / keys / key / info / hotkeys / command-catalog");
@@ -1357,3 +1375,6 @@ public class CacheProxyController {
         resp.getOutputStream().flush();
     }
 }
+
+
+
